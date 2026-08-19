@@ -66,7 +66,11 @@ function buildDigitalTwinSnapshotTest_(userId, options) {
 
   const opts = options || {};
   const asOf = dtParseDateTime_(opts.as_of) || new Date();
-  const mapped = mapExistingDataToObservations_(normalizedUserId, {as_of: asOf});
+  const repository = resolveSpreadsheetRepositoryTest_(opts);
+  const mapped = mapExistingDataToObservations_(normalizedUserId, {
+    as_of: asOf,
+    spreadsheet_repository: repository
+  });
   const context = {
     user_id: normalizedUserId,
     as_of: asOf,
@@ -142,16 +146,16 @@ function buildDigitalTwinSnapshotTest_(userId, options) {
 function mapExistingDataToObservations_(userId, options) {
   const opts = options || {};
   const asOf = dtParseDateTime_(opts.as_of) || new Date();
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const repository = resolveSpreadsheetRepositoryTest_(opts);
   const observations = [];
 
-  const profileRows = dtReadSheet_(spreadsheet, DIGITAL_TWIN_TEST_CONFIG.SHEETS.PROFILE);
-  const bodyRows = dtReadSheet_(spreadsheet, DIGITAL_TWIN_TEST_CONFIG.SHEETS.BODY);
-  const workoutRows = dtReadSheet_(spreadsheet, DIGITAL_TWIN_TEST_CONFIG.SHEETS.WORKOUT);
-  const nutritionRows = dtReadSheet_(spreadsheet, DIGITAL_TWIN_TEST_CONFIG.SHEETS.NUTRITION);
-  const recoveryRows = dtReadSheet_(spreadsheet, DIGITAL_TWIN_TEST_CONFIG.SHEETS.RECOVERY);
-  const memoryRows = dtReadSheet_(spreadsheet, DIGITAL_TWIN_TEST_CONFIG.SHEETS.MEMORY);
-  const botRows = dtReadSheet_(spreadsheet, DIGITAL_TWIN_TEST_CONFIG.SHEETS.BOT_INPUT);
+  const profileRows = dtReadSheet_(repository, DIGITAL_TWIN_TEST_CONFIG.SHEETS.PROFILE);
+  const bodyRows = dtReadSheet_(repository, DIGITAL_TWIN_TEST_CONFIG.SHEETS.BODY);
+  const workoutRows = dtReadSheet_(repository, DIGITAL_TWIN_TEST_CONFIG.SHEETS.WORKOUT);
+  const nutritionRows = dtReadSheet_(repository, DIGITAL_TWIN_TEST_CONFIG.SHEETS.NUTRITION);
+  const recoveryRows = dtReadSheet_(repository, DIGITAL_TWIN_TEST_CONFIG.SHEETS.RECOVERY);
+  const memoryRows = dtReadSheet_(repository, DIGITAL_TWIN_TEST_CONFIG.SHEETS.MEMORY);
+  const botRows = dtReadSheet_(repository, DIGITAL_TWIN_TEST_CONFIG.SHEETS.BOT_INPUT);
 
   const profile = profileRows.filter(function(row) {
     return String(row["User_ID"]) === String(userId);
@@ -603,7 +607,8 @@ function calculateSnapshotQuality_(states, context) {
   };
 }
 
-function testDigitalTwinSnapshot_() {
+function testDigitalTwinSnapshot_(options) {
+  const repository = resolveSpreadsheetRepositoryTest_(options);
   const userId = "132976932";
   const referenceAsOf = new Date();
   const sourceSheets = [
@@ -615,11 +620,20 @@ function testDigitalTwinSnapshot_() {
     DIGITAL_TWIN_TEST_CONFIG.SHEETS.MEMORY,
     DIGITAL_TWIN_TEST_CONFIG.SHEETS.BOT_INPUT
   ];
-  const rowsBefore = dtSheetLastRows_(sourceSheets);
-  const mapped = mapExistingDataToObservations_(userId, {as_of: referenceAsOf});
-  const snapshotA = buildDigitalTwinSnapshotTest_(userId, {as_of: referenceAsOf});
-  const snapshotB = buildDigitalTwinSnapshotTest_(userId, {as_of: referenceAsOf});
-  const rowsAfter = dtSheetLastRows_(sourceSheets);
+  const rowsBefore = dtSheetLastRows_(sourceSheets, repository);
+  const mapped = mapExistingDataToObservations_(userId, {
+    as_of: referenceAsOf,
+    spreadsheet_repository: repository
+  });
+  const snapshotA = buildDigitalTwinSnapshotTest_(userId, {
+    as_of: referenceAsOf,
+    spreadsheet_repository: repository
+  });
+  const snapshotB = buildDigitalTwinSnapshotTest_(userId, {
+    as_of: referenceAsOf,
+    spreadsheet_repository: repository
+  });
+  const rowsAfter = dtSheetLastRows_(sourceSheets, repository);
   const requiredBlocks = [
     "body_state", "training_state", "nutrition_state",
     "recovery_state", "goal_state", "behavior_state"
@@ -745,8 +759,8 @@ function testDigitalTwinSnapshot_() {
   };
 }
 
-function runDigitalTwinSnapshotTests() {
-  const report = testDigitalTwinSnapshot_();
+function runDigitalTwinSnapshotTests(options) {
+  const report = testDigitalTwinSnapshot_(options);
   console.log("[Digital Twin Snapshot Test] " + JSON.stringify({
     status: report.status,
     sprint: report.sprint,
@@ -1061,13 +1075,16 @@ function dtObservation_(input) {
   };
 }
 
-function dtReadSheet_(spreadsheet, sheetName) {
-  const sheet = spreadsheet.getSheetByName(sheetName);
-  if (!sheet) throw new Error("DIGITAL_TWIN_MISSING_SHEET:" + sheetName);
+function dtReadSheet_(repository, sheetName) {
   const expected = DIGITAL_TWIN_TEST_CONFIG.HEADERS[sheetName];
   if (!expected) throw new Error("DIGITAL_TWIN_MISSING_HEADER_CONTRACT:" + sheetName);
-  const lastRow = Math.max(sheet.getLastRow(), 1);
-  const values = sheet.getRange(1, 1, lastRow, expected.length).getDisplayValues();
+  const snapshot = resolveSpreadsheetRepositoryTest_(repository).readSheet(sheetName, {
+    value_mode: SPREADSHEET_REPOSITORY_TEST_CONFIG.VALUE_MODE.DISPLAY,
+    column_count: expected.length,
+    minimum_rows: 1
+  });
+  if (!snapshot.exists) throw new Error("DIGITAL_TWIN_MISSING_SHEET:" + sheetName);
+  const values = snapshot.values;
   const actual = values[0];
   if (dtStableStringify_(actual) !== dtStableStringify_(expected)) {
     throw new Error("DIGITAL_TWIN_HEADER_MISMATCH:" + sheetName);
@@ -1236,12 +1253,12 @@ function dtTestResult_(id, passed, expected, actual) {
   };
 }
 
-function dtSheetLastRows_(sheetNames) {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+function dtSheetLastRows_(sheetNames, repository) {
+  const readableRepository = resolveSpreadsheetRepositoryTest_(repository);
   const result = {};
   (sheetNames || []).forEach(function(sheetName) {
-    const sheet = spreadsheet.getSheetByName(sheetName);
-    result[sheetName] = sheet ? sheet.getLastRow() : null;
+    const snapshot = readableRepository.readSheet(sheetName, {metadata_only: true});
+    result[sheetName] = snapshot.exists ? snapshot.last_row : null;
   });
   return result;
 }

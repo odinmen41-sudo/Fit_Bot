@@ -258,11 +258,11 @@ function extractNutritionAcquisitionS63Test_(message, options) {
   };
 }
 
-function calculateNutritionCoverageS63Test_(asOfValue, windowDays, acquiredRecords) {
+function calculateNutritionCoverageS63Test_(asOfValue, windowDays, acquiredRecords, repository) {
   const asOf = startOfDayDq_(parseDateS63Test_(asOfValue));
   const days = windowDays || DATA_COLLECTION_ACQUISITION_S63_CONFIG.NUTRITION_WINDOW_DAYS;
   const start = new Date(asOf.getFullYear(), asOf.getMonth(), asOf.getDate() - days + 1);
-  const table = readTableDq_("Nutrition_Log");
+  const table = readTableDq_("Nutrition_Log", repository);
   const indexes = resolveHeaderIndexesDq_(table.headers, {date: ["Дата", "date"]});
   const covered = {};
   table.rows.forEach(function(row) {

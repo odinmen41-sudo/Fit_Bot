@@ -18,15 +18,16 @@ const DATA_READINESS_S63_CONFIG = Object.freeze({
 
 function buildDataReadinessReportS63Test_(options) {
   const config = options || {};
+  const repository = resolveSpreadsheetRepositoryTest_(config);
   const asOf = normalizeDateS63Test_(config.as_of || new Date());
-  const body = calculateBodyReadinessS63Test_();
-  const workoutAudit = config.workout_audit || buildWorkoutDataQualityReportS63Test_();
+  const body = calculateBodyReadinessS63Test_(repository);
+  const workoutAudit = config.workout_audit || buildWorkoutDataQualityReportS63Test_(repository);
   const trainingScore = workoutAudit.total_records
     ? roundDq_(workoutAudit.dated_records / workoutAudit.total_records * 100, 1)
     : 0;
   const trainingReady = workoutAudit.temporal_coverage >= DATA_READINESS_S63_CONFIG.TRAINING_MIN_TEMPORAL_COVERAGE;
 
-  const nutritionCoverage = config.nutrition_coverage || calculateNutritionCoverageS63Test_(asOf, 14, []);
+  const nutritionCoverage = config.nutrition_coverage || calculateNutritionCoverageS63Test_(asOf, 14, [], repository);
   const nutritionRatio = config.use_acquired_nutrition
     ? nutritionCoverage.coverage_after
     : nutritionCoverage.coverage_before;
@@ -118,8 +119,9 @@ function buildDataReadinessReportS63Test_(options) {
   };
 }
 
-function runDataCollectionReadinessTests() {
-  const before = captureSpreadsheetFingerprintDq_();
+function runDataCollectionReadinessTests(options) {
+  const repository = resolveSpreadsheetRepositoryTest_(options);
+  const before = captureSpreadsheetFingerprintDq_(repository);
   const tests = [];
   const asOf = "2026-08-14";
   const userId = "132976932";
@@ -194,12 +196,15 @@ function runDataCollectionReadinessTests() {
     meal.fact_estimate_separation === true && meal.estimates.length === 2 &&
     meal.estimates.every(function(item) { return item.is_estimate === true && item.source_fact === false; }) &&
     meal.recommendations.length === 0, {estimates: meal.estimates}));
-  const coverage = calculateNutritionCoverageS63Test_(asOf, 14, [meal]);
+  const coverage = calculateNutritionCoverageS63Test_(asOf, 14, [meal], repository);
   tests.push(testCaseDq_("S63-N04", "Nutrition coverage improvement is calculated without write",
     coverage.covered_days_before === 4 && coverage.covered_days_after === 5 &&
     coverage.coverage_before === 0.286 && coverage.coverage_after === 0.357 && coverage.write_performed === false, coverage));
 
-  const memoryGoal = createGoalV2FinalizationS63Test_(userId, "", {source: "AI_MEMORY"});
+  const memoryGoal = createGoalV2FinalizationS63Test_(userId, "", {
+    source: "AI_MEMORY",
+    spreadsheet_repository: repository
+  });
   tests.push(testCaseDq_("S63-G01", "AI_MEMORY goal stays pending and non-authoritative",
     memoryGoal.status === "PENDING_CONFIRMATION" && memoryGoal.canonical === false &&
     memoryGoal.source_fact === false && memoryGoal.memory_candidate.value === "105-110 кг" &&
@@ -231,7 +236,7 @@ function runDataCollectionReadinessTests() {
       canonical: confirmedGoal.canonical
     }));
 
-  const workout = buildWorkoutDataQualityReportS63Test_();
+  const workout = buildWorkoutDataQualityReportS63Test_(repository);
   tests.push(testCaseDq_("S63-W01", "Workout data quality counts are exact",
     workout.total_records === 79 && workout.dated_records === 6 && workout.records_without_date === 73 &&
     workout.missing_fields.rpe === 79, {
@@ -256,7 +261,11 @@ function runDataCollectionReadinessTests() {
       migration_performed: workout.migration_performed
     }));
 
-  const baseline = buildDataReadinessReportS63Test_({as_of: asOf, workout_audit: workout});
+  const baseline = buildDataReadinessReportS63Test_({
+    as_of: asOf,
+    workout_audit: workout,
+    spreadsheet_repository: repository
+  });
   tests.push(testCaseDq_("S63-D01", "Baseline DATA_READINESS_REPORT exposes all blockers",
     baseline.report_type === "DATA_READINESS_REPORT" && baseline.overall_readiness_score === 12.2 &&
     baseline.domains.body.status === "NOT_READY" && baseline.domains.training.status === "NOT_READY" &&
@@ -272,7 +281,8 @@ function runDataCollectionReadinessTests() {
     nutrition_coverage: coverage,
     use_acquired_nutrition: true,
     recovery_observations: [full.observation],
-    confirmed_goal: confirmedGoal
+    confirmed_goal: confirmedGoal,
+    spreadsheet_repository: repository
   });
   tests.push(testCaseDq_("S63-D02", "Readiness improves but Decision Engine remains blocked",
     afterAcquisition.overall_readiness_score === 36.5 && afterAcquisition.domains.goal.status === "READY" &&
@@ -283,7 +293,7 @@ function runDataCollectionReadinessTests() {
       blockers: afterAcquisition.blockers
     }));
 
-  const after = captureSpreadsheetFingerprintDq_();
+  const after = captureSpreadsheetFingerprintDq_(repository);
   const noSheetMutation = before.global_hash === after.global_hash && before.sheet_count === after.sheet_count;
   const guardrails = {
     mode: DATA_READINESS_S63_CONFIG.MODE,
@@ -334,8 +344,8 @@ function runDataCollectionReadinessTests() {
   return report;
 }
 
-function calculateBodyReadinessS63Test_() {
-  const table = readTableDq_("Body_Tracking");
+function calculateBodyReadinessS63Test_(repository) {
+  const table = readTableDq_("Body_Tracking", repository);
   const indexes = resolveHeaderIndexesDq_(table.headers, {date: ["Дата", "date"], weight: ["Вес", "weight"]});
   const valid = table.rows.map(function(row) {
     return {date: parseDateS63Test_(getCellDq_(row, indexes.date)), weight: parseNumberDq_(getCellDq_(row, indexes.weight))};

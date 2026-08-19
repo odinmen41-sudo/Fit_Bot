@@ -16,7 +16,7 @@ function createGoalV2FinalizationS63Test_(userId, userInput, options) {
   const raw = String(userInput || "").trim();
   const explicit = source === "EXPLICIT_USER_INPUT" ? parseGoalV2FieldsS63Test_(raw, config) : {};
   const memoryCandidate = source === "AI_MEMORY_NON_AUTHORITATIVE"
-    ? getMemoryGoalCandidateS63Test_(userId)
+    ? getMemoryGoalCandidateS63Test_(userId, config.spreadsheet_repository || config.repository)
     : null;
   const targetCandidate = source === "EXPLICIT_USER_INPUT" ? explicit.target_weight : null;
   const currentWeight = source === "EXPLICIT_USER_INPUT" ? explicit.current_weight : null;
@@ -119,8 +119,8 @@ function confirmGoalV2FinalizationS63Test_(proposal, confirmation, options) {
   return result;
 }
 
-function getMemoryGoalCandidateS63Test_(userId) {
-  const memory = readTableDq_("AI_MEMORY");
+function getMemoryGoalCandidateS63Test_(userId, repository) {
+  const memory = readTableDq_("AI_MEMORY", repository);
   const indexes = resolveHeaderIndexesDq_(memory.headers, {
     userId: ["user_id"], category: ["category"], key: ["key"], value: ["value"], updatedAt: ["updated_at"]
   });
@@ -182,8 +182,8 @@ function parseGoalV2FieldsS63Test_(message, options) {
   };
 }
 
-function buildWorkoutDataQualityReportS63Test_() {
-  const table = readTableDq_("Workout_Log");
+function buildWorkoutDataQualityReportS63Test_(repository) {
+  const table = readTableDq_("Workout_Log", repository);
   const indexes = resolveHeaderIndexesDq_(table.headers, {
     date: ["Дата", "date"],
     trainingType: ["Тип тренировки", "training_type"],

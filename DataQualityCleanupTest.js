@@ -32,8 +32,8 @@ const DATA_QUALITY_TEST_CONFIG = Object.freeze({
  *
  * @return {Object} deterministic workout data-quality result.
  */
-function auditWorkoutDataQuality_() {
-  const table = readTableDq_(DATA_QUALITY_TEST_CONFIG.SHEETS.WORKOUT);
+function auditWorkoutDataQuality_(repository) {
+  const table = readTableDq_(DATA_QUALITY_TEST_CONFIG.SHEETS.WORKOUT, repository);
   const indexes = resolveHeaderIndexesDq_(table.headers, {
     date: ["Дата", "date"],
     exercise: ["Упражнение", "exercise"],
@@ -120,8 +120,8 @@ function auditWorkoutDataQuality_() {
  *
  * @return {Object} proposal envelope and one proposal per undated row.
  */
-function buildWorkoutDateMappingProposal_() {
-  const audit = auditWorkoutDataQuality_();
+function buildWorkoutDateMappingProposal_(repository) {
+  const audit = auditWorkoutDataQuality_(repository);
   const proposals = audit.row_audits
     .filter(function(rowAudit) { return !rowAudit.has_date; })
     .map(function(rowAudit) {
@@ -152,10 +152,10 @@ function buildWorkoutDateMappingProposal_() {
  *
  * @return {Object} goal quality and conflict report.
  */
-function auditGoalDataQuality_() {
-  const goals = readTableDq_(DATA_QUALITY_TEST_CONFIG.SHEETS.GOALS);
-  const profile = readTableDq_(DATA_QUALITY_TEST_CONFIG.SHEETS.PROFILE);
-  const memory = readTableDq_(DATA_QUALITY_TEST_CONFIG.SHEETS.MEMORY);
+function auditGoalDataQuality_(repository) {
+  const goals = readTableDq_(DATA_QUALITY_TEST_CONFIG.SHEETS.GOALS, repository);
+  const profile = readTableDq_(DATA_QUALITY_TEST_CONFIG.SHEETS.PROFILE, repository);
+  const memory = readTableDq_(DATA_QUALITY_TEST_CONFIG.SHEETS.MEMORY, repository);
 
   const goalIndexes = resolveHeaderIndexesDq_(goals.headers, {
     goal: ["Цель", "goal"],
@@ -273,8 +273,8 @@ function auditGoalDataQuality_() {
  *
  * @return {Object} in-memory mapping proposal.
  */
-function mapCurrentGoalsToGoalsV2Test_() {
-  const audit = auditGoalDataQuality_();
+function mapCurrentGoalsToGoalsV2Test_(repository) {
+  const audit = auditGoalDataQuality_(repository);
   return {
     mapping_version: "goals-v2-test-v1.0",
     mode: "IN_MEMORY_ONLY",
@@ -301,8 +301,8 @@ function mapCurrentGoalsToGoalsV2Test_() {
  *
  * @return {Object} recovery data-quality result.
  */
-function auditRecoveryDataQuality_() {
-  const table = readTableDq_(DATA_QUALITY_TEST_CONFIG.SHEETS.RECOVERY);
+function auditRecoveryDataQuality_(repository) {
+  const table = readTableDq_(DATA_QUALITY_TEST_CONFIG.SHEETS.RECOVERY, repository);
   const aliases = {
     date: ["Дата", "date"],
     sleep_hours: ["Сон часы", "sleep", "sleep_hours"],
@@ -355,12 +355,12 @@ function auditRecoveryDataQuality_() {
  *
  * @return {Object} complete read-only Data Quality Report.
  */
-function buildDataQualityReport_() {
-  const body = auditBodyDataQualityDq_();
-  const training = auditWorkoutDataQuality_();
-  const nutrition = auditNutritionDataQualityDq_();
-  const recovery = auditRecoveryDataQuality_();
-  const goals = auditGoalDataQuality_();
+function buildDataQualityReport_(repository) {
+  const body = auditBodyDataQualityDq_(repository);
+  const training = auditWorkoutDataQuality_(repository);
+  const nutrition = auditNutritionDataQualityDq_(repository);
+  const recovery = auditRecoveryDataQuality_(repository);
+  const goals = auditGoalDataQuality_(repository);
 
   const blockingIssues = [];
   if (body.status !== "READY") {
@@ -442,11 +442,12 @@ function buildDataQualityReport_() {
  *
  * @return {Object} six deterministic test results plus the full report.
  */
-function testDataQualityCleanup_() {
-  const before = captureSpreadsheetFingerprintDq_();
+function testDataQualityCleanup_(options) {
+  const repository = resolveSpreadsheetRepositoryTest_(options);
+  const before = captureSpreadsheetFingerprintDq_(repository);
   const tests = [];
 
-  const workout = auditWorkoutDataQuality_();
+  const workout = auditWorkoutDataQuality_(repository);
   tests.push(testCaseDq_(
     "TEST 1",
     "Workout без дат определяется",
@@ -458,7 +459,7 @@ function testDataQualityCleanup_() {
     }
   ));
 
-  const mapping = buildWorkoutDateMappingProposal_();
+  const mapping = buildWorkoutDateMappingProposal_(repository);
   const noInventedDates = mapping.proposals.every(function(proposal) {
     return proposal.date === null &&
       proposal.proposal === "NEEDS_USER_CONFIRMATION" &&
@@ -476,7 +477,7 @@ function testDataQualityCleanup_() {
     }
   ));
 
-  const goals = auditGoalDataQuality_();
+  const goals = auditGoalDataQuality_(repository);
   tests.push(testCaseDq_(
     "TEST 3",
     "Goals conflict определяется",
@@ -484,7 +485,7 @@ function testDataQualityCleanup_() {
     {conflicts: goals.conflicts}
   ));
 
-  const recovery = auditRecoveryDataQuality_();
+  const recovery = auditRecoveryDataQuality_(repository);
   tests.push(testCaseDq_(
     "TEST 4",
     "Recovery empty определяется",
@@ -492,8 +493,8 @@ function testDataQualityCleanup_() {
     {records_count: recovery.records_count, status: recovery.status}
   ));
 
-  const reportOne = buildDataQualityReport_();
-  const reportTwo = buildDataQualityReport_();
+  const reportOne = buildDataQualityReport_(repository);
+  const reportTwo = buildDataQualityReport_(repository);
   const stableHashOne = digestHexDq_(JSON.stringify(stableReportDq_(reportOne)));
   const stableHashTwo = digestHexDq_(JSON.stringify(stableReportDq_(reportTwo)));
   tests.push(testCaseDq_(
@@ -503,7 +504,7 @@ function testDataQualityCleanup_() {
     {first_hash: stableHashOne, second_hash: stableHashTwo}
   ));
 
-  const after = captureSpreadsheetFingerprintDq_();
+  const after = captureSpreadsheetFingerprintDq_(repository);
   tests.push(testCaseDq_(
     "TEST 6",
     "Google Sheets не изменяются",
@@ -528,7 +529,7 @@ function testDataQualityCleanup_() {
     tests: tests,
     data_quality_report: reportOne,
     workout_date_mapping_proposal: mapping,
-    goals_v2_mapping: mapCurrentGoalsToGoalsV2Test_(),
+    goals_v2_mapping: mapCurrentGoalsToGoalsV2Test_(repository),
     sheet_integrity: {before: before, after: after},
     deployment_performed: false,
     telegram_calls: 0,
@@ -543,8 +544,8 @@ function testDataQualityCleanup_() {
  *
  * @return {Object} complete suite result.
  */
-function runDataQualityCleanupTests() {
-  const result = testDataQualityCleanup_();
+function runDataQualityCleanupTests(options) {
+  const result = testDataQualityCleanup_(options);
   Logger.log(JSON.stringify({
     suite: result.suite,
     status: result.status,
@@ -568,14 +569,14 @@ function runDataQualityCleanupTests() {
  *
  * @return {Object} full Data Quality Report.
  */
-function runDataQualityReportTest() {
-  const report = buildDataQualityReport_();
+function runDataQualityReportTest(options) {
+  const report = buildDataQualityReport_(resolveSpreadsheetRepositoryTest_(options));
   Logger.log(JSON.stringify(report, null, 2));
   return report;
 }
 
-function auditBodyDataQualityDq_() {
-  const table = readTableDq_(DATA_QUALITY_TEST_CONFIG.SHEETS.BODY);
+function auditBodyDataQualityDq_(repository) {
+  const table = readTableDq_(DATA_QUALITY_TEST_CONFIG.SHEETS.BODY, repository);
   const indexes = resolveHeaderIndexesDq_(table.headers, {
     date: ["Дата", "date"],
     weight: ["Вес", "weight"]
@@ -618,8 +619,8 @@ function auditBodyDataQualityDq_() {
   };
 }
 
-function auditNutritionDataQualityDq_() {
-  const table = readTableDq_(DATA_QUALITY_TEST_CONFIG.SHEETS.NUTRITION);
+function auditNutritionDataQualityDq_(repository) {
+  const table = readTableDq_(DATA_QUALITY_TEST_CONFIG.SHEETS.NUTRITION, repository);
   const indexes = resolveHeaderIndexesDq_(table.headers, {
     date: ["Дата", "date"],
     calories: ["Ккал", "calories"],
@@ -689,16 +690,15 @@ function auditNutritionDataQualityDq_() {
   };
 }
 
-function readTableDq_(sheetName) {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = spreadsheet.getSheetByName(sheetName);
-  if (!sheet) throw new Error("Required sheet not found: " + sheetName);
-  const lastRow = sheet.getLastRow();
-  const lastColumn = sheet.getLastColumn();
-  if (lastRow === 0 || lastColumn === 0) {
+function readTableDq_(sheetName, repository) {
+  const snapshot = resolveSpreadsheetRepositoryTest_(repository).readSheet(sheetName, {
+    value_mode: SPREADSHEET_REPOSITORY_TEST_CONFIG.VALUE_MODE.RAW
+  });
+  if (!snapshot.exists) throw new Error("Required sheet not found: " + sheetName);
+  if (snapshot.last_row === 0 || snapshot.last_column === 0) {
     return {sheet_name: sheetName, headers: [], rows: []};
   }
-  const values = sheet.getRange(1, 1, lastRow, lastColumn).getValues();
+  const values = snapshot.values;
   const headers = values.length ? values[0] : [];
   const rows = values.slice(1).filter(function(row) {
     return row.some(isPresentDq_);
@@ -833,24 +833,23 @@ function deepCloneDq_(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function captureSpreadsheetFingerprintDq_() {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const sheets = spreadsheet.getSheets().slice().sort(function(a, b) {
-    return a.getSheetId() - b.getSheetId();
+function captureSpreadsheetFingerprintDq_(repository) {
+  const sheets = resolveSpreadsheetRepositoryTest_(repository).readAllSheets({
+    value_mode: SPREADSHEET_REPOSITORY_TEST_CONFIG.VALUE_MODE.RAW
+  }).slice().sort(function(a, b) {
+    return Number(a.sheet_id) - Number(b.sheet_id);
   });
   const sheetFingerprints = sheets.map(function(sheet) {
-    const lastRow = sheet.getLastRow();
-    const lastColumn = sheet.getLastColumn();
-    const values = lastRow > 0 && lastColumn > 0
-      ? sheet.getRange(1, 1, lastRow, lastColumn).getValues().map(function(row) {
+    const values = sheet.last_row > 0 && sheet.last_column > 0
+      ? sheet.values.map(function(row) {
           return row.map(normalizeFingerprintValueDq_);
         })
       : [];
     return {
-      sheet_id: sheet.getSheetId(),
-      name: sheet.getName(),
-      last_row: lastRow,
-      last_column: lastColumn,
+      sheet_id: sheet.sheet_id,
+      name: sheet.name,
+      last_row: sheet.last_row,
+      last_column: sheet.last_column,
       hash: digestHexDq_(JSON.stringify(values))
     };
   });

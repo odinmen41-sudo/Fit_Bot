@@ -2,6 +2,8 @@
  * Sprint 5.5 — Controlled Write Canary.
  *
  * Real writes are permitted only when all gates pass:
+ * - CANARY_WRITE_ENVIRONMENT=TEST;
+ * - the Apps Script project has no Web App deployment;
  * - DATA_WRITE_MODE=CANARY;
  * - explicit options.canary_write=true;
  * - test-only capture/user/chat/update prefixes;
@@ -10,10 +12,70 @@
  * - only Body_Tracking and body_weight_recorded USER_EVENTS targets.
  */
 
-function dataWriteCanaryWritesAllowed_() {
-  return DATA_WRITE_CONFIG.CANARY_WRITES_ENABLED === true &&
+const DATA_WRITE_CANARY_ENVIRONMENT = Object.freeze({
+  ENVIRONMENT_PROPERTY: "CANARY_WRITE_ENVIRONMENT",
+  TEST: "TEST",
+  PRODUCTION: "PRODUCTION",
+  PRODUCTION_ERROR: "CANARY_WRITE_FORBIDDEN_IN_PRODUCTION"
+});
+
+function dataWriteCanaryEnvironmentDecision_(configuredEnvironment, deployedWebApp) {
+  const normalized = String(configuredEnvironment || "").trim().toUpperCase();
+  const isTest = normalized === DATA_WRITE_CANARY_ENVIRONMENT.TEST;
+  const isDeployed = deployedWebApp === true;
+  return {
+    environment: isTest ? DATA_WRITE_CANARY_ENVIRONMENT.TEST : DATA_WRITE_CANARY_ENVIRONMENT.PRODUCTION,
+    deployed_web_app: isDeployed,
+    production: !isTest || isDeployed
+  };
+}
+
+function dataWriteCanaryRuntimeContext_() {
+  let configuredEnvironment = "";
+  let deployedWebApp = true;
+  try {
+    configuredEnvironment = PropertiesService.getScriptProperties()
+      .getProperty(DATA_WRITE_CANARY_ENVIRONMENT.ENVIRONMENT_PROPERTY) || "";
+  } catch (error) {
+    configuredEnvironment = "";
+  }
+  try {
+    const service = ScriptApp.getService();
+    deployedWebApp = !service || Boolean(service.getUrl());
+  } catch (error) {
+    deployedWebApp = true;
+  }
+  return dataWriteCanaryEnvironmentDecision_(configuredEnvironment, deployedWebApp);
+}
+
+function dataWriteLogCanaryProductionBlock_(runtimeContext) {
+  const runtime = runtimeContext || {};
+  console.error("[Canary Write Guard] " + JSON.stringify({
+    code: DATA_WRITE_CANARY_ENVIRONMENT.PRODUCTION_ERROR,
+    environment: runtime.environment === DATA_WRITE_CANARY_ENVIRONMENT.TEST
+      ? DATA_WRITE_CANARY_ENVIRONMENT.TEST
+      : DATA_WRITE_CANARY_ENVIRONMENT.PRODUCTION,
+    deployed_web_app: runtime.deployed_web_app === true,
+    data_write_mode: dataWriteMode_()
+  }));
+}
+
+function dataWriteAssertCanaryWriteContext_(runtimeContext) {
+  const runtime = runtimeContext || dataWriteCanaryRuntimeContext_();
+  if (runtime.production !== false) {
+    dataWriteLogCanaryProductionBlock_(runtime);
+    throw new Error(DATA_WRITE_CANARY_ENVIRONMENT.PRODUCTION_ERROR);
+  }
+  return runtime;
+}
+
+function dataWriteCanaryWritesAllowed_(runtimeContext, modeOverride) {
+  const runtime = runtimeContext || dataWriteCanaryRuntimeContext_();
+  const mode = modeOverride == null ? dataWriteMode_() : String(modeOverride).trim().toUpperCase();
+  return runtime.production === false &&
+    DATA_WRITE_CONFIG.CANARY_WRITES_ENABLED === true &&
     DATA_WRITE_CONFIG.PRODUCTION_WRITES_ENABLED === false &&
-    dataWriteMode_() === "CANARY";
+    mode === "CANARY";
 }
 
 function dataWriteValidateCanaryScope_(selected, payload, validatedItems, options) {
@@ -51,7 +113,8 @@ function dataWriteValidateCanaryScope_(selected, payload, validatedItems, option
 }
 
 function dataWriteCommitCanaryOperation_(operation, context) {
-  if (!dataWriteCanaryWritesAllowed_()) throw new Error("CANARY_MODE_NOT_ALLOWED");
+  const runtime = dataWriteAssertCanaryWriteContext_();
+  if (!dataWriteCanaryWritesAllowed_(runtime)) throw new Error("CANARY_MODE_NOT_ALLOWED");
   if (!operation || operation.category !== DATA_WRITE_CONFIG.CANARY_CATEGORY ||
       operation.target_sheet !== DATA_WRITE_CONFIG.DOMAIN_ALLOWLIST.BODY_TRACKING) {
     throw new Error("CANARY_CATEGORY_REJECTED:" + String(operation && operation.category || "UNKNOWN"));
@@ -119,7 +182,51 @@ function dataWriteCommitCanaryOperation_(operation, context) {
   return committed;
 }
 
+function testCanaryProductionGuard_() {
+  const production = dataWriteCanaryEnvironmentDecision_("PRODUCTION", false);
+  const deployedTest = dataWriteCanaryEnvironmentDecision_("TEST", true);
+  const missingEnvironment = dataWriteCanaryEnvironmentDecision_("", false);
+  const test = dataWriteCanaryEnvironmentDecision_("TEST", false);
+  let productionError = "";
+  let deployedTestError = "";
+
+  try {
+    dataWriteAssertCanaryWriteContext_(production);
+  } catch (error) {
+    productionError = String(error && error.message || error);
+  }
+  try {
+    dataWriteAssertCanaryWriteContext_(deployedTest);
+  } catch (error) {
+    deployedTestError = String(error && error.message || error);
+  }
+
+  const checks = [
+    {id: "PRODUCTION_ENV_BLOCKED", passed: production.production === true && productionError === DATA_WRITE_CANARY_ENVIRONMENT.PRODUCTION_ERROR},
+    {id: "DEPLOYED_TEST_BLOCKED", passed: deployedTest.production === true && deployedTestError === DATA_WRITE_CANARY_ENVIRONMENT.PRODUCTION_ERROR},
+    {id: "MISSING_ENV_FAILS_CLOSED", passed: missingEnvironment.production === true && missingEnvironment.environment === DATA_WRITE_CANARY_ENVIRONMENT.PRODUCTION},
+    {id: "NON_DEPLOYED_TEST_ALLOWED", passed: test.production === false && dataWriteCanaryWritesAllowed_(test, "CANARY") === true},
+    {id: "TEST_STILL_REQUIRES_CANARY_MODE", passed: dataWriteCanaryWritesAllowed_(test, "SIMULATION") === false}
+  ];
+  const passed = checks.filter(function(check) { return check.passed; }).length;
+  return {
+    ok: passed === checks.length,
+    code: "C-03",
+    checks: checks,
+    passed: passed,
+    failed: checks.length - passed,
+    sheet_reads: 0,
+    sheet_writes: 0,
+    production_writes: 0
+  };
+}
+
+function runCanaryProductionGuardTests() {
+  return testCanaryProductionGuard_();
+}
+
 function testCanaryWrite_() {
+  dataWriteAssertCanaryWriteContext_();
   const properties = PropertiesService.getScriptProperties();
   const previousDataMode = properties.getProperty(DATA_WRITE_CONFIG.MODE_PROPERTY) || "SIMULATION";
   const previousCaptureMode = properties.getProperty(SMART_CAPTURE_CONFIG.MODE_PROPERTY) || "TEST";
@@ -309,6 +416,7 @@ function dataWriteCanarySheet_(spreadsheet, sheetName, expectedHeaders) {
 }
 
 function dataWriteCanaryAppendFormattedRow_(sheet, values) {
+  dataWriteAssertCanaryWriteContext_();
   const lastRow = sheet.getLastRow();
   const targetRow = lastRow + 1;
   const target = sheet.getRange(targetRow, 1, 1, values.length);

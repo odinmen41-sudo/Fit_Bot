@@ -64,6 +64,18 @@ function saveConfirmedData_(captureId, userId, options) {
       production_writes: false
     });
   }
+  if (isCanary) {
+    try {
+      dataWriteAssertCanaryWriteContext_();
+    } catch (error) {
+      return dataWriteResult_(false, DATA_WRITE_CANARY_ENVIRONMENT.PRODUCTION_ERROR,
+        "CANARY write запрещён в production-контексте.", {
+          mode: mode,
+          canary_writes: false,
+          production_writes: false
+        });
+    }
+  }
   if (isCanary && (!dataWriteCanaryWritesAllowed_() || opts.canary_write !== true)) {
     return dataWriteResult_(false, "CANARY_AUTH_REQUIRED", "CANARY требует явного test-only разрешения.", {
       mode: mode,

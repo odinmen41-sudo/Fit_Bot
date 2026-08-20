@@ -43,6 +43,11 @@ function doPost(e) {
       return httpOk_("DUPLICATE");
     }
 
+    if (update.callback_query) {
+      const callbackCollection = routeCollectionProductionBridge_(update);
+      if (callbackCollection.handled) return httpOk_("OK");
+    }
+
     const message = update.message || update.edited_message || null;
     if (!message) {
       console.log("Unsupported update ignored: " + updateId);
@@ -98,6 +103,12 @@ function doPost(e) {
       sendTelegramMessage_(chatId, help);
       logAiReply_(messageText, help, "command");
       markBotInputProcessed_(inputRow, "Да");
+      return httpOk_("OK");
+    }
+
+    const messageCollection = routeCollectionProductionBridge_(update);
+    if (messageCollection.handled) {
+      markBotInputProcessed_(inputRow, messageCollection.ok ? "Да" : "Ошибка collection");
       return httpOk_("OK");
     }
 
@@ -406,18 +417,21 @@ function recordGroqUsage_(model, usage) {
   }
 }
 
-function sendTelegramMessage_(chatId, text) {
+function sendTelegramMessage_(chatId, text, options) {
   const token = PropertiesService.getScriptProperties()
     .getProperty(CONFIG.TELEGRAM_TOKEN_PROPERTY);
 
   if (!token) throw new Error("TELEGRAM_TOKEN is not configured in Script Properties");
+
+  const payload = {chat_id: chatId, text: text};
+  if (options && options.reply_markup) payload.reply_markup = options.reply_markup;
 
   const response = UrlFetchApp.fetch(
     "https://api.telegram.org/bot" + token + "/sendMessage",
     {
       method: "post",
       contentType: "application/json",
-      payload: JSON.stringify({ chat_id: chatId, text: text }),
+      payload: JSON.stringify(payload),
       muteHttpExceptions: true
     }
   );
@@ -431,6 +445,32 @@ function sendTelegramMessage_(chatId, text) {
 
   const result = JSON.parse(body);
   if (!result.ok) throw new Error("Telegram sendMessage failed: " + body);
+}
+
+function answerTelegramCallbackQuery_(callbackQueryId) {
+  const callbackId = String(callbackQueryId || "").trim();
+  if (!callbackId) throw new Error("Telegram callback_query_id is required");
+
+  const token = PropertiesService.getScriptProperties()
+    .getProperty(CONFIG.TELEGRAM_TOKEN_PROPERTY);
+  if (!token) throw new Error("TELEGRAM_TOKEN is not configured in Script Properties");
+
+  const response = UrlFetchApp.fetch(
+    "https://api.telegram.org/bot" + token + "/answerCallbackQuery",
+    {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify({callback_query_id: callbackId}),
+      muteHttpExceptions: true
+    }
+  );
+  const status = response.getResponseCode();
+  const body = response.getContentText();
+  if (status < 200 || status >= 300) {
+    throw new Error("Telegram answerCallbackQuery HTTP " + status + ": " + body);
+  }
+  const result = JSON.parse(body);
+  if (!result.ok) throw new Error("Telegram answerCallbackQuery failed: " + body);
 }
 
 function claimUpdate_(updateId) {

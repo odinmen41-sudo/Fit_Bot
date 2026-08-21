@@ -6,7 +6,9 @@ const CONFIG = Object.freeze({
   GROQ_PRIMARY_MODEL_PROPERTY: "GROQ_PRIMARY_MODEL",
   GROQ_FALLBACK_MODEL_PROPERTY: "GROQ_FALLBACK_MODEL",
   PROCESSED_IDS_PROPERTY: "PROCESSED_UPDATE_IDS",
+  BOT_INPUT_DIAGNOSTICS_PROPERTY: "BOT_INPUT_WRITE_DIAGNOSTICS",
   MAX_PROCESSED_IDS: 200,
+  MAX_BOT_INPUT_DIAGNOSTICS: 6,
   PRIMARY_MODEL: "llama-3.3-70b-versatile",
   FALLBACK_MODEL: "llama-3.1-8b-instant",
   MAX_OUTPUT_TOKENS: 250,
@@ -502,18 +504,97 @@ function claimUpdate_(updateId) {
   }
 }
 
-function getSpreadsheet_() {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+function getSpreadsheet_(options) {
+  const opts = options || {};
+  const properties = opts.properties || PropertiesService.getScriptProperties();
+  const spreadsheetApp = opts.spreadsheet_app || SpreadsheetApp;
+  const environment = String(properties.getProperty("DEPLOYMENT_ENV") || "")
+    .trim()
+    .toUpperCase();
+
+  if (environment === "STAGING") {
+    const stagingSpreadsheetId = String(
+      properties.getProperty("COLLECTION_SPREADSHEET_ID") || ""
+    ).trim();
+
+    if (!stagingSpreadsheetId) {
+      throw new Error("STAGING: COLLECTION_SPREADSHEET_ID is not configured");
+    }
+
+    const stagingSpreadsheet = spreadsheetApp.openById(stagingSpreadsheetId);
+    if (!stagingSpreadsheet) {
+      throw new Error("STAGING: collection spreadsheet is unavailable");
+    }
+    return stagingSpreadsheet;
+  }
+
+  const spreadsheet = spreadsheetApp.getActiveSpreadsheet();
   if (!spreadsheet) throw new Error("Active spreadsheet is unavailable");
   return spreadsheet;
 }
 
-function appendBotInput_(row) {
-  return appendRowToSheet_(CONFIG.BOT_INPUT_SHEET, row);
+function appendBotInput_(row, options) {
+  try {
+    return appendRowToSheet_(CONFIG.BOT_INPUT_SHEET, row, options);
+  } catch (error) {
+    console.error("Bot_Input logging failed: " + errorText_(error));
+    recordBotInputDiagnostic_(row, error, options);
+    return 0;
+  }
 }
 
-function appendRowToSheet_(sheetName, row) {
-  const sheet = getSpreadsheet_().getSheetByName(sheetName);
+function recordBotInputDiagnostic_(row, error, options) {
+  let lock = null;
+  let acquired = false;
+  try {
+    const opts = options || {};
+    const properties = opts.properties || PropertiesService.getScriptProperties();
+    const lockService = opts.lock_service || LockService;
+    lock = lockService.getScriptLock();
+    lock.waitLock(10000);
+    acquired = true;
+    let diagnostics = [];
+    try {
+      diagnostics = JSON.parse(
+        properties.getProperty(CONFIG.BOT_INPUT_DIAGNOSTICS_PROPERTY) || "[]"
+      );
+      if (!Array.isArray(diagnostics)) diagnostics = [];
+    } catch (parseError) {
+      diagnostics = [];
+    }
+
+    const attemptedRow = Array.isArray(row) ? row : [];
+    diagnostics.push({
+      timestamp: new Date().toISOString(),
+      error: limitText_(errorText_(error), 700),
+      data_type: limitText_(attemptedRow[4], 80),
+      status: limitText_(attemptedRow[5], 80),
+      message_length: valueText_(attemptedRow[3]).length
+    });
+    if (diagnostics.length > CONFIG.MAX_BOT_INPUT_DIAGNOSTICS) {
+      diagnostics = diagnostics.slice(-CONFIG.MAX_BOT_INPUT_DIAGNOSTICS);
+    }
+    properties.setProperty(
+      CONFIG.BOT_INPUT_DIAGNOSTICS_PROPERTY,
+      JSON.stringify(diagnostics)
+    );
+    return true;
+  } catch (diagnosticError) {
+    console.error("Bot_Input durable diagnostics failed: " + errorText_(diagnosticError));
+    return false;
+  } finally {
+    if (acquired && lock) {
+      try {
+        lock.releaseLock();
+      } catch (releaseError) {
+        console.error("Bot_Input diagnostic unlock failed: " + errorText_(releaseError));
+      }
+    }
+  }
+}
+
+function appendRowToSheet_(sheetName, row, options) {
+  const sheet = getSpreadsheet_(options).getSheetByName(sheetName);
   if (!sheet) throw new Error('Sheet "' + sheetName + '" not found');
 
   const lock = LockService.getScriptLock();

@@ -174,7 +174,9 @@ function generateCoachReply_(userId, chatId, userText, options) {
   } catch (primaryError) {
     console.error("Primary Groq model failed: " + errorText_(primaryError));
 
-    if (!primaryError || primaryError.retryable !== true ||
+    const fallbackEligible = primaryError &&
+      (primaryError.retryable === true || primaryError.fallbackEligible === true);
+    if (!fallbackEligible ||
         !fallbackModel || fallbackModel === primaryModel) {
       throw primaryError;
     }
@@ -350,6 +352,8 @@ function callGroq_(apiKey, model, messages, options) {
     const httpError = new Error("Groq HTTP " + status + ": " + limitText_(apiMessage, 700));
     httpError.httpStatus = status;
     httpError.retryable = status === 429 || (status >= 500 && status <= 599);
+    httpError.fallbackEligible = status === 404 &&
+      /model.*does not exist|do not have access/i.test(String(apiMessage || ""));
     throw httpError;
   }
 

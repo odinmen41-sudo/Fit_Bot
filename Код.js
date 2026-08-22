@@ -11,7 +11,7 @@ const CONFIG = Object.freeze({
   MAX_BOT_INPUT_DIAGNOSTICS: 6,
   PRIMARY_MODEL: "llama-3.3-70b-versatile",
   FALLBACK_MODEL: "llama-3.1-8b-instant",
-  MAX_OUTPUT_TOKENS: 250,
+  MAX_OUTPUT_TOKENS: 300,
   MAX_USER_CHARS: 1200,
   MAX_CONTEXT_CHARS: 3500,
   MAX_TELEGRAM_CHARS: 3500,
@@ -157,7 +157,7 @@ function generateCoachReply_(userId, chatId, userText, options) {
     return deterministicReply;
   }
 
-  const properties = PropertiesService.getScriptProperties();
+  const properties = runtime.properties || PropertiesService.getScriptProperties();
   const apiKey = properties.getProperty(CONFIG.GROQ_KEY_PROPERTY);
 
   if (!apiKey) {
@@ -166,7 +166,9 @@ function generateCoachReply_(userId, chatId, userText, options) {
 
   const primaryModel = properties.getProperty(CONFIG.GROQ_PRIMARY_MODEL_PROPERTY) || CONFIG.PRIMARY_MODEL;
   const fallbackModel = properties.getProperty(CONFIG.GROQ_FALLBACK_MODEL_PROPERTY) || CONFIG.FALLBACK_MODEL;
-  const context = buildCoachContext_(userId, chatId);
+  const context = typeof runtime.build_context === "function"
+    ? runtime.build_context(userId, chatId)
+    : buildCoachContext_(userId, chatId);
   const messages = buildGroqMessages_(context, userText);
 
   try {
@@ -317,7 +319,7 @@ function callGroq_(apiKey, model, messages, options) {
           model: model,
           messages: messages,
           temperature: 0.35,
-          max_completion_tokens: Math.min(CONFIG.MAX_OUTPUT_TOKENS, 190),
+          max_completion_tokens: Math.min(CONFIG.MAX_OUTPUT_TOKENS, 300),
           top_p: 0.9,
           stream: false
         }),
@@ -361,8 +363,23 @@ function callGroq_(apiKey, model, messages, options) {
     data.choices[0].message && data.choices[0].message.content;
 
   if (!text || !String(text).trim()) {
-    const emptyCompletionError = new Error("Groq returned an empty completion");
+    const choice = data && data.choices && data.choices[0] ? data.choices[0] : {};
+    const usage = data && data.usage ? data.usage : {};
+    const finishReason = choice.finish_reason == null ? "unavailable" : String(choice.finish_reason);
+    const totalTokens = Number.isFinite(Number(usage.total_tokens))
+      ? Math.max(0, Math.floor(Number(usage.total_tokens)))
+      : "unavailable";
+    const completionTokens = Number.isFinite(Number(usage.completion_tokens))
+      ? Math.max(0, Math.floor(Number(usage.completion_tokens)))
+      : "unavailable";
+    const emptyCompletionError = new Error(
+      "Groq returned an empty completion" +
+      "; finish_reason=" + limitText_(finishReason, 80) +
+      "; usage.total_tokens=" + totalTokens +
+      "; usage.completion_tokens=" + completionTokens
+    );
     emptyCompletionError.retryable = false;
+    emptyCompletionError.fallbackEligible = true;
     throw emptyCompletionError;
   }
 

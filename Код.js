@@ -122,6 +122,14 @@ function doPost(e) {
       return httpOk_("OK");
     }
 
+    const weightFact = routeWeightFactConfirmation_(update);
+    if (weightFact.handled) {
+      sendTelegramMessage_(chatId, weightFact.message);
+      logAiReply_(messageText, weightFact.message, "weight_fact_gate");
+      markBotInputProcessed_(inputRow, weightFact.ok ? "Да" : "Ошибка weight gate");
+      return httpOk_("OK");
+    }
+
     let reply;
     let modelUsed = "";
 
@@ -752,6 +760,7 @@ function normalizeCoachState_(state, now) {
     }),
     active_topic: coachStateEnum_(source.active_topic, coachStateAllowedTopics_(), "UNKNOWN"),
     pending_question: coachStateEnum_(source.pending_question, coachStateAllowedPendingQuestions_(), "NONE"),
+    pending_action: coachStateEnum_(source.pending_action, coachStateAllowedPendingActions_(), "NONE"),
     unfinished_consultation: source.unfinished_consultation === true
   };
 }
@@ -835,6 +844,10 @@ function coachStateAllowedPendingQuestions_() {
   return {NONE: true, AWAITING_USER_REPLY: true};
 }
 
+function coachStateAllowedPendingActions_() {
+  return {NONE: true, WEIGHT_UPDATE_CONFIRMATION: true};
+}
+
 function coachStateAllowedUserIntents_() {
   return {
     UNKNOWN: true,
@@ -849,6 +862,340 @@ function coachStateAllowedUserIntents_() {
 
 function coachStateAllowedAssistantActions_() {
   return {UNKNOWN: true, RESPONDED: true, ASKED_CLARIFICATION: true};
+}
+
+function routeWeightFactConfirmation_(update, options) {
+  const runtime = options || {};
+  const message = update && (update.message || update.edited_message);
+  if (!message || typeof message.text !== "string") return weightFactResult_(false, true, "NOT_WEIGHT_FACT");
+  const userId = String(message.from && message.from.id || "");
+  const chatId = String(message.chat && message.chat.id || "");
+  if (!userId || !chatId) return weightFactResult_(false, true, "IDENTITY_MISSING");
+
+  const dependencies = weightFactDependencies_(runtime.dependencies);
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  const stateOptions = runtime.state_options || {};
+  const state = dependencies.read_state(userId, stateOptions);
+  if (state && state.pending_action === "WEIGHT_UPDATE_CONFIRMATION") {
+    return handleWeightFactConfirmation_(userId, chatId, message.text, now, dependencies, stateOptions);
+  }
+
+  const candidate = detectExplicitWeightUpdate_(message.text);
+  if (!candidate) return weightFactResult_(false, true, "NOT_WEIGHT_FACT");
+  const capture = buildWeightPendingCapture_(candidate, {
+    now: now,
+    update_id: update && update.update_id,
+    user_id: userId,
+    uuid: dependencies.uuid,
+    format_date: dependencies.format_date
+  });
+  const created = dependencies.create_pending(capture, {
+    now: now,
+    capture_id: capture.capture_id,
+    user_id: userId,
+    chat_id: chatId,
+    source_update_id: update && update.update_id,
+    validation: dependencies.validate_capture(capture),
+    reject_if_active: true
+  });
+  if (!created || created.ok !== true) {
+    const collision = created && created.code === "ACTIVE_CAPTURE_EXISTS";
+    return weightFactResult_(true, false, String(created && created.code || "CAPTURE_CREATE_FAILED"), {
+      message: collision
+        ? "Сначала завершите или отмените текущее подтверждение данных."
+        : "Не удалось безопасно подготовить подтверждение веса. Попробуйте позже."
+    });
+  }
+
+  const stateUpdated = dependencies.set_pending_action(
+    userId, "WEIGHT_UPDATE_CONFIRMATION", stateOptions
+  );
+  if (stateUpdated !== true) {
+    dependencies.cancel_created(userId, chatId, capture.capture_id, {now: now});
+    return weightFactResult_(true, false, "STATE_UPDATE_FAILED", {
+      message: "Не удалось безопасно подготовить подтверждение веса. Попробуйте позже."
+    });
+  }
+  return weightFactResult_(true, true, "WEIGHT_CONFIRMATION_REQUESTED", {
+    capture_id: created.capture_id || capture.capture_id,
+    message: "Правильно понял, что ваш текущий вес " + weightFactNumber_(candidate.value) +
+      " кг? Подтвердите: Да или Нет."
+  });
+}
+
+function handleWeightFactConfirmation_(userId, chatId, text, now, dependencies, stateOptions) {
+  const confirmation = dependencies.detect_confirmation(text);
+  if (!confirmation || ["CONFIRM", "CANCEL"].indexOf(confirmation.intent) < 0) {
+    return weightFactResult_(true, false, "CONFIRMATION_REQUIRED", {
+      message: "Пожалуйста, подтвердите изменение веса ответом Да или Нет."
+    });
+  }
+
+  const pending = dependencies.get_pending(userId, chatId, {now: now});
+  const verified = verifyWeightPendingCapture_(pending, userId, chatId, now);
+  if (!verified.ok) {
+    dependencies.set_pending_action(userId, "NONE", stateOptions);
+    return weightFactResult_(true, false, verified.code, {
+      message: verified.code === "EXPIRED"
+        ? "Срок подтверждения веса истёк. Отправьте актуальный вес ещё раз."
+        : "Активное подтверждение веса не найдено."
+    });
+  }
+
+  if (confirmation.intent === "CANCEL") {
+    const cancelled = dependencies.cancel(userId, chatId, {now: now});
+    if (cancelled && cancelled.ok === true) {
+      dependencies.set_pending_action(userId, "NONE", stateOptions);
+      return weightFactResult_(true, true, "CANCELLED", {message: "Обновление веса отменено."});
+    }
+    return weightFactResult_(true, false, String(cancelled && cancelled.code || "CANCEL_FAILED"), {
+      message: "Не удалось отменить подтверждение веса. Попробуйте позже."
+    });
+  }
+
+  const saved = dependencies.save(verified.capture.capture_id, userId, {
+    now: now,
+    chat_id: chatId
+  });
+  if (saved && ["SAVED", "ALREADY_SAVED"].indexOf(saved.code) >= 0) {
+    dependencies.set_pending_action(userId, "NONE", stateOptions);
+    return weightFactResult_(true, true, saved.code, {
+      save: saved,
+      message: saved.code === "ALREADY_SAVED"
+        ? "Это обновление веса уже было подтверждено."
+        : "Вес подтверждён. Проверка сохранения выполнена в режиме SIMULATION."
+    });
+  }
+  return weightFactResult_(true, false, String(saved && saved.code || "SAVE_FAILED"), {
+    save: saved || null,
+    message: "Не удалось завершить проверку сохранения веса. Попробуйте позже."
+  });
+}
+
+function detectExplicitWeightUpdate_(text) {
+  const normalized = String(text == null ? "" : text).trim().toLowerCase().replace(/ё/g, "е");
+  const match = normalized.match(/^(?:мой\s+вес|сейчас\s+вешу|вес\s+сегодня)\s*[:=\-]?\s*(\d{2,3}(?:[.,]\d{1,2})?)\s*(?:кг)?[.!]?$/i);
+  if (!match) return null;
+  const value = Number(match[1].replace(",", "."));
+  if (!Number.isFinite(value) || value < 30 || value > 350) return null;
+  return {fact_type: "WEIGHT", category: "BODY_TRACKING", value: value, unit: "kg"};
+}
+
+function buildWeightPendingCapture_(candidate, options) {
+  const runtime = options || {};
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  const updateId = String(runtime.update_id == null ? "" : runtime.update_id).replace(/[^A-Za-z0-9._-]/g, "");
+  const uuid = typeof runtime.uuid === "function" ? runtime.uuid() : Utilities.getUuid();
+  const captureId = "c20a-weight-" + (updateId || String(uuid).replace(/[^A-Za-z0-9._-]/g, "").slice(0, 32));
+  const formatDate = typeof runtime.format_date === "function"
+    ? runtime.format_date(now)
+    : Utilities.formatDate(now, "Europe/Moscow", "yyyy-MM-dd");
+  return {
+    schema_version: "c20a-weight-capture-v1",
+    mode: "SIMULATION",
+    writes_allowed: false,
+    capture_id: captureId,
+    source: "C20A_WEIGHT_GATE",
+    raw_message: "",
+    items: [{
+      category: "BODY_TRACKING",
+      confidence: 1,
+      fields: {
+        date: {value: formatDate, confidence: 1, source: "EXPLICIT_USER_INPUT"},
+        weight: {value: candidate.value, confidence: 1, source: "EXPLICIT_USER_INPUT", unit: "kg"}
+      }
+    }]
+  };
+}
+
+function createWeightPendingCaptureC20A_(capture, metadata, options) {
+  const meta = metadata || {};
+  const runtime = options || {};
+  const now = meta.now instanceof Date ? meta.now : new Date();
+  const userId = String(meta.user_id == null ? "" : meta.user_id);
+  const chatId = String(meta.chat_id == null ? "" : meta.chat_id);
+  const captureId = String(meta.capture_id || capture && capture.capture_id || "");
+  const validation = meta.validation || validateExtractedData_(capture);
+  let lock = null;
+  let acquired = false;
+  try {
+    if (!capture || capture.raw_message !== "" || capture.source !== "C20A_WEIGHT_GATE") {
+      return weightFactResult_(false, false, "INVALID_CAPTURE");
+    }
+    if (!validation || validation.ready_for_confirmation !== true || !captureId || !userId || !chatId) {
+      return weightFactResult_(false, false, "VALIDATION_FAILED");
+    }
+    if (!runtime.skip_mode_check && !smartConfirmationTechnicalWritesAllowed_()) {
+      return weightFactResult_(false, false, "TECHNICAL_WRITES_DISABLED");
+    }
+    lock = runtime.lock || LockService.getScriptLock();
+    acquired = typeof lock.tryLock === "function" ? lock.tryLock(5000) === true : false;
+    if (!acquired) return weightFactResult_(false, false, "LOCK_TIMEOUT");
+    const sheet = runtime.sheet || smartConfirmationSheet_();
+    const rows = typeof runtime.read_rows === "function"
+      ? runtime.read_rows(sheet)
+      : smartConfirmationReadRows_(sheet);
+    const existing = rows.filter(function(row) { return String(row.capture_id) === captureId; })[0];
+    if (existing) return weightFactResult_(false, true, "CAPTURE_ALREADY_EXISTS", {
+      capture_id: captureId, status: existing.status, created: false
+    });
+    const active = rows.filter(function(row) {
+      return String(row.user_id) === userId && String(row.chat_id) === chatId &&
+        row.status === SMART_CONFIRMATION_CONFIG.STATUSES.PENDING &&
+        smartConfirmationDate_(row.expires_at).getTime() > now.getTime();
+    });
+    if (active.length) return weightFactResult_(false, false, "ACTIVE_CAPTURE_EXISTS", {
+      capture_id: active[0].capture_id, created: false
+    });
+
+    const expiresAt = new Date(now.getTime() + SMART_CONFIRMATION_CONFIG.DEFAULT_TTL_MINUTES * 60000);
+    const row = [captureId, now, expiresAt, userId, chatId,
+      String(meta.source_update_id == null ? "" : meta.source_update_id), "",
+      JSON.stringify(capture), JSON.stringify(validation), SMART_CONFIRMATION_CONFIG.STATUSES.PENDING,
+      "[]", "", ""];
+    if (typeof runtime.append_row === "function") runtime.append_row(sheet, row);
+    else sheet.appendRow(row.map(function(value) {
+      return typeof value === "string" ? smartConfirmationSafeCellText_(value) : value;
+    }));
+    if (typeof runtime.flush === "function") runtime.flush();
+    else SpreadsheetApp.flush();
+    return weightFactResult_(false, true, "CREATED", {
+      capture_id: captureId, status: SMART_CONFIRMATION_CONFIG.STATUSES.PENDING,
+      created: true, expires_at: expiresAt.toISOString(), production_writes: false
+    });
+  } catch (error) {
+    return weightFactResult_(false, false, "CREATE_FAILED", {error: errorText_(error)});
+  } finally {
+    if (acquired && lock) {
+      try { lock.releaseLock(); } catch (releaseError) {
+        console.error("C20A capture unlock failed: " + errorText_(releaseError));
+      }
+    }
+  }
+}
+
+function verifyWeightPendingCapture_(pending, userId, chatId, now) {
+  if (!pending || pending.ok !== true || !pending.capture) {
+    return {ok: false, code: pending && /EXPIRED/.test(String(pending.code)) ? "EXPIRED" : "NO_ACTIVE_CAPTURE"};
+  }
+  const row = pending.capture;
+  if (String(row.user_id) !== String(userId) || String(row.chat_id) !== String(chatId)) {
+    return {ok: false, code: "OWNER_MISMATCH"};
+  }
+  if (row.status !== SMART_CONFIRMATION_CONFIG.STATUSES.PENDING) {
+    return {ok: false, code: "NOT_CONFIRMABLE"};
+  }
+  if (smartConfirmationDate_(row.expires_at).getTime() <= now.getTime()) return {ok: false, code: "EXPIRED"};
+  const payload = smartConfirmationParseJson_(row.payload_json, {});
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  if (payload.source !== "C20A_WEIGHT_GATE" || items.length !== 1 || items[0].category !== "BODY_TRACKING") {
+    return {ok: false, code: "CAPTURE_CONTRACT_MISMATCH"};
+  }
+  return {ok: true, code: "VERIFIED", capture: row, payload: payload};
+}
+
+function updateCoachPendingAction_(telegramUserId, action, options) {
+  const runtime = options || {};
+  let lock = null;
+  let acquired = false;
+  try {
+    const key = coachStateKey_(telegramUserId);
+    const normalizedAction = coachStateEnum_(action, coachStateAllowedPendingActions_(), "NONE");
+    if (!key || normalizedAction !== String(action || "").toUpperCase()) return false;
+    lock = runtime.lock || LockService.getScriptLock();
+    acquired = typeof lock.tryLock === "function" ? lock.tryLock(50) === true : false;
+    if (!acquired) return false;
+    const now = coachStateNow_(runtime);
+    const properties = runtime.properties || PropertiesService.getScriptProperties();
+    const state = readCoachStateValue_(properties, key, now) || normalizeCoachState_({}, now);
+    state.pending_action = normalizedAction;
+    state.pending_question = normalizedAction === "NONE" ? "NONE" : "AWAITING_USER_REPLY";
+    state.unfinished_consultation = normalizedAction !== "NONE";
+    state.updated_at = new Date(now).toISOString();
+    state.expires_at = new Date(now + CONFIG.COACH_STATE_TTL_MS).toISOString();
+    const serialized = JSON.stringify(normalizeCoachState_(state, now));
+    if (serialized.length > CONFIG.COACH_STATE_MAX_JSON_CHARS) return false;
+    properties.setProperty(key, serialized);
+    return true;
+  } catch (error) {
+    console.error("Coach pending action update failed: " + errorText_(error));
+    return false;
+  } finally {
+    if (acquired && lock) {
+      try { lock.releaseLock(); } catch (releaseError) {
+        console.error("Coach pending action unlock failed: " + errorText_(releaseError));
+      }
+    }
+  }
+}
+
+function cancelWeightPendingCaptureC20A_(userId, chatId, captureId, options) {
+  const runtime = options || {};
+  let lock = null;
+  let acquired = false;
+  try {
+    lock = runtime.lock || LockService.getScriptLock();
+    acquired = typeof lock.tryLock === "function" ? lock.tryLock(5000) === true : false;
+    if (!acquired) return weightFactResult_(false, false, "LOCK_TIMEOUT");
+    const sheet = runtime.sheet || smartConfirmationSheet_();
+    const row = typeof runtime.find_by_id === "function"
+      ? runtime.find_by_id(sheet, captureId)
+      : smartConfirmationFindByCaptureId_(sheet, captureId);
+    if (!row) return weightFactResult_(false, false, "CAPTURE_NOT_FOUND");
+    if (String(row.user_id) !== String(userId) || String(row.chat_id) !== String(chatId)) {
+      return weightFactResult_(false, false, "OWNER_MISMATCH");
+    }
+    const payload = smartConfirmationParseJson_(row.payload_json, {});
+    if (payload.source !== "C20A_WEIGHT_GATE") {
+      return weightFactResult_(false, false, "CAPTURE_CONTRACT_MISMATCH");
+    }
+    if (row.status !== SMART_CONFIRMATION_CONFIG.STATUSES.PENDING) {
+      return weightFactResult_(false, false, "NOT_CONFIRMABLE");
+    }
+    if (typeof runtime.update_state === "function") {
+      runtime.update_state(sheet, row, SMART_CONFIRMATION_CONFIG.STATUSES.CANCELLED);
+    } else {
+      smartConfirmationUpdateState_(sheet, row.row_number, SMART_CONFIRMATION_CONFIG.STATUSES.CANCELLED, "[]", "", "");
+    }
+    if (typeof runtime.flush === "function") runtime.flush();
+    else SpreadsheetApp.flush();
+    return weightFactResult_(false, true, "CANCELLED", {capture_id: String(captureId)});
+  } catch (error) {
+    return weightFactResult_(false, false, "CANCEL_FAILED", {error: errorText_(error)});
+  } finally {
+    if (acquired && lock) {
+      try { lock.releaseLock(); } catch (releaseError) {
+        console.error("C20A cancel unlock failed: " + errorText_(releaseError));
+      }
+    }
+  }
+}
+
+function weightFactDependencies_(injected) {
+  return injected || {
+    read_state: readCoachState_,
+    set_pending_action: updateCoachPendingAction_,
+    create_pending: function(capture, metadata) { return createWeightPendingCaptureC20A_(capture, metadata); },
+    get_pending: getPendingCapture_,
+    detect_confirmation: detectConfirmationIntent_,
+    save: saveConfirmedData_,
+    cancel: cancelPendingCapture_,
+    cancel_created: cancelWeightPendingCaptureC20A_,
+    validate_capture: validateExtractedData_,
+    uuid: function() { return Utilities.getUuid(); },
+    format_date: function(date) { return Utilities.formatDate(date, "Europe/Moscow", "yyyy-MM-dd"); }
+  };
+}
+
+function weightFactResult_(handled, ok, code, extra) {
+  const result = {handled: handled === true, ok: ok === true, code: String(code || "UNKNOWN"),
+    production_writes: false, groq_calls: 0};
+  Object.keys(extra || {}).forEach(function(key) { result[key] = extra[key]; });
+  return result;
+}
+
+function weightFactNumber_(value) {
+  return String(Number(value)).replace(".", ",");
 }
 
 function recordGroqUsage_(model, usage) {

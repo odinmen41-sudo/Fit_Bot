@@ -15,7 +15,11 @@ const CONFIG = Object.freeze({
   MAX_USER_CHARS: 1200,
   MAX_CONTEXT_CHARS: 3500,
   MAX_TELEGRAM_CHARS: 3500,
-  HISTORY_TURNS: 2
+  HISTORY_TURNS: 2,
+  COACH_STATE_VERSION: 2,
+  COACH_STATE_TTL_MS: 48 * 60 * 60 * 1000,
+  COACH_STATE_MAX_TURNS: 3,
+  COACH_STATE_MAX_JSON_CHARS: 3200
 });
 
 const CONTEXT_STAGING_USER_ALIASES = Object.freeze({
@@ -136,7 +140,7 @@ function doPost(e) {
     reply = limitText_(reply, CONFIG.MAX_TELEGRAM_CHARS);
     sendTelegramMessage_(chatId, reply);
     logAiReply_(messageText, reply, modelUsed);
-    saveChatTurn_(chatId, messageText, reply);
+    saveChatTurn_(userId, messageText, reply);
     markBotInputProcessed_(inputRow, modelUsed === "fallback_message" ? "Ошибка AI" : "Да");
 
     console.log("Processed update_id=" + updateId + ", chat_id=" + chatId + ", model=" + modelUsed);
@@ -609,48 +613,242 @@ function rowToText_(headers, row) {
   return pairs.join(", ");
 }
 
-function loadChatHistory_(chatId) {
-  const raw = PropertiesService.getScriptProperties().getProperty("CHAT_HISTORY_" + chatId);
-  if (!raw) return "";
+function loadChatHistory_(telegramUserId, options) {
+  const runtime = options || {};
+  const coachState = readCoachState_(telegramUserId, runtime);
+  return coachState ? formatCoachStateContext_(coachState) : "";
+}
 
+function saveChatTurn_(telegramUserId, userText, assistantText, options) {
+  return saveCoachStateTurn_(telegramUserId, userText, assistantText, options);
+}
+
+function readCoachState_(telegramId, options) {
+  const runtime = options || {};
   try {
-    const turns = JSON.parse(raw);
-    if (!Array.isArray(turns)) return "";
-    return turns.map(function(turn) {
-      return "Пользователь: " + limitText_(turn.user || "", 350) +
-        "; Тренер: " + limitText_(turn.assistant || "", 500);
-    }).join(" | ");
+    const key = coachStateKey_(resolveCoachStateIdentity_(telegramId, runtime));
+    if (!key) return null;
+    const properties = runtime.properties || PropertiesService.getScriptProperties();
+    return readCoachStateValue_(properties, key, coachStateNow_(runtime));
   } catch (error) {
-    return "";
+    console.error("Coach state read failed: " + errorText_(error));
+    return null;
   }
 }
 
-function saveChatTurn_(chatId, userText, assistantText) {
-  const lock = LockService.getScriptLock();
-  lock.waitLock(10000);
-
+function writeCoachState_(telegramId, state, options) {
+  const runtime = options || {};
+  let lock = null;
+  let acquired = false;
   try {
-    const properties = PropertiesService.getScriptProperties();
-    const key = "CHAT_HISTORY_" + chatId;
-    let turns = [];
-
-    try {
-      turns = JSON.parse(properties.getProperty(key) || "[]");
-      if (!Array.isArray(turns)) turns = [];
-    } catch (error) {
-      turns = [];
+    const key = coachStateKey_(resolveCoachStateIdentity_(telegramId, runtime));
+    if (!key) return false;
+    lock = runtime.lock || LockService.getScriptLock();
+    if (typeof lock.tryLock === "function") {
+      acquired = lock.tryLock(50) === true;
+    } else {
+      lock.waitLock(50);
+      acquired = true;
     }
+    if (!acquired) return false;
 
-    turns.push({
-      user: limitText_(userText, 350),
-      assistant: limitText_(assistantText, 500)
-    });
+    const now = coachStateNow_(runtime);
+    const normalized = normalizeCoachState_(state, now);
+    normalized.updated_at = new Date(now).toISOString();
+    normalized.expires_at = new Date(now + CONFIG.COACH_STATE_TTL_MS).toISOString();
+    const serialized = JSON.stringify(normalized);
+    if (serialized.length > CONFIG.COACH_STATE_MAX_JSON_CHARS) return false;
 
-    turns = turns.slice(-CONFIG.HISTORY_TURNS);
-    properties.setProperty(key, JSON.stringify(turns));
+    const properties = runtime.properties || PropertiesService.getScriptProperties();
+    properties.setProperty(key, serialized);
+    return true;
+  } catch (error) {
+    console.error("Coach state write failed: " + errorText_(error));
+    return false;
   } finally {
-    lock.releaseLock();
+    if (acquired && lock) {
+      try {
+        lock.releaseLock();
+      } catch (releaseError) {
+        console.error("Coach state unlock failed: " + errorText_(releaseError));
+      }
+    }
   }
+}
+
+function saveCoachStateTurn_(telegramId, userText, assistantText, options) {
+  const runtime = options || {};
+  let lock = null;
+  let acquired = false;
+  try {
+    const identity = resolveCoachStateIdentity_(telegramId, runtime);
+    const key = coachStateKey_(identity);
+    if (!key) return false;
+
+    lock = runtime.lock || LockService.getScriptLock();
+    if (typeof lock.tryLock === "function") {
+      acquired = lock.tryLock(50) === true;
+    } else {
+      lock.waitLock(50);
+      acquired = true;
+    }
+    if (!acquired) return false;
+
+    const now = coachStateNow_(runtime);
+    const properties = runtime.properties || PropertiesService.getScriptProperties();
+    const existing = readCoachStateValue_(properties, key, now) || normalizeCoachState_({}, now);
+    const transition = buildCoachStateTransition_(userText, assistantText);
+    existing.active_topic = transition.active_topic;
+    existing.pending_question = transition.pending_question;
+    existing.unfinished_consultation = transition.unfinished_consultation;
+    existing.recent_turns.push(transition.turn);
+    existing.recent_turns = existing.recent_turns.slice(-CONFIG.COACH_STATE_MAX_TURNS);
+    existing.updated_at = new Date(now).toISOString();
+    existing.expires_at = new Date(now + CONFIG.COACH_STATE_TTL_MS).toISOString();
+    const serialized = JSON.stringify(normalizeCoachState_(existing, now));
+    if (serialized.length > CONFIG.COACH_STATE_MAX_JSON_CHARS) return false;
+    properties.setProperty(key, serialized);
+    return true;
+  } catch (error) {
+    console.error("Coach state turn failed: " + errorText_(error));
+    return false;
+  } finally {
+    if (acquired && lock) {
+      try {
+        lock.releaseLock();
+      } catch (releaseError) {
+        console.error("Coach state turn unlock failed: " + errorText_(releaseError));
+      }
+    }
+  }
+}
+
+function readCoachStateValue_(properties, key, now) {
+  try {
+    const raw = properties.getProperty(key);
+    if (!raw || raw.length > CONFIG.COACH_STATE_MAX_JSON_CHARS) return null;
+    const state = JSON.parse(raw);
+    const expiresAt = Date.parse(String(state && state.expires_at || ""));
+    if (!state || state.version !== CONFIG.COACH_STATE_VERSION ||
+        !Number.isFinite(expiresAt) || expiresAt <= now) return null;
+    return normalizeCoachState_(state, now);
+  } catch (error) {
+    return null;
+  }
+}
+
+function normalizeCoachState_(state, now) {
+  const source = state && typeof state === "object" ? state : {};
+  const turns = Array.isArray(source.recent_turns) ? source.recent_turns : [];
+  return {
+    version: CONFIG.COACH_STATE_VERSION,
+    updated_at: coachStateTimestamp_(source.updated_at, now),
+    expires_at: coachStateTimestamp_(source.expires_at, now + CONFIG.COACH_STATE_TTL_MS),
+    recent_turns: turns.slice(-CONFIG.COACH_STATE_MAX_TURNS).map(function(turn) {
+      return {
+        user_intent: coachStateEnum_(turn && turn.user_intent, coachStateAllowedUserIntents_(), "UNKNOWN"),
+        assistant_action: coachStateEnum_(turn && turn.assistant_action, coachStateAllowedAssistantActions_(), "UNKNOWN")
+      };
+    }),
+    active_topic: coachStateEnum_(source.active_topic, coachStateAllowedTopics_(), "UNKNOWN"),
+    pending_question: coachStateEnum_(source.pending_question, coachStateAllowedPendingQuestions_(), "NONE"),
+    unfinished_consultation: source.unfinished_consultation === true
+  };
+}
+
+function coachStateKey_(telegramId) {
+  const normalized = String(telegramId == null ? "" : telegramId).trim();
+  return /^-?\d{1,32}$/.test(normalized) ? "COACH_STATE_" + normalized : "";
+}
+
+function resolveCoachStateIdentity_(fallbackId, options) {
+  const runtime = options || {};
+  const telegramUserId = String(runtime.telegram_user_id == null ? "" : runtime.telegram_user_id).trim();
+  return /^-?\d{1,32}$/.test(telegramUserId) ? telegramUserId : fallbackId;
+}
+
+function coachStateNow_(options) {
+  const value = options && typeof options.now === "function" ? options.now() : Date.now();
+  return Number.isFinite(Number(value)) ? Number(value) : Date.now();
+}
+
+function coachStateTimestamp_(value, fallbackMs) {
+  const parsed = Date.parse(String(value || ""));
+  return new Date(Number.isFinite(parsed) ? parsed : fallbackMs).toISOString();
+}
+
+function buildCoachStateTransition_(userText, assistantText) {
+  const normalized = normalizeDeterministicCoachIntent_(userText);
+  let topic = "GENERAL";
+  let intent = "UNKNOWN";
+
+  if (/восстанов/.test(normalized)) {
+    topic = "RECOVERY";
+    intent = "ASK_RECOVERY_GUIDANCE";
+  } else if (/трениров|упражнен|зал|присед|тяг/.test(normalized)) {
+    topic = "TRAINING";
+    intent = "ASK_TRAINING_GUIDANCE";
+  } else if (/питан|съесть|еда|продукт/.test(normalized)) {
+    topic = "NUTRITION";
+    intent = "ASK_NUTRITION_GUIDANCE";
+  } else if (/профил/.test(normalized)) {
+    topic = "PROFILE";
+    intent = "ASK_PROFILE_OVERVIEW";
+  } else if (/^продолж(?:им|ай|ить)?$/.test(normalized)) {
+    intent = "CONTINUE_CONVERSATION";
+  } else if (/^что мы обсуждали(?: вчера)?$/.test(normalized)) {
+    intent = "RECALL_CONVERSATION";
+  }
+
+  const assistantAskedQuestion = /\?\s*$/.test(String(assistantText || ""));
+  return {
+    active_topic: topic,
+    pending_question: assistantAskedQuestion ? "AWAITING_USER_REPLY" : "NONE",
+    unfinished_consultation: assistantAskedQuestion,
+    turn: {
+      user_intent: intent,
+      assistant_action: assistantAskedQuestion ? "ASKED_CLARIFICATION" : "RESPONDED"
+    }
+  };
+}
+
+function formatCoachStateContext_(state) {
+  const intents = (state.recent_turns || []).map(function(turn) {
+    return turn.user_intent;
+  }).join(",");
+  return "Conversation state: topic=" + state.active_topic +
+    "; pending=" + state.pending_question +
+    "; unfinished=" + String(state.unfinished_consultation === true) +
+    "; recent_intents=" + (intents || "NONE");
+}
+
+function coachStateEnum_(value, allowed, fallback) {
+  const normalized = String(value == null ? "" : value).trim().toUpperCase();
+  return allowed[normalized] ? normalized : fallback;
+}
+
+function coachStateAllowedTopics_() {
+  return {TRAINING: true, NUTRITION: true, RECOVERY: true, PROFILE: true, GENERAL: true, UNKNOWN: true};
+}
+
+function coachStateAllowedPendingQuestions_() {
+  return {NONE: true, AWAITING_USER_REPLY: true};
+}
+
+function coachStateAllowedUserIntents_() {
+  return {
+    UNKNOWN: true,
+    ASK_TRAINING_GUIDANCE: true,
+    ASK_NUTRITION_GUIDANCE: true,
+    ASK_RECOVERY_GUIDANCE: true,
+    ASK_PROFILE_OVERVIEW: true,
+    CONTINUE_CONVERSATION: true,
+    RECALL_CONVERSATION: true
+  };
+}
+
+function coachStateAllowedAssistantActions_() {
+  return {UNKNOWN: true, RESPONDED: true, ASKED_CLARIFICATION: true};
 }
 
 function recordGroqUsage_(model, usage) {
@@ -1499,7 +1697,7 @@ function buildLegacyCoachContext_(userId, chatId, options) {
   addRecentUserSheetContext_(parts, "Recovery_Log", userId, 2, "Восстановление", spreadsheet);
   addKnowledgeBaseContext_(parts, spreadsheet);
 
-  const history = runtime.chat_history == null ? loadChatHistory_(chatId) : String(runtime.chat_history);
+  const history = runtime.chat_history == null ? loadChatHistory_(userId) : String(runtime.chat_history);
   if (history) parts.push("Недавний диалог: " + history);
 
   return limitText_(parts.join("\n"), CONFIG.MAX_CONTEXT_CHARS);
@@ -1610,7 +1808,7 @@ function buildMemoryCoachContext_(userId, chatId) {
   contextAddRecentSource_(chunks, "Recovery_Log", 2, "RECENT HISTORY — RECOVERY", "MEDIUM", order++);
   contextAddRecentSource_(chunks, "Health_Data", 2, "RECENT HISTORY — HEALTH", "MEDIUM", order++);
 
-  const history = loadChatHistory_(chatId);
+  const history = loadChatHistory_(userId);
   if (history) {
     chunks.push(contextChunk_("RECENT HISTORY — DIALOG:\n" + limitText_(history, 700), "MEDIUM", order++));
   }

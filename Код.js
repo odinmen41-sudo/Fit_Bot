@@ -18,6 +18,10 @@ const CONFIG = Object.freeze({
   HISTORY_TURNS: 2
 });
 
+const CONTEXT_STAGING_USER_ALIASES = Object.freeze({
+  "132976932": "staging-user-001"
+});
+
 function doGet() {
   return httpOk_("Pavel AI Fitness Coach webhook with Groq AI is running");
 }
@@ -449,8 +453,8 @@ function buildCoachContext_(userId, chatId) {
   return limitText_(deduplicated.join("\n"), CONFIG.MAX_CONTEXT_CHARS);
 }
 
-function addKnowledgeBaseContext_(parts) {
-  const sheet = getSpreadsheet_().getSheetByName("Knowledge_Base");
+function addKnowledgeBaseContext_(parts, spreadsheet) {
+  const sheet = (spreadsheet || getSpreadsheet_()).getSheetByName("Knowledge_Base");
   if (!sheet || sheet.getLastRow() < 2) return;
 
   const rowCount = Math.min(sheet.getLastRow(), 200);
@@ -493,21 +497,66 @@ function addKnowledgeBaseContext_(parts) {
   if (notes.length) parts.push("Ограничения из базы: " + notes.slice(0, 3).join(" | "));
 }
 
-function findUserProfile_(userId) {
-  const sheet = getSpreadsheet_().getSheetByName("User_Profile");
+function findUserProfile_(userId, spreadsheet, options) {
+  const sheet = (spreadsheet || getSpreadsheet_()).getSheetByName("User_Profile");
   if (!sheet || sheet.getLastRow() < 2) return "";
 
-  const lastColumn = Math.min(sheet.getLastColumn(), 8);
+  const lastColumn = sheet.getLastColumn();
+  if (lastColumn < 1) return "";
   const values = sheet.getRange(1, 1, Math.min(sheet.getLastRow(), 100), lastColumn).getDisplayValues();
   const headers = values[0];
+  const match = resolveContextUser_(headers, values.slice(1), userId, options);
+  return match ? rowToText_(headers, match.row) : "";
+}
 
-  for (let i = 1; i < values.length; i++) {
-    if (String(values[i][0]) === String(userId)) {
-      return rowToText_(headers, values[i]);
+function resolveContextUser_(headers, rows, telegramUserId, options) {
+  const directMatch = findContextUserRow_(headers, rows, telegramUserId);
+  if (directMatch) return directMatch;
+
+  const config = options || {};
+  let environment = String(config.deployment_env || "").trim().toUpperCase();
+  if (!environment && typeof PropertiesService !== "undefined") {
+    try {
+      environment = String(PropertiesService.getScriptProperties().getProperty("DEPLOYMENT_ENV") || "")
+        .trim().toUpperCase();
+    } catch (error) {
+      environment = "";
     }
   }
+  if (environment !== "STAGING") return null;
 
-  return "";
+  const canonicalTelegramId = String(telegramUserId == null ? "" : telegramUserId).trim();
+  const stagingUserId = CONTEXT_STAGING_USER_ALIASES[canonicalTelegramId];
+  if (!stagingUserId) return null;
+  return findContextUserRowByHeader_(headers, rows, "User_ID", stagingUserId);
+}
+
+function findContextUserRow_(headers, rows, userId) {
+  const expectedUserId = String(userId == null ? "" : userId).trim();
+  if (!expectedUserId) return null;
+
+  const identityHeaders = ["Telegram_ID", "User_ID"];
+  for (let identityOrder = 0; identityOrder < identityHeaders.length; identityOrder++) {
+    const match = findContextUserRowByHeader_(headers, rows, identityHeaders[identityOrder], expectedUserId);
+    if (match) return match;
+  }
+  return null;
+}
+
+function findContextUserRowByHeader_(headers, rows, identityHeader, expectedUserId) {
+  const expectedHeader = String(identityHeader || "").trim().toLowerCase();
+  const columnIndex = (headers || []).findIndex(function(header) {
+    return String(header || "").trim().toLowerCase() === expectedHeader;
+  });
+  if (columnIndex < 0) return null;
+
+  for (let rowIndex = 0; rowIndex < (rows || []).length; rowIndex++) {
+    if (String(rows[rowIndex][columnIndex] == null ? "" : rows[rowIndex][columnIndex]).trim() ===
+        String(expectedUserId == null ? "" : expectedUserId).trim()) {
+      return {row: rows[rowIndex], row_index: rowIndex, identity_header: identityHeader};
+    }
+  }
+  return null;
 }
 
 function addRecentSheetContext_(parts, sheetName, maxRows, label) {
@@ -521,6 +570,34 @@ function addRecentSheetContext_(parts, sheetName, maxRows, label) {
   const rows = sheet.getRange(startRow, 1, rowCount, lastColumn).getDisplayValues();
   const lines = rows.map(function(row) { return rowToText_(headers, row); }).filter(String);
 
+  if (lines.length) parts.push(label + ": " + lines.join(" | "));
+}
+
+function addRecentUserSheetContext_(parts, sheetName, userId, maxRows, label, spreadsheet) {
+  const sheet = (spreadsheet || getSpreadsheet_()).getSheetByName(sheetName);
+  if (!sheet || sheet.getLastRow() < 2) return;
+
+  const lastColumn = sheet.getLastColumn();
+  if (lastColumn < 1) return;
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
+  const identityColumns = ["Telegram_ID", "User_ID"].map(function(identityHeader) {
+    return headers.findIndex(function(header) {
+      return String(header || "").trim().toLowerCase() === identityHeader.toLowerCase();
+    });
+  });
+  if (identityColumns[0] < 0 && identityColumns[1] < 0) return;
+
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, lastColumn).getDisplayValues();
+  const expectedUserId = String(userId == null ? "" : userId).trim();
+  if (!expectedUserId) return;
+  const rowLimit = Math.max(0, Math.floor(Number(maxRows) || 0));
+  if (!rowLimit) return;
+  const matchingRows = rows.filter(function(row) {
+    return identityColumns.some(function(columnIndex) {
+      return columnIndex >= 0 && String(row[columnIndex] == null ? "" : row[columnIndex]).trim() === expectedUserId;
+    });
+  }).slice(-rowLimit);
+  const lines = matchingRows.map(function(row) { return rowToText_(headers, row); }).filter(String);
   if (lines.length) parts.push(label + ": " + lines.join(" | "));
 }
 
@@ -1405,20 +1482,24 @@ function memoryLogError_(scope, error) {
 }
 
 
-function buildLegacyCoachContext_(userId, chatId) {
+function buildLegacyCoachContext_(userId, chatId, options) {
+  const runtime = options || {};
+  const spreadsheet = runtime.spreadsheet || getSpreadsheet_();
   const parts = [];
 
-  const profile = findUserProfile_(userId);
+  const profile = findUserProfile_(userId, spreadsheet, {
+    deployment_env: runtime.deployment_env
+  });
   if (profile) parts.push("Профиль: " + profile);
 
-  addRecentSheetContext_(parts, "Goals", 2, "Цели");
-  addRecentSheetContext_(parts, "Body_Tracking", 2, "Тело");
-  addRecentSheetContext_(parts, "Nutrition_Log", 3, "Питание");
-  addRecentSheetContext_(parts, "Workout_Log", 2, "Тренировки");
-  addRecentSheetContext_(parts, "Recovery_Log", 2, "Восстановление");
-  addKnowledgeBaseContext_(parts);
+  addRecentUserSheetContext_(parts, "Goals", userId, 2, "Цели", spreadsheet);
+  addRecentUserSheetContext_(parts, "Body_Tracking", userId, 2, "Тело", spreadsheet);
+  addRecentUserSheetContext_(parts, "Nutrition_Log", userId, 3, "Питание", spreadsheet);
+  addRecentUserSheetContext_(parts, "Workout_Log", userId, 2, "Тренировки", spreadsheet);
+  addRecentUserSheetContext_(parts, "Recovery_Log", userId, 2, "Восстановление", spreadsheet);
+  addKnowledgeBaseContext_(parts, spreadsheet);
 
-  const history = loadChatHistory_(chatId);
+  const history = runtime.chat_history == null ? loadChatHistory_(chatId) : String(runtime.chat_history);
   if (history) parts.push("Недавний диалог: " + history);
 
   return limitText_(parts.join("\n"), CONFIG.MAX_CONTEXT_CHARS);

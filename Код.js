@@ -881,7 +881,15 @@ function routeWeightFactConfirmation_(update, options) {
   }
 
   const candidate = detectExplicitWeightUpdate_(message.text);
-  if (!candidate) return weightFactResult_(false, true, "NOT_WEIGHT_FACT");
+  if (!candidate) {
+    const invalidBoundary = detectInvalidExplicitWeightBoundary_(message.text);
+    if (invalidBoundary) {
+      return weightFactResult_(true, false, "WEIGHT_OUT_OF_RANGE", {
+        message: "Укажите текущий вес в диапазоне от 30 до 350 кг."
+      });
+    }
+    return weightFactResult_(false, true, "NOT_WEIGHT_FACT");
+  }
   const capture = buildWeightPendingCapture_(candidate, {
     now: now,
     update_id: update && update.update_id,
@@ -973,12 +981,90 @@ function handleWeightFactConfirmation_(userId, chatId, text, now, dependencies, 
 }
 
 function detectExplicitWeightUpdate_(text) {
-  const normalized = String(text == null ? "" : text).trim().toLowerCase().replace(/ё/g, "е");
-  const match = normalized.match(/^(?:мой\s+вес|сейчас\s+вешу|вес\s+сегодня)\s*[:=\-]?\s*(\d{2,3}(?:[.,]\d{1,2})?)\s*(?:кг)?[.!]?$/i);
+  const normalized = normalizeExplicitWeightText_(text);
+  if (!normalized || normalized.length > 80 || hasExerciseWeightContext_(normalized)) return null;
+
+  const temporal = detectTemporalWeightComparison_(normalized);
+  if (temporal) return temporal;
+  if (hasDisqualifyingWeightContext_(normalized)) return null;
+
+  const value = parseExplicitCurrentWeightValue_(normalized);
+  return validWeightCandidate_(value);
+}
+
+function detectTemporalWeightComparison_(text) {
+  const normalized = normalizeExplicitWeightText_(text);
+  if (!normalized || normalized.length > 80 || /[?？]/.test(normalized) ||
+      hasExerciseWeightContext_(normalized)) return null;
+  const values = parseTemporalWeightComparisonValues_(normalized);
+  if (!values || !isWeightWithinBoundary_(values.previous) || !isWeightWithinBoundary_(values.current)) return null;
+  return validWeightCandidate_(values.current);
+}
+
+function normalizeExplicitWeightText_(text) {
+  return String(text == null ? "" : text)
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .replace(/[\u00a0\u2007\u202f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseExplicitCurrentWeightValue_(normalized) {
+  const patterns = [
+    /^мой(?:\s+текущий)?\s+вес\s*[:=\-–—]?\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:кг|килограмм(?:а|ов)?)?\s*[.!]?$/,
+    /^сейчас\s+(?:я\s+)?вешу\s*[:=\-–—]?\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:кг|килограмм(?:а|ов)?)?\s*[.!]?$/,
+    /^(?:вес\s+(?:сегодня|на\s+сегодня)|сегодня\s+мой\s+вес)\s*[:=\-–—]?\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:кг|килограмм(?:а|ов)?)?\s*[.!]?$/
+  ];
+  for (let i = 0; i < patterns.length; i += 1) {
+    const match = normalized.match(patterns[i]);
+    if (match) return Number(match[1].replace(",", "."));
+  }
+  return null;
+}
+
+function parseTemporalWeightComparisonValues_(normalized) {
+  const number = "(\\d{1,3}(?:[.,]\\d{1,2})?)";
+  const unit = "(?:\\s*(?:кг|килограмм(?:а|ов)?))?";
+  const pattern = new RegExp("^(?:(?:раньше|в прошлом месяце)\\s+)?(?:я\\s+)?был(?:а)?\\s+" +
+    number + unit + "\\s*[,;]\\s*(?:а\\s+)?(?:сейчас|теперь)\\s+(?:(?:я\\s+)?вешу\\s+)?" +
+    number + unit + "\\s*[.!]?$");
+  const match = normalized.match(pattern);
   if (!match) return null;
-  const value = Number(match[1].replace(",", "."));
-  if (!Number.isFinite(value) || value < 30 || value > 350) return null;
+  return {previous: Number(match[1].replace(",", ".")), current: Number(match[2].replace(",", "."))};
+}
+
+function detectInvalidExplicitWeightBoundary_(text) {
+  const normalized = normalizeExplicitWeightText_(text);
+  if (!normalized || normalized.length > 80 || hasExerciseWeightContext_(normalized)) return null;
+  const temporal = parseTemporalWeightComparisonValues_(normalized);
+  const value = temporal ? temporal.current :
+    (hasDisqualifyingWeightContext_(normalized) ? null : parseExplicitCurrentWeightValue_(normalized));
+  return value != null && !isWeightWithinBoundary_(value) ? {fact_type: "WEIGHT", reason: "OUT_OF_RANGE"} : null;
+}
+
+function validWeightCandidate_(value) {
+  if (!isWeightWithinBoundary_(value)) return null;
   return {fact_type: "WEIGHT", category: "BODY_TRACKING", value: value, unit: "kg"};
+}
+
+function isWeightWithinBoundary_(value) {
+  return Number.isFinite(value) && value >= 30 && value <= 350;
+}
+
+function hasDisqualifyingWeightContext_(normalized) {
+  if (/[?？]/.test(normalized)) return true;
+  const blockedContexts = [
+    /(?:^|[^а-яa-z0-9])(?:примерно|около|где-то|приблизительно|наверное|вроде|кажется|может|возможно)(?:$|[^а-яa-z0-9])/,
+    /(?:^|[^а-яa-z0-9])(?:был|была|было|будет|станет|хочу|планирую|цель|целевой|желаемый)(?:$|[^а-яa-z0-9])/,
+    /(?:^|[^а-яa-z0-9])(?:скинул|скинула|сбросил|сбросила|набрал|набрала|похудел|похудела|прибавил|прибавила)(?:$|[^а-яa-z0-9])/,
+    /(?:^|[^а-яa-z0-9])(?:не\s+более|не\s+менее|не|от|до)\s+\d/
+  ];
+  return blockedContexts.some(function(pattern) { return pattern.test(normalized); });
+}
+
+function hasExerciseWeightContext_(normalized) {
+  return /(?:^|[^а-яa-z0-9])(?:присед[а-яa-z]*|жим[а-яa-z]*|тяг[а-яa-z]*|подход[а-яa-z]*|повтор[а-яa-z]*|штанг[а-яa-z]*|гантел[а-яa-z]*|тренажер[а-яa-z]*|рабочий\s+вес)(?:$|[^а-яa-z0-9])/.test(normalized);
 }
 
 function buildWeightPendingCapture_(candidate, options) {

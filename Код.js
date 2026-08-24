@@ -2110,7 +2110,7 @@ function loadCoachRules_() {
     });
   } catch (error) {
     memoryLogError_("loadCoachRules_", error);
-    throw error;
+    return [];
   }
 }
 
@@ -2306,15 +2306,20 @@ function saveUserMemory_(userId, category, key, value, priority) {
 }
 
 function memoryLoadPersona_() {
-  const sheet = memoryRequiredSheet_(MEMORY_LAYER_CONFIG.PERSONA_SHEET);
-  if (sheet.getLastRow() < 2) return {};
-  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getDisplayValues();
-  const persona = {};
-  rows.forEach(function(row) {
-    const key = String(row[0]).trim();
-    if (key) persona[key] = String(row[1]).trim();
-  });
-  return persona;
+  try {
+    const sheet = memoryRequiredSheet_(MEMORY_LAYER_CONFIG.PERSONA_SHEET);
+    if (sheet.getLastRow() < 2) return {};
+    const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getDisplayValues();
+    const persona = {};
+    rows.forEach(function(row) {
+      const key = String(row[0]).trim();
+      if (key) persona[key] = String(row[1]).trim();
+    });
+    return persona;
+  } catch (error) {
+    memoryLogError_("memoryLoadPersona_", error);
+    return {};
+  }
 }
 
 function memoryFormatPersona_(persona) {
@@ -2345,9 +2350,41 @@ function memoryFormatUserMemory_(memory) {
 }
 
 function memoryLoadProfileContext_(userId) {
-  const profile = memoryFindRowByUserId_("User_Profile", userId);
-  if (!profile) return "";
-  return "USER PROFILE:\n" + memoryRowToText_(profile.headers, profile.row);
+  const sheet = getSpreadsheet_().getSheetByName("User_Profile");
+  if (!sheet || sheet.getLastRow() < 2 || sheet.getLastColumn() < 1) return "";
+  const values = sheet.getRange(1, 1, Math.min(sheet.getLastRow(), 100), sheet.getLastColumn())
+    .getDisplayValues();
+  const headers = values[0];
+  const match = resolveContextUser_(headers, values.slice(1), userId);
+  return match ? "USER PROFILE:\n" + memoryRowToText_(headers, match.row) : "";
+}
+
+function sanitizeCoachProfileContext_(profileContext, excludeCurrentWeight) {
+  const technicalHeaders = /^(?:id|user_id|telegram_id|source|confirmation_id|updated_at)$/i;
+  const currentWeightHeaders = /^(?:текущий\s+вес|current[_\s-]*weight)$/i;
+  const lines = String(profileContext || "").split("\n");
+  const sanitized = [];
+
+  lines.forEach(function(line) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) return;
+    if (/^[^:=;]+:$/.test(trimmed)) {
+      sanitized.push(trimmed);
+      return;
+    }
+
+    const prefix = /^[-•]\s*/.test(trimmed) ? "- " : "";
+    const fields = trimmed.replace(/^[-•]\s*/, "").split(/\s*;\s*/).filter(function(field) {
+      const match = String(field).match(/^([^:=]+)\s*[:=]/);
+      if (!match) return true;
+      const header = String(match[1] || "").trim();
+      if (technicalHeaders.test(header)) return false;
+      return !(excludeCurrentWeight && currentWeightHeaders.test(header));
+    });
+    if (fields.length) sanitized.push(prefix + fields.join("; "));
+  });
+
+  return sanitized.join("\n").replace(/\n[^\n]+:\s*$/, "").trim();
 }
 
 function memoryLoadRecentSheetContext_(sheetName, userId, maxRows, label) {
@@ -2672,9 +2709,11 @@ function buildMemoryCoachContext_(userId, chatId, options) {
   chunks.push.apply(chunks, contextSectionChunks_("MEMORY — ADDITIONAL FACTS", remainingMemory, order));
   order += 10;
 
-  const profileSource = runtime.skip_sources ? "" : memoryLoadProfileContext_(String(userId));
+  const rawProfileSource = runtime.profile_context == null ?
+    (runtime.skip_sources ? "" : memoryLoadProfileContext_(String(userId))) : String(runtime.profile_context);
+  const profileSource = sanitizeCoachProfileContext_(rawProfileSource, Boolean(bodyCurrent));
   if (profileSource) {
-    chunks.push(contextChunk_("SOURCE — User_Profile:\n" + profileSource, "MEDIUM", order++));
+    chunks.push(contextChunk_("PROFILE DETAILS:\n" + profileSource, "MEDIUM", order++));
   }
 
   if (!runtime.skip_sources) {

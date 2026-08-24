@@ -1502,6 +1502,22 @@ function bootstrapAiMemorySchemaForStaging_(options) {
   }
 }
 
+function runStagingMemoryBootstrap(options) {
+  const runtime = options || {};
+  let environmentValue = runtime.deployment_env;
+  if (environmentValue == null) {
+    const properties = runtime.properties || PropertiesService.getScriptProperties();
+    environmentValue = properties.getProperty("DEPLOYMENT_ENV");
+  }
+  const environment = String(environmentValue || "").trim().toUpperCase();
+  if (environment !== "STAGING") return {ok: false, code: "STAGING_ONLY"};
+
+  const bootstrapRuntime = {};
+  Object.keys(runtime).forEach(function(key) { bootstrapRuntime[key] = runtime[key]; });
+  bootstrapRuntime.deployment_env = environment;
+  return bootstrapAiMemorySchemaForStaging_(bootstrapRuntime);
+}
+
 function generateEventId_(date, options) {
   const runtime = options || {};
   const now = date instanceof Date ? date : new Date();

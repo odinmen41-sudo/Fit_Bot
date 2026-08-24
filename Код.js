@@ -20,6 +20,7 @@ const CONFIG = Object.freeze({
   COACH_STATE_TTL_MS: 48 * 60 * 60 * 1000,
   COACH_STATE_MAX_TURNS: 3,
   COACH_STATE_MAX_JSON_CHARS: 3200,
+  MEMORY_PERSISTENCE_ENABLED_PROPERTY: "MEMORY_PERSISTENCE_ENABLED",
   MEMORY_RETRY_PROPERTY_PREFIX: "C21_MEMORY_RETRY_QUEUE_",
   MEMORY_RETRY_MAX_ITEMS: 20,
   MEMORY_RETRY_TTL_MS: 48 * 60 * 60 * 1000,
@@ -1311,9 +1312,9 @@ function handleWeightFactPersistence_(userId, weight, confirmationId, options) {
   if (!Number.isFinite(Number(weight)) || Number(weight) < 30 || Number(weight) > 350) {
     return {ok: false, code: "INVALID_WEIGHT", memory_sync_status: "RETRY_PENDING"};
   }
-  if (isSimulationMode_(runtime)) {
-    return {ok: true, code: "SIMULATION_NO_WRITE", memory_sync_status: "SYNCED",
-      simulated: true, memory_writes: 0};
+  if (!isMemoryPersistenceEnabled_(runtime)) {
+    return {ok: true, code: "MEMORY_PERSISTENCE_DISABLED", memory_sync_status: "SYNCED",
+      memory_writes: 0};
   }
   const now = runtime.now instanceof Date ? runtime.now : new Date();
   const timestamp = now.toISOString();
@@ -1338,7 +1339,9 @@ function handleWeightFactPersistence_(userId, weight, confirmationId, options) {
 
 function persistMemoryBatch_(operations, options) {
   const runtime = options || {};
-  if (isSimulationMode_(runtime)) return {ok: true, operations: [], memory_writes: 0, simulated: true};
+  if (!isMemoryPersistenceEnabled_(runtime)) {
+    return {ok: true, operations: [], memory_writes: 0, persistence_disabled: true};
+  }
   let lock = null;
   let acquired = false;
   try {
@@ -1413,6 +1416,92 @@ function memorySchemaIndexes_(headers) {
   return result;
 }
 
+function aiMemoryRequiredHeaders_() {
+  return ["ID", "USER_ID", "CATEGORY", "KEY", "VALUE", "PRIORITY", "UPDATED_AT", "SOURCE", "CONFIRMATION_ID"];
+}
+
+function validateAiMemorySchema_(sheetOrHeaders) {
+  try {
+    let headers = [];
+    if (Array.isArray(sheetOrHeaders)) {
+      headers = sheetOrHeaders.map(String);
+    } else if (sheetOrHeaders && typeof sheetOrHeaders.getLastRow === "function" &&
+        typeof sheetOrHeaders.getLastColumn === "function") {
+      const lastRow = Number(sheetOrHeaders.getLastRow() || 0);
+      const lastColumn = Number(sheetOrHeaders.getLastColumn() || 0);
+      if (lastRow < 1 || lastColumn < 1) {
+        return {ok: false, code: "AI_MEMORY_SCHEMA_EMPTY", headers: [], missing: aiMemoryRequiredHeaders_()};
+      }
+      headers = sheetOrHeaders.getRange(1, 1, 1, lastColumn).getValues()[0].map(String);
+    }
+    const normalized = headers.map(function(header) { return String(header || "").trim().toUpperCase(); });
+    const missing = aiMemoryRequiredHeaders_().filter(function(required) {
+      return normalized.indexOf(required) < 0;
+    });
+    return {ok: missing.length === 0, code: missing.length ? "AI_MEMORY_SCHEMA_INVALID" : "AI_MEMORY_SCHEMA_VALID",
+      headers: headers, missing: missing};
+  } catch (error) {
+    return {ok: false, code: "AI_MEMORY_SCHEMA_CHECK_FAILED", headers: [], missing: aiMemoryRequiredHeaders_(),
+      error: errorText_(error)};
+  }
+}
+
+function bootstrapAiMemorySchemaForStaging_(options) {
+  const runtime = options || {};
+  let lock = null;
+  let acquired = false;
+  try {
+    let environmentValue = runtime.deployment_env;
+    if (environmentValue == null) {
+      const properties = runtime.properties || PropertiesService.getScriptProperties();
+      environmentValue = properties.getProperty("DEPLOYMENT_ENV");
+    }
+    const environment = String(environmentValue || "").trim().toUpperCase();
+    if (environment !== "STAGING") return {ok: false, code: "STAGING_ONLY", created: false, writes: 0};
+
+    lock = runtime.lock || LockService.getScriptLock();
+    acquired = typeof lock.tryLock === "function" ? lock.tryLock(5000) === true : false;
+    if (!acquired) return {ok: false, code: "LOCK_TIMEOUT", created: false, writes: 0};
+
+    const spreadsheet = runtime.spreadsheet || getSpreadsheet_();
+    let sheet = typeof runtime.get_sheet === "function"
+      ? runtime.get_sheet(spreadsheet, MEMORY_LAYER_CONFIG.MEMORY_SHEET)
+      : spreadsheet.getSheetByName(MEMORY_LAYER_CONFIG.MEMORY_SHEET);
+    let created = false;
+    if (!sheet) {
+      sheet = typeof runtime.create_sheet === "function"
+        ? runtime.create_sheet(spreadsheet, MEMORY_LAYER_CONFIG.MEMORY_SHEET)
+        : spreadsheet.insertSheet(MEMORY_LAYER_CONFIG.MEMORY_SHEET);
+      created = true;
+    }
+
+    const lastRow = Number(sheet.getLastRow() || 0);
+    const lastColumn = Number(sheet.getLastColumn() || 0);
+    if (lastRow < 1 || lastColumn < 1) {
+      const headers = aiMemoryRequiredHeaders_();
+      sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+      if (typeof runtime.flush === "function") runtime.flush();
+      else SpreadsheetApp.flush();
+      return {ok: true, code: "AI_MEMORY_SCHEMA_BOOTSTRAPPED", created: created, writes: 1,
+        headers: headers};
+    }
+
+    const validation = validateAiMemorySchema_(sheet);
+    validation.created = created;
+    validation.writes = 0;
+    return validation;
+  } catch (error) {
+    return {ok: false, code: "AI_MEMORY_BOOTSTRAP_FAILED", created: false, writes: 0,
+      error: errorText_(error)};
+  } finally {
+    if (acquired && lock) {
+      try { lock.releaseLock(); } catch (releaseError) {
+        console.error("AI_MEMORY bootstrap unlock failed: " + errorText_(releaseError));
+      }
+    }
+  }
+}
+
 function generateEventId_(date, options) {
   const runtime = options || {};
   const now = date instanceof Date ? date : new Date();
@@ -1428,6 +1517,21 @@ function isSimulationMode_(options) {
     return String(properties.getProperty("DATA_WRITE_MODE") || "SIMULATION").toUpperCase() === "SIMULATION";
   } catch (error) {
     return true;
+  }
+}
+
+function isMemoryPersistenceEnabled_(options) {
+  const runtime = options || {};
+  try {
+    if (runtime.memory_persistence_enabled != null) {
+      return runtime.memory_persistence_enabled === true ||
+        String(runtime.memory_persistence_enabled).trim().toLowerCase() === "true";
+    }
+    const properties = runtime.properties || PropertiesService.getScriptProperties();
+    return String(properties.getProperty(CONFIG.MEMORY_PERSISTENCE_ENABLED_PROPERTY) || "false")
+      .trim().toLowerCase() === "true";
+  } catch (error) {
+    return false;
   }
 }
 

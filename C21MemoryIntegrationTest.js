@@ -7,7 +7,8 @@ function runC21MemoryIntegrationTests() {
     getProperty: function(key) { return Object.prototype.hasOwnProperty.call(values, key) ? values[key] : null; },
     setProperty: function(key, value) { values[key] = String(value); }}; }
   function store(headers, rows) { return {headers: headers.slice(), rows: (rows || []).map(function(row) { return row.slice(); }), writes: 0}; }
-  function runtimeFor(target, extra) { return Object.assign({data_write_mode: "ACTIVE", lock: lock(), retry_lock: lock(),
+  function runtimeFor(target, extra) { return Object.assign({data_write_mode: "ACTIVE", memory_persistence_enabled: true,
+    lock: lock(), retry_lock: lock(),
     read_table: function() { return {headers: target.headers.slice(), rows: target.rows.map(function(row) { return row.slice(); })}; },
     write_table: function(sheet, headers, rows) { target.headers = headers.slice(); target.rows = rows.map(function(row) { return row.slice(); }); target.writes += 1; },
     flush: function() {}, now: new Date("2026-08-24T10:00:00.000Z"),
@@ -25,7 +26,7 @@ function runC21MemoryIntegrationTests() {
 
   const simulationStore = store(headers9, []);
   const simulated = processConfirmedFacts_("capture-sim", "user-1", payload(117),
-    runtimeFor(simulationStore, {data_write_mode: "SIMULATION"}));
+    runtimeFor(simulationStore, {data_write_mode: "SIMULATION", memory_persistence_enabled: false}));
   record("C21-03_SIMULATION_ZERO_MEMORY_WRITES", simulated.memory_sync_status === "SYNCED" &&
     simulated.memory_writes === 0 && simulationStore.writes === 0 && simulationStore.rows.length === 0, simulated);
 
@@ -78,7 +79,8 @@ function runC21MemoryIntegrationTests() {
 
   const wrapperStore = store(headers9, []);
   const wrapped = saveConfirmedDataWithMemory_("capture-wrapper", "user-5", Object.assign(runtimeFor(wrapperStore, {
-    data_write_mode: "SIMULATION", payload: payload(117), confirmation_id: "capture-wrapper"
+    data_write_mode: "SIMULATION", memory_persistence_enabled: false,
+    payload: payload(117), confirmation_id: "capture-wrapper"
   }), {save_confirmed: function() { return {ok: true, code: "SAVED", production_writes: false}; }}));
   record("C21-12_C20A_CONFIRMATION_MEMORY_DISABLED", wrapped.ok && wrapped.code === "SAVED" &&
     wrapped.memory_sync_status === "SYNCED" && wrapperStore.writes === 0, wrapped);

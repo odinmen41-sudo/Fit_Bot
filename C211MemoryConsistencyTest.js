@@ -8,7 +8,8 @@ function runC211MemoryConsistencyTests() {
     setProperty: function(key, value) { values[key] = String(value); }}; }
   const headers = ["CONFIRMATION_ID", "VALUE", "KEY", "USER_ID", "UPDATED_AT", "ID", "CATEGORY", "SOURCE", "PRIORITY"];
   const table = {headers: headers.slice(), rows: [], writes: 0};
-  function runtime(now, uuid) { return {data_write_mode: "ACTIVE", now: now, uuid: function() { return uuid; },
+  function runtime(now, uuid) { return {data_write_mode: "ACTIVE", memory_persistence_enabled: true,
+    now: now, uuid: function() { return uuid; },
     lock: lock(), retry_lock: lock(), read_table: function() { return {headers: table.headers.slice(), rows: table.rows.map(function(row) { return row.slice(); })}; },
     write_table: function(sheet, nextHeaders, rows) { table.headers = nextHeaders.slice(); table.rows = rows.map(function(row) { return row.slice(); }); table.writes += 1; },
     flush: function() {}}; }

@@ -19,7 +19,11 @@ const CONFIG = Object.freeze({
   COACH_STATE_VERSION: 2,
   COACH_STATE_TTL_MS: 48 * 60 * 60 * 1000,
   COACH_STATE_MAX_TURNS: 3,
-  COACH_STATE_MAX_JSON_CHARS: 3200
+  COACH_STATE_MAX_JSON_CHARS: 3200,
+  MEMORY_RETRY_PROPERTY_PREFIX: "C21_MEMORY_RETRY_QUEUE_",
+  MEMORY_RETRY_MAX_ITEMS: 20,
+  MEMORY_RETRY_TTL_MS: 48 * 60 * 60 * 1000,
+  MEMORY_RETRY_BASE_DELAY_MS: 5 * 60 * 1000
 });
 
 const CONTEXT_STAGING_USER_ALIASES = Object.freeze({
@@ -963,7 +967,9 @@ function handleWeightFactConfirmation_(userId, chatId, text, now, dependencies, 
 
   const saved = dependencies.save(verified.capture.capture_id, userId, {
     now: now,
-    chat_id: chatId
+    chat_id: chatId,
+    payload: verified.payload,
+    confirmation_id: verified.capture.capture_id
   });
   if (saved && ["SAVED", "ALREADY_SAVED"].indexOf(saved.code) >= 0) {
     dependencies.set_pending_action(userId, "NONE", stateOptions);
@@ -1257,6 +1263,254 @@ function cancelWeightPendingCaptureC20A_(userId, chatId, captureId, options) {
   }
 }
 
+function saveConfirmedDataWithMemory_(captureId, userId, options) {
+  const runtime = options || {};
+  const save = typeof runtime.save_confirmed === "function" ? runtime.save_confirmed : saveConfirmedData_;
+  const saved = save(captureId, userId, runtime);
+  if (!saved || saved.ok !== true || saved.code !== "SAVED") return saved;
+  const sync = processConfirmedFacts_(captureId, userId, runtime.payload, {
+    confirmation_id: runtime.confirmation_id || captureId,
+    now: runtime.now,
+    data_write_mode: runtime.data_write_mode,
+    properties: runtime.memory_properties,
+    lock: runtime.memory_lock,
+    sheet: runtime.memory_sheet,
+    read_table: runtime.memory_read_table,
+    write_table: runtime.memory_write_table,
+    uuid: runtime.memory_uuid,
+    log: runtime.memory_log
+  });
+  saved.memory_sync_status = sync.memory_sync_status;
+  saved.memory_sync = sync;
+  return saved;
+}
+
+function processConfirmedFacts_(captureId, userId, payload, options) {
+  const runtime = options || {};
+  const items = payload && Array.isArray(payload.items) ? payload.items : [];
+  const weightItems = items.filter(function(item) {
+    return item && item.category === "BODY_TRACKING" && item.fields && item.fields.weight;
+  });
+  if (weightItems.length === 1) {
+    const weightField = weightItems[0].fields.weight;
+    const weight = Number(weightField && weightField.value);
+    return handleWeightFactPersistence_(userId, weight, runtime.confirmation_id || captureId, runtime);
+  }
+  const result = {ok: false, code: "UNKNOWN_FACT_TYPE", memory_sync_status: "RETRY_PENDING"};
+  try {
+    const logger = typeof runtime.log === "function" ? runtime.log : function(message) {
+      console.error(message);
+    };
+    logger("C21 UNKNOWN_FACT_TYPE capture=" + String(captureId || ""));
+  } catch (ignored) {}
+  return result;
+}
+
+function handleWeightFactPersistence_(userId, weight, confirmationId, options) {
+  const runtime = options || {};
+  if (!Number.isFinite(Number(weight)) || Number(weight) < 30 || Number(weight) > 350) {
+    return {ok: false, code: "INVALID_WEIGHT", memory_sync_status: "RETRY_PENDING"};
+  }
+  if (isSimulationMode_(runtime)) {
+    return {ok: true, code: "SIMULATION_NO_WRITE", memory_sync_status: "SYNCED",
+      simulated: true, memory_writes: 0};
+  }
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  const timestamp = now.toISOString();
+  const eventId = generateEventId_(now, runtime);
+  const operations = [{behavior: "APPEND", id: eventId, user_id: String(userId),
+    category: "body_tracking", key: "weight_event", value: String(Number(weight)), priority: "HIGH",
+    updated_at: timestamp, source: "C21_CONFIRMED_FACT", confirmation_id: String(confirmationId || "")}];
+  try {
+    const persisted = persistMemoryBatch_(operations, runtime);
+    return {ok: true, code: "MEMORY_SYNCED", memory_sync_status: "SYNCED",
+      event_id: eventId, operations: persisted.operations, memory_writes: persisted.memory_writes};
+  } catch (error) {
+    if (runtime.skip_retry_enqueue !== true) {
+      enqueueMemoryRetry_({capture_id: String(confirmationId || ""), user_id: String(userId),
+        fact_type: "WEIGHT", created_at: timestamp, retry_count: 0,
+        next_retry_at: new Date(now.getTime() + CONFIG.MEMORY_RETRY_BASE_DELAY_MS).toISOString()}, runtime);
+    }
+    return {ok: false, code: "MEMORY_WRITE_FAILED", memory_sync_status: "RETRY_PENDING",
+      error: errorText_(error), memory_writes: 0};
+  }
+}
+
+function persistMemoryBatch_(operations, options) {
+  const runtime = options || {};
+  if (isSimulationMode_(runtime)) return {ok: true, operations: [], memory_writes: 0, simulated: true};
+  let lock = null;
+  let acquired = false;
+  try {
+    lock = runtime.lock || LockService.getScriptLock();
+    if (typeof lock.tryLock === "function") acquired = lock.tryLock(MEMORY_LAYER_CONFIG.LOCK_TIMEOUT_MS) === true;
+    else { lock.waitLock(MEMORY_LAYER_CONFIG.LOCK_TIMEOUT_MS); acquired = true; }
+    if (!acquired) throw new Error("C21_MEMORY_LOCK_TIMEOUT");
+    const sheet = runtime.sheet || (typeof runtime.read_table === "function" ? null :
+      memoryRequiredSheet_(MEMORY_LAYER_CONFIG.MEMORY_SHEET));
+    const table = typeof runtime.read_table === "function" ? runtime.read_table(sheet) : memoryReadBatchTable_(sheet);
+    const headers = table.headers.slice();
+    const rows = table.rows.map(function(row) { return row.slice(); });
+    const indexes = memorySchemaIndexes_(headers);
+    ["id", "user_id", "category", "key", "value", "priority", "updated_at"].forEach(function(required) {
+      if (indexes[required] < 0) throw new Error("AI_MEMORY missing required column: " + required.toUpperCase());
+    });
+    const results = [];
+    (operations || []).forEach(function(operation) {
+      const row = new Array(headers.length).fill("");
+      Object.keys(indexes).forEach(function(field) {
+        if (indexes[field] >= 0 && operation[field] != null) row[indexes[field]] = operation[field];
+      });
+      let target = -1;
+      if (operation.behavior === "UPSERT") {
+        rows.forEach(function(existing, index) {
+          if (String(existing[indexes.user_id]) === String(operation.user_id) &&
+              String(existing[indexes.category]) === String(operation.category) &&
+              String(existing[indexes.key]) === String(operation.key)) {
+            if (target >= 0) throw new Error("AI_MEMORY uniqueness violation");
+            target = index;
+          }
+        });
+      }
+      if (target >= 0) {
+        rows[target] = row;
+        results.push({action: "updated", id: operation.id});
+      } else {
+        rows.push(row);
+        results.push({action: "inserted", id: operation.id});
+      }
+    });
+    if (typeof runtime.write_table === "function") runtime.write_table(sheet, headers, rows);
+    else sheet.getRange(1, 1, rows.length + 1, headers.length).setValues([headers].concat(rows));
+    if (typeof runtime.flush === "function") runtime.flush();
+    else SpreadsheetApp.flush();
+    return {ok: true, operations: results, memory_writes: 1};
+  } finally {
+    if (acquired && lock) {
+      try { lock.releaseLock(); } catch (releaseError) {
+        console.error("C21 memory unlock failed: " + errorText_(releaseError));
+      }
+    }
+  }
+}
+
+function memoryReadBatchTable_(sheet) {
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+  if (lastRow < 1 || lastColumn < 1) throw new Error("AI_MEMORY schema is empty");
+  const values = sheet.getRange(1, 1, lastRow, lastColumn).getValues();
+  return {headers: values[0].map(String), rows: values.slice(1)};
+}
+
+function memorySchemaIndexes_(headers) {
+  const aliases = {
+    id: ["ID"], user_id: ["USER_ID"], category: ["CATEGORY"], key: ["KEY"], value: ["VALUE"],
+    priority: ["PRIORITY"], updated_at: ["UPDATED_AT"], source: ["SOURCE"],
+    confirmation_id: ["CONFIRMATION_ID"]
+  };
+  const result = {};
+  Object.keys(aliases).forEach(function(field) { result[field] = memoryHeaderIndex_(headers, aliases[field]); });
+  return result;
+}
+
+function generateEventId_(date, options) {
+  const runtime = options || {};
+  const now = date instanceof Date ? date : new Date();
+  const uuid = typeof runtime.uuid === "function" ? runtime.uuid() : Utilities.getUuid();
+  return now.toISOString() + "_" + String(uuid);
+}
+
+function isSimulationMode_(options) {
+  const runtime = options || {};
+  if (runtime.data_write_mode != null) return String(runtime.data_write_mode).toUpperCase() === "SIMULATION";
+  try {
+    const properties = runtime.properties || PropertiesService.getScriptProperties();
+    return String(properties.getProperty("DATA_WRITE_MODE") || "SIMULATION").toUpperCase() === "SIMULATION";
+  } catch (error) {
+    return true;
+  }
+}
+
+function enqueueMemoryRetry_(task, options) {
+  const runtime = options || {};
+  let lock = null;
+  let acquired = false;
+  try {
+    const properties = runtime.properties || PropertiesService.getScriptProperties();
+    const key = memoryRetryKey_(task && task.user_id);
+    if (!key) return false;
+    lock = runtime.retry_lock || LockService.getScriptLock();
+    acquired = typeof lock.tryLock === "function" ? lock.tryLock(1000) === true : false;
+    if (!acquired) return false;
+    let queue = [];
+    try { queue = JSON.parse(properties.getProperty(key) || "[]"); } catch (ignored) {}
+    if (!Array.isArray(queue)) queue = [];
+    queue.push({capture_id: String(task.capture_id || ""), fact_type: String(task.fact_type || "UNKNOWN"),
+      created_at: String(task.created_at || new Date().toISOString()), retry_count: Number(task.retry_count || 0),
+      next_retry_at: String(task.next_retry_at || new Date().toISOString())});
+    queue = queue.slice(-CONFIG.MEMORY_RETRY_MAX_ITEMS);
+    properties.setProperty(key, JSON.stringify(queue));
+    return true;
+  } catch (error) {
+    console.error("C21 retry enqueue failed: " + errorText_(error));
+    return false;
+  } finally {
+    if (acquired && lock) try { lock.releaseLock(); } catch (ignored) {}
+  }
+}
+
+function retryPendingMemorySync_(userId, options) {
+  const runtime = options || {};
+  const properties = runtime.properties || PropertiesService.getScriptProperties();
+  const key = memoryRetryKey_(userId);
+  if (!key) return {ok: false, retried: 0, pending: 0};
+  let queue = [];
+  try { queue = JSON.parse(properties.getProperty(key) || "[]"); } catch (ignored) {}
+  if (!Array.isArray(queue) || !queue.length) return {ok: true, retried: 0, pending: 0};
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  const pending = [];
+  let synced = 0;
+  queue.forEach(function(task) {
+    const createdAt = new Date(task.created_at).getTime();
+    if (!Number.isFinite(createdAt) || now.getTime() - createdAt > CONFIG.MEMORY_RETRY_TTL_MS) return;
+    if (new Date(task.next_retry_at).getTime() > now.getTime()) { pending.push(task); return; }
+    const resolver = typeof runtime.resolve_retry_fact === "function" ? runtime.resolve_retry_fact : resolveMemoryRetryFact_;
+    const fact = resolver(task.capture_id, userId, runtime);
+    if (!fact || fact.fact_type !== "WEIGHT") return;
+    const retryRuntime = Object.assign({}, runtime, {skip_retry_enqueue: true});
+    const result = handleWeightFactPersistence_(userId, fact.value, task.capture_id, retryRuntime);
+    if (result.memory_sync_status === "SYNCED") synced += 1;
+    else {
+      const retryCount = Number(task.retry_count || 0) + 1;
+      pending.push({capture_id: String(task.capture_id), fact_type: String(task.fact_type),
+        created_at: String(task.created_at), retry_count: retryCount,
+        next_retry_at: new Date(now.getTime() + CONFIG.MEMORY_RETRY_BASE_DELAY_MS * Math.min(12, retryCount + 1)).toISOString()});
+    }
+  });
+  try { properties.setProperty(key,
+    JSON.stringify(pending.slice(-CONFIG.MEMORY_RETRY_MAX_ITEMS))); } catch (ignored) {}
+  return {ok: pending.length === 0, retried: synced, pending: pending.length};
+}
+
+function memoryRetryKey_(userId) {
+  const normalized = String(userId == null ? "" : userId).trim().replace(/[^A-Za-z0-9._-]/g, "");
+  return normalized ? CONFIG.MEMORY_RETRY_PROPERTY_PREFIX + normalized.slice(0, 64) : "";
+}
+
+function resolveMemoryRetryFact_(captureId, userId) {
+  try {
+    const row = smartConfirmationFindByCaptureId_(smartConfirmationSheet_(), String(captureId || ""));
+    if (!row || String(row.user_id) !== String(userId)) return null;
+    const payload = smartConfirmationParseJson_(row.payload_json, {});
+    const items = Array.isArray(payload.items) ? payload.items : [];
+    const item = items.filter(function(candidate) { return candidate.category === "BODY_TRACKING"; })[0];
+    const value = item && item.fields && item.fields.weight && Number(item.fields.weight.value);
+    return Number.isFinite(value) ? {fact_type: "WEIGHT", value: value} : null;
+  } catch (error) {
+    return null;
+  }
+}
+
 function weightFactDependencies_(injected) {
   return injected || {
     read_state: readCoachState_,
@@ -1264,7 +1518,7 @@ function weightFactDependencies_(injected) {
     create_pending: function(capture, metadata) { return createWeightPendingCaptureC20A_(capture, metadata); },
     get_pending: getPendingCapture_,
     detect_confirmation: detectConfirmationIntent_,
-    save: saveConfirmedData_,
+    save: saveConfirmedDataWithMemory_,
     cancel: cancelPendingCapture_,
     cancel_created: cancelWeightPendingCaptureC20A_,
     validate_capture: validateExtractedData_,
@@ -1587,16 +1841,21 @@ function loadUserMemory(userId) {
     const normalizedUserId = memoryRequiredText_(userId, "userId");
     const sheet = memoryRequiredSheet_(MEMORY_LAYER_CONFIG.MEMORY_SHEET);
     if (sheet.getLastRow() < 2) return [];
-
-    const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 7).getDisplayValues();
+    const lastColumn = sheet.getLastColumn();
+    const headers = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
+    const indexes = memorySchemaIndexes_(headers);
+    ["id", "user_id", "category", "key", "value", "priority", "updated_at"].forEach(function(required) {
+      if (indexes[required] < 0) throw new Error("AI_MEMORY missing required column: " + required.toUpperCase());
+    });
+    const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, lastColumn).getDisplayValues();
     const memory = [];
     const uniqueKeys = {};
 
     rows.forEach(function(row, index) {
-      if (String(row[1]).trim() !== normalizedUserId) return;
+      if (String(row[indexes.user_id]).trim() !== normalizedUserId) return;
 
-      const category = String(row[2]).trim();
-      const key = String(row[3]).trim();
+      const category = String(row[indexes.category]).trim();
+      const key = String(row[indexes.key]).trim();
       if (!category || !key) return;
 
       const uniqueKey = normalizedUserId + "|" + category + "|" + key;
@@ -1605,15 +1864,7 @@ function loadUserMemory(userId) {
       }
       uniqueKeys[uniqueKey] = true;
 
-      memory.push({
-        id: String(row[0]).trim(),
-        user_id: normalizedUserId,
-        category: category,
-        key: key,
-        value: String(row[4]).trim(),
-        priority: memoryNormalizePriority_(row[5]),
-        updated_at: String(row[6]).trim()
-      });
+      memory.push(memoryRowFromSchema_(row, indexes, normalizedUserId));
     });
 
     memory.sort(function(a, b) {
@@ -1625,6 +1876,20 @@ function loadUserMemory(userId) {
     memoryLogError_("loadUserMemory", error);
     throw error;
   }
+}
+
+function memoryRowFromSchema_(row, indexes, userId) {
+  return {
+    id: String(row[indexes.id]).trim(),
+    user_id: String(userId),
+    category: String(row[indexes.category]).trim(),
+    key: String(row[indexes.key]).trim(),
+    value: String(row[indexes.value]).trim(),
+    priority: memoryNormalizePriority_(row[indexes.priority]),
+    updated_at: String(row[indexes.updated_at]).trim(),
+    source: indexes.source >= 0 ? String(row[indexes.source]).trim() : "LEGACY",
+    confirmation_id: indexes.confirmation_id >= 0 ? String(row[indexes.confirmation_id]).trim() : ""
+  };
 }
 
 function saveUserMemory(userId, category, key, value, priority) {
@@ -2136,14 +2401,15 @@ function buildLegacyCoachContext_(userId, chatId, options) {
   return limitText_(parts.join("\n"), CONFIG.MAX_CONTEXT_CHARS);
 }
 
-function buildMemoryCoachContext_(userId, chatId) {
-  const memory = loadUserMemory(userId);
+function buildMemoryCoachContext_(userId, chatId, options) {
+  const runtime = options || {};
+  const memory = Array.isArray(runtime.memory) ? runtime.memory : loadUserMemory(userId);
   const memoryIndex = contextMemoryIndex_(memory);
   const usedMemory = {};
   const chunks = [];
   let order = 10;
 
-  const persona = memoryLoadPersona_();
+  const persona = runtime.persona || memoryLoadPersona_();
   const systemLines = [
     persona.role || "Ты персональный AI Fitness Coach пользователя.",
     persona.style || "Отвечай как профессиональный тренер высокого уровня.",
@@ -2152,7 +2418,7 @@ function buildMemoryCoachContext_(userId, chatId) {
   ];
   chunks.push(contextChunk_("SYSTEM:\n" + systemLines.join("\n"), "HIGH", order++));
 
-  const rules = loadCoachRules_();
+  const rules = Array.isArray(runtime.rules) ? runtime.rules : loadCoachRules_();
   ["HIGH", "MEDIUM", "LOW"].forEach(function(priority) {
     const ruleLines = rules.filter(function(rule) {
       return rule.priority === priority;
@@ -2164,6 +2430,21 @@ function buildMemoryCoachContext_(userId, chatId) {
     }
   });
 
+  const weightEvents = memory.filter(function(item) {
+    return item.category === "body_tracking" && item.key === "weight_event" && String(item.value || "").trim();
+  }).sort(function(a, b) {
+    return String(b.updated_at || b.key).localeCompare(String(a.updated_at || a.key));
+  });
+  const newestWeight = weightEvents[0] || null;
+  const bodyCurrent = newestWeight ? {label: "Текущий вес", value: contextAddUnit_(newestWeight.value, "кг"),
+    priority: newestWeight.priority || "HIGH"} : null;
+  const bodyHistory = weightEvents.slice(0, 5).map(function(item) {
+    usedMemory[item.category + "|" + item.key] = true;
+    return {label: "Вес " + String(item.updated_at || item.key), value: contextAddUnit_(item.value, "кг"),
+      priority: item.priority || "HIGH"};
+  });
+  if (memoryIndex["body_tracking|current_weight"]) usedMemory["body_tracking|current_weight"] = true;
+
   chunks.push.apply(chunks, contextSectionChunks_("USER PROFILE", [
     contextTakeMemory_(memoryIndex, usedMemory, "profile", "name", "Имя"),
     contextTakeMemory_(memoryIndex, usedMemory, "profile", "gender", "Пол"),
@@ -2173,13 +2454,16 @@ function buildMemoryCoachContext_(userId, chatId) {
     contextTakeMemory_(memoryIndex, usedMemory, "profile", "height", "Рост", function(value) {
       return contextAddUnit_(value, "см");
     }),
-    contextTakeMemory_(memoryIndex, usedMemory, "profile", "current_weight", "Вес", function(value) {
+    bodyCurrent ? null : contextTakeMemory_(memoryIndex, usedMemory, "profile", "current_weight", "Вес", function(value) {
       return contextAddUnit_(value, "кг");
     }),
     contextTakeMemory_(memoryIndex, usedMemory, "profile", "start_weight", "Стартовый вес", function(value) {
       return contextAddUnit_(value, "кг");
     })
   ], order));
+  order += 10;
+
+  chunks.push.apply(chunks, contextSectionChunks_("BODY TRACKING", [bodyCurrent].concat(bodyHistory), order));
   order += 10;
 
   chunks.push.apply(chunks, contextSectionChunks_("GOALS", [
@@ -2229,25 +2513,28 @@ function buildMemoryCoachContext_(userId, chatId) {
   chunks.push.apply(chunks, contextSectionChunks_("MEMORY — ADDITIONAL FACTS", remainingMemory, order));
   order += 10;
 
-  const profileSource = memoryLoadProfileContext_(String(userId));
+  const profileSource = runtime.skip_sources ? "" : memoryLoadProfileContext_(String(userId));
   if (profileSource) {
     chunks.push(contextChunk_("SOURCE — User_Profile:\n" + profileSource, "MEDIUM", order++));
   }
 
-  contextAddRecentSource_(chunks, "Goals", 2, "RECENT HISTORY — GOALS", "MEDIUM", order++);
-  contextAddRecentSource_(chunks, "Body_Tracking", 2, "RECENT HISTORY — BODY", "MEDIUM", order++);
-  contextAddRecentSource_(chunks, "Nutrition_Log", 3, "RECENT HISTORY — NUTRITION", "MEDIUM", order++);
-  contextAddRecentSource_(chunks, "Workout_Log", 2, "RECENT HISTORY — TRAINING", "MEDIUM", order++);
-  contextAddRecentSource_(chunks, "Recovery_Log", 2, "RECENT HISTORY — RECOVERY", "MEDIUM", order++);
-  contextAddRecentSource_(chunks, "Health_Data", 2, "RECENT HISTORY — HEALTH", "MEDIUM", order++);
+  if (!runtime.skip_sources) {
+    contextAddRecentSource_(chunks, "Goals", 2, "RECENT HISTORY — GOALS", "MEDIUM", order++);
+    contextAddRecentSource_(chunks, "Body_Tracking", 2, "RECENT HISTORY — BODY", "MEDIUM", order++);
+    contextAddRecentSource_(chunks, "Nutrition_Log", 3, "RECENT HISTORY — NUTRITION", "MEDIUM", order++);
+    contextAddRecentSource_(chunks, "Workout_Log", 2, "RECENT HISTORY — TRAINING", "MEDIUM", order++);
+    contextAddRecentSource_(chunks, "Recovery_Log", 2, "RECENT HISTORY — RECOVERY", "MEDIUM", order++);
+    contextAddRecentSource_(chunks, "Health_Data", 2, "RECENT HISTORY — HEALTH", "MEDIUM", order++);
+  }
 
-  const history = loadChatHistory_(userId);
+  const history = runtime.chat_history == null ? (runtime.skip_sources ? "" : loadChatHistory_(userId)) :
+    String(runtime.chat_history);
   if (history) {
     chunks.push(contextChunk_("RECENT HISTORY — DIALOG:\n" + limitText_(history, 700), "MEDIUM", order++));
   }
 
   const knowledgeParts = [];
-  addKnowledgeBaseContext_(knowledgeParts);
+  if (!runtime.skip_sources) addKnowledgeBaseContext_(knowledgeParts);
   knowledgeParts.forEach(function(part) {
     chunks.push(contextChunk_("KNOWLEDGE BASE:\n" + part, "LOW", order++));
   });

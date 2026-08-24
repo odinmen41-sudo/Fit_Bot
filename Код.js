@@ -443,15 +443,27 @@ function buildCoachContext_(userId, chatId) {
     }
   }
 
+  return limitText_(deduplicateCoachContext_(context), CONFIG.MAX_CONTEXT_CHARS);
+}
+
+function deduplicateCoachContext_(context) {
   const safetyPattern = /health|pain|здоров|боль|болит|плеч|поясн|травм|огранич/i;
   const stableInstructionPattern = /^(SYSTEM:|Ты персональный AI Fitness Coach|Отвечай как профессиональный тренер высокого уровня\.?|Стиль ответа: конкретный аналитический ответ с цифрами и причинно-следственными объяснениями\.?)$/i;
   const seen = {};
   const lines = String(context || "").split("\n");
   const deduplicated = [];
+  let currentCategory = "general";
 
   lines.forEach(function(line) {
     const trimmed = String(line || "").trim();
     if (!trimmed || stableInstructionPattern.test(trimmed)) return;
+
+    if (/^[^:]+:$/.test(trimmed)) {
+      currentCategory = trimmed.slice(0, -1).trim().toLowerCase()
+        .replace(/[\s\u00a0]+/g, "_");
+      deduplicated.push(trimmed);
+      return;
+    }
 
     const factText = trimmed.indexOf(":") >= 0
       ? trimmed.substring(trimmed.indexOf(":") + 1).trim()
@@ -460,14 +472,15 @@ function buildCoachContext_(userId, chatId) {
       .replace(/[\s\u00a0]+/g, " ")
       .replace(/[.,;:!?]+$/g, "")
       .trim();
+    const deduplicationKey = currentCategory + ":" + normalized;
 
-    if (!normalized || safetyPattern.test(trimmed) || !seen[normalized]) {
+    if (!normalized || safetyPattern.test(trimmed) || !seen[deduplicationKey]) {
       deduplicated.push(trimmed);
-      if (normalized) seen[normalized] = true;
+      if (normalized) seen[deduplicationKey] = true;
     }
   });
 
-  return limitText_(deduplicated.join("\n"), CONFIG.MAX_CONTEXT_CHARS);
+  return deduplicated.join("\n");
 }
 
 function addKnowledgeBaseContext_(parts, spreadsheet) {
@@ -1956,10 +1969,11 @@ const MEMORY_LAYER_CONFIG = Object.freeze({
   LOCK_TIMEOUT_MS: 10000
 });
 
-function loadUserMemory(userId) {
+function loadUserMemory(userId, options) {
   try {
+    const runtime = options || {};
     const normalizedUserId = memoryRequiredText_(userId, "userId");
-    const sheet = memoryRequiredSheet_(MEMORY_LAYER_CONFIG.MEMORY_SHEET);
+    const sheet = runtime.sheet || memoryRequiredSheet_(MEMORY_LAYER_CONFIG.MEMORY_SHEET);
     if (sheet.getLastRow() < 2) return [];
     const lastColumn = sheet.getLastColumn();
     const headers = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
@@ -1978,13 +1992,16 @@ function loadUserMemory(userId) {
       const key = String(row[indexes.key]).trim();
       if (!category || !key) return;
 
-      const uniqueKey = normalizedUserId + "|" + category + "|" + key;
-      if (uniqueKeys[uniqueKey]) {
+      const normalizedCategory = category.toLowerCase();
+      const normalizedKey = key.toLowerCase();
+      const appendOnlyWeightEvent = normalizedCategory === "body_tracking" && normalizedKey === "weight_event";
+      const uniqueKey = normalizedUserId + "|" + normalizedCategory + "|" + normalizedKey;
+      if (!appendOnlyWeightEvent && uniqueKeys[uniqueKey]) {
         throw new Error("Duplicate AI_MEMORY key at row " + (index + 2) + ": " + uniqueKey);
       }
-      uniqueKeys[uniqueKey] = true;
+      if (!appendOnlyWeightEvent) uniqueKeys[uniqueKey] = true;
 
-      memory.push(memoryRowFromSchema_(row, indexes, normalizedUserId));
+      memory.push(memoryRowFromSchema_(row, indexes, normalizedUserId, index + 2));
     });
 
     memory.sort(function(a, b) {
@@ -1998,7 +2015,7 @@ function loadUserMemory(userId) {
   }
 }
 
-function memoryRowFromSchema_(row, indexes, userId) {
+function memoryRowFromSchema_(row, indexes, userId, rowOrder) {
   return {
     id: String(row[indexes.id]).trim(),
     user_id: String(userId),
@@ -2008,7 +2025,8 @@ function memoryRowFromSchema_(row, indexes, userId) {
     priority: memoryNormalizePriority_(row[indexes.priority]),
     updated_at: String(row[indexes.updated_at]).trim(),
     source: indexes.source >= 0 ? String(row[indexes.source]).trim() : "LEGACY",
-    confirmation_id: indexes.confirmation_id >= 0 ? String(row[indexes.confirmation_id]).trim() : ""
+    confirmation_id: indexes.confirmation_id >= 0 ? String(row[indexes.confirmation_id]).trim() : "",
+    _row_order: Number(rowOrder) || 0
   };
 }
 
@@ -2523,7 +2541,17 @@ function buildLegacyCoachContext_(userId, chatId, options) {
 
 function buildMemoryCoachContext_(userId, chatId, options) {
   const runtime = options || {};
-  const memory = Array.isArray(runtime.memory) ? runtime.memory : loadUserMemory(userId);
+  let memory = [];
+  if (Array.isArray(runtime.memory)) {
+    memory = runtime.memory;
+  } else {
+    try {
+      memory = typeof runtime.load_memory === "function" ? runtime.load_memory(userId) : loadUserMemory(userId);
+    } catch (memoryError) {
+      console.error("AI_MEMORY unavailable; empty memory context used: " + errorText_(memoryError));
+      memory = [];
+    }
+  }
   const memoryIndex = contextMemoryIndex_(memory);
   const usedMemory = {};
   const chunks = [];
@@ -2551,17 +2579,27 @@ function buildMemoryCoachContext_(userId, chatId, options) {
   });
 
   const weightEvents = memory.filter(function(item) {
-    return item.category === "body_tracking" && item.key === "weight_event" && String(item.value || "").trim();
+    return String(item.category || "").toLowerCase() === "body_tracking" &&
+      String(item.key || "").toLowerCase() === "weight_event" && String(item.value || "").trim();
+  }).map(function(item, index) {
+    return {item: item, fallback_order: Number(item._row_order) || index + 1};
   }).sort(function(a, b) {
-    return String(b.updated_at || b.key).localeCompare(String(a.updated_at || a.key));
+    const aTime = contextTimestamp_(a.item.updated_at);
+    const bTime = contextTimestamp_(b.item.updated_at);
+    if (aTime !== null && bTime !== null && aTime !== bTime) return bTime - aTime;
+    if (aTime !== null && bTime === null) return -1;
+    if (aTime === null && bTime !== null) return 1;
+    return b.fallback_order - a.fallback_order;
+  }).map(function(entry) {
+    return entry.item;
   });
   const newestWeight = weightEvents[0] || null;
   const bodyCurrent = newestWeight ? {label: "Текущий вес", value: contextAddUnit_(newestWeight.value, "кг"),
     priority: newestWeight.priority || "HIGH"} : null;
   const bodyHistory = weightEvents.slice(0, 5).map(function(item) {
     usedMemory[item.category + "|" + item.key] = true;
-    return {label: "Вес " + String(item.updated_at || item.key), value: contextAddUnit_(item.value, "кг"),
-      priority: item.priority || "HIGH"};
+    return {label: "Вес " + contextDisplayDate_(item.updated_at), value: contextAddUnit_(item.value, "кг"),
+      priority: "HIGH"};
   });
   if (memoryIndex["body_tracking|current_weight"]) usedMemory["body_tracking|current_weight"] = true;
 
@@ -2583,42 +2621,43 @@ function buildMemoryCoachContext_(userId, chatId, options) {
   ], order));
   order += 10;
 
-  chunks.push.apply(chunks, contextSectionChunks_("BODY TRACKING", [bodyCurrent].concat(bodyHistory), order));
+  if (bodyCurrent) bodyCurrent.priority = "HIGH";
+  chunks.push.apply(chunks, contextSectionChunks_("BODY_TRACKING_MEMORY", [bodyCurrent].concat(bodyHistory), order));
   order += 10;
 
-  chunks.push.apply(chunks, contextSectionChunks_("GOALS", [
+  chunks.push.apply(chunks, contextSectionChunks_("GOALS", contextForcePriority_([
     contextTakeMemory_(memoryIndex, usedMemory, "goal", "goal_type", "Основная цель"),
     contextTakeMemory_(memoryIndex, usedMemory, "goal", "target_weight", "Целевой вес", function(value) {
       return contextAddUnit_(value, "кг");
     }),
     contextTakeMemory_(memoryIndex, usedMemory, "goal", "main_priority", "Главный приоритет")
-  ], order));
+  ], "MEDIUM"), order));
   order += 10;
 
-  chunks.push.apply(chunks, contextSectionChunks_("TRAINING", [
+  chunks.push.apply(chunks, contextSectionChunks_("TRAINING", contextForcePriority_([
     contextTakeMemory_(memoryIndex, usedMemory, "training", "experience", "Опыт"),
     contextTakeMemory_(memoryIndex, usedMemory, "training", "frequency", "Частота"),
     contextTakeMemory_(memoryIndex, usedMemory, "training", "style", "Формат")
-  ], order));
+  ], "MEDIUM"), order));
   order += 10;
 
-  chunks.push.apply(chunks, contextSectionChunks_("NUTRITION", [
+  chunks.push.apply(chunks, contextSectionChunks_("NUTRITION", contextForcePriority_([
     contextTakeMemory_(memoryIndex, usedMemory, "nutrition", "calories_target", "Калории"),
     contextTakeMemory_(memoryIndex, usedMemory, "nutrition", "maximum_calories", "Максимум калорий"),
     contextTakeMemory_(memoryIndex, usedMemory, "nutrition", "protein_priority", "Белок")
-  ], order));
+  ], "MEDIUM"), order));
   order += 10;
 
-  chunks.push.apply(chunks, contextSectionChunks_("HEALTH", [
+  chunks.push.apply(chunks, contextSectionChunks_("HEALTH", contextForcePriority_([
     contextTakeMemory_(memoryIndex, usedMemory, "health", "shoulder", "Правое плечо"),
     contextTakeMemory_(memoryIndex, usedMemory, "health", "lower_back", "Поясница")
-  ], order));
+  ], "HIGH"), order));
   order += 10;
 
-  chunks.push.apply(chunks, contextSectionChunks_("MEMORY", [
+  chunks.push.apply(chunks, contextSectionChunks_("MEMORY", contextForcePriority_([
     contextTakeMemory_(memoryIndex, usedMemory, "preferences", "response_style", "Предпочитаемый стиль"),
     contextTakeMemory_(memoryIndex, usedMemory, "preferences", "avoid", "Избегать")
-  ], order));
+  ], "LOW"), order));
   order += 10;
 
   const remainingMemory = memory.filter(function(item) {
@@ -2659,10 +2698,10 @@ function buildMemoryCoachContext_(userId, chatId, options) {
     chunks.push(contextChunk_("KNOWLEDGE BASE:\n" + part, "LOW", order++));
   });
 
-  return limitContextSize_(chunks, 5000);
+  return limitContextSize_(chunks, 3000, {preserve_high: true});
 }
 
-function limitContextSize_(chunks, maxChars) {
+function limitContextSize_(chunks, maxChars, options) {
   const hardLimit = Number(maxChars) > 0 ? Number(maxChars) : 5000;
   if (typeof chunks === "string") return limitText_(chunks, hardLimit);
 
@@ -2679,6 +2718,10 @@ function limitContextSize_(chunks, maxChars) {
   }).sort(function(a, b) {
     return priorityOrder[b.priority] - priorityOrder[a.priority] || a.order - b.order;
   });
+
+  if (options && options.preserve_high) {
+    return limitPrioritizedMemoryContext_(normalized, hardLimit);
+  }
 
   const result = [];
   let currentLength = 0;
@@ -2702,6 +2745,56 @@ function limitContextSize_(chunks, maxChars) {
   });
 
   return result.join("\n\n").slice(0, hardLimit);
+}
+
+function limitPrioritizedMemoryContext_(chunks, hardLimit) {
+  const result = [];
+  let currentLength = 0;
+
+  (chunks || []).forEach(function(chunk) {
+    const separatorLength = result.length ? 2 : 0;
+    if (chunk.priority === "HIGH") {
+      result.push(chunk.text);
+      currentLength += separatorLength + chunk.text.length;
+      return;
+    }
+
+    const remaining = hardLimit - currentLength - separatorLength;
+    if (remaining <= 0) return;
+    if (chunk.text.length <= remaining) {
+      result.push(chunk.text);
+      currentLength += separatorLength + chunk.text.length;
+      return;
+    }
+
+    const marker = "\n...[truncated]";
+    if (remaining > marker.length + 20) {
+      result.push(chunk.text.slice(0, remaining - marker.length) + marker);
+      currentLength += separatorLength + remaining;
+    }
+  });
+
+  return result.join("\n\n");
+}
+
+function contextTimestamp_(value) {
+  const time = Date.parse(String(value || ""));
+  return isFinite(time) ? time : null;
+}
+
+function contextDisplayDate_(value) {
+  const time = contextTimestamp_(value);
+  if (time === null) return "дата не указана";
+  const date = new Date(time);
+  return String(date.getUTCDate()).padStart(2, "0") + "." +
+    String(date.getUTCMonth() + 1).padStart(2, "0") + "." + date.getUTCFullYear();
+}
+
+function contextForcePriority_(entries, priority) {
+  return (entries || []).map(function(entry) {
+    if (!entry) return entry;
+    return {label: entry.label, value: entry.value, priority: priority};
+  });
 }
 
 function isMemoryEnabled_() {

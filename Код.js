@@ -135,6 +135,14 @@ function doPost(e) {
       return httpOk_("OK");
     }
 
+    const domainFact = routeDomainFactConfirmation_(update);
+    if (domainFact.handled) {
+      sendTelegramMessage_(chatId, domainFact.message);
+      logAiReply_(messageText, domainFact.message, "domain_fact_gate");
+      markBotInputProcessed_(inputRow, domainFact.ok ? "Да" : "Ошибка domain gate");
+      return httpOk_("OK");
+    }
+
     let reply;
     let modelUsed = "";
 
@@ -947,6 +955,270 @@ function routeWeightFactConfirmation_(update, options) {
     message: "Правильно понял, что ваш текущий вес " + weightFactNumber_(candidate.value) +
       " кг? Подтвердите: Да или Нет."
   });
+}
+
+function routeDomainFactConfirmation_(update, options) {
+  const runtime = options || {};
+  const message = update && (update.message || update.edited_message);
+  if (!message || typeof message.text !== "string") {
+    return domainFactResult_(false, true, "NOT_DOMAIN_FACT");
+  }
+  const userId = String(message.from && message.from.id || "");
+  const chatId = String(message.chat && message.chat.id || "");
+  if (!userId || !chatId) return domainFactResult_(false, true, "NOT_DOMAIN_FACT");
+
+  const dependencies = domainFactDependencies_(runtime.dependencies);
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  const confirmation = dependencies.detect_confirmation(message.text);
+  if (confirmation && ["CONFIRM", "CANCEL"].indexOf(confirmation.intent) >= 0) {
+    const selected = dependencies.find_capture(userId, chatId, {
+      now: now,
+      include_saved: confirmation.intent === "CONFIRM"
+    });
+    if (selected && selected.ok === true) {
+      return handleDomainFactConfirmation_(selected, confirmation.intent, userId, chatId,
+        now, dependencies);
+    }
+    if (selected && selected.code === "CAPTURE_EXPIRED") {
+      return domainFactResult_(true, false, "CAPTURE_EXPIRED", {
+        message: "Срок подтверждения истёк. Отправьте данные ещё раз."
+      });
+    }
+  }
+
+  const detection = detectDomainFactCandidate_(message.text);
+  if (detection.code === "AMBIGUOUS_DOMAIN") {
+    return domainFactResult_(false, true, "AMBIGUOUS_DOMAIN");
+  }
+  if (!detection.domain) return domainFactResult_(false, true, "NOT_DOMAIN_FACT");
+
+  const active = dependencies.get_pending(userId, chatId, {now: now});
+  if (active && active.ok === true) {
+    return domainFactResult_(true, false, "ACTIVE_CAPTURE_EXISTS", {
+      message: "Сначала завершите или отмените текущее подтверждение данных."
+    });
+  }
+
+  const capture = buildDomainFactCandidate_(detection, {
+    now: now,
+    update_id: update && update.update_id,
+    user_id: userId,
+    uuid: dependencies.uuid
+  });
+  const validation = validateDomainFactCandidate_(capture);
+  if (!validation.ready_for_confirmation) {
+    return domainFactResult_(true, false, "INVALID_PAYLOAD", {
+      message: "Не удалось безопасно подготовить подтверждение данных."
+    });
+  }
+  const created = dependencies.create_pending(capture, {
+    now: now,
+    ttl_minutes: SMART_CONFIRMATION_CONFIG.DEFAULT_TTL_MINUTES,
+    user_id: userId,
+    chat_id: chatId,
+    source_update_id: update && update.update_id,
+    capture_id: capture.capture_id,
+    validation: validation
+  });
+  if (!created || created.ok !== true) {
+    return domainFactResult_(true, false, String(created && created.code || "CAPTURE_CREATE_FAILED"), {
+      message: "Не удалось безопасно подготовить подтверждение данных. Попробуйте позже."
+    });
+  }
+  return domainFactResult_(true, true, "CAPTURE_CREATED", {
+    domain: detection.domain,
+    capture_id: created.capture_id || capture.capture_id,
+    message: domainFactConfirmationPrompt_(detection.domain)
+  });
+}
+
+function detectDomainFactCandidate_(text) {
+  const normalized = normalizeExplicitWeightText_(text);
+  if (!normalized || /^\//.test(normalized)) return {domain: null, code: "NOT_DOMAIN_FACT"};
+
+  const domains = [];
+  const workout = /(?:жим|пожал|присед|станов(?:ая)?|тяга|подтягив|штанг|гантел)/i.test(normalized) &&
+    /\d+(?:[.,]\d+)?\s*кг(?=\s|$|[.,;])/i.test(normalized);
+  const nutrition = /(?:съел|съела|съели|ел|ела|выпил|выпила)(?=\s|$|[.,;])/i.test(normalized) &&
+    /\d+(?:[.,]\d+)?\s*(?:г|гр|грамм(?:а|ов)?)(?=\s|$|[.,;])/i.test(normalized) &&
+    /(?:рис|куриц|творог|яйц|овсян|греч|мяс|рыб|хлеб|сыр)/i.test(normalized);
+  const recovery = /(?:сегодня\s+)?(?:плохо|мало|хорошо)?\s*спал(?:а)?(?=\s|$|[.,;])|(?:устал(?:а)?|усталость|сон)\s*[:=-]?\s*\d/i
+    .test(normalized);
+
+  if (workout) domains.push("WORKOUT");
+  if (nutrition) domains.push("NUTRITION");
+  if (recovery) domains.push("RECOVERY");
+  if (domains.length > 1) return {domain: null, code: "AMBIGUOUS_DOMAIN", domains: domains};
+  if (!domains.length) return {domain: null, code: "NOT_DOMAIN_FACT"};
+  return {domain: domains[0], code: "DOMAIN_FACT", confidence: 0.99, requires_clarification: false};
+}
+
+function buildDomainFactCandidate_(detection, options) {
+  const runtime = options || {};
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  const domain = String(detection && detection.domain || "");
+  const categoryMap = {
+    NUTRITION: "NUTRITION_LOG",
+    WORKOUT: "WORKOUT_LOG",
+    RECOVERY: "RECOVERY_LOG"
+  };
+  const uuid = typeof runtime.uuid === "function" ? runtime.uuid() : Utilities.getUuid();
+  return {
+    schema_version: "c231-domain-routing-v1",
+    mode: "SIMULATION",
+    writes_allowed: false,
+    capture_id: "c231-" + String(uuid),
+    created_at: now.toISOString(),
+    source: "C231_DOMAIN_ROUTER",
+    raw_message: "",
+    domain: domain,
+    confidence: Number(detection && detection.confidence || 0),
+    requires_clarification: detection && detection.requires_clarification === true,
+    items: [{
+      category: categoryMap[domain] || "",
+      confidence: Number(detection && detection.confidence || 0),
+      fields: {
+        routing_intent: {
+          value: domain,
+          confidence: Number(detection && detection.confidence || 0),
+          source: "EXPLICIT_USER_INPUT"
+        }
+      }
+    }]
+  };
+}
+
+function validateDomainFactCandidate_(capture) {
+  const allowed = {NUTRITION: "NUTRITION_LOG", WORKOUT: "WORKOUT_LOG", RECOVERY: "RECOVERY_LOG"};
+  const items = capture && Array.isArray(capture.items) ? capture.items : [];
+  const valid = !!(capture && capture.source === "C231_DOMAIN_ROUTER" && capture.raw_message === "" &&
+    allowed[capture.domain] && items.length === 1 && items[0].category === allowed[capture.domain] &&
+    Number(capture.confidence) >= 0.9 && capture.requires_clarification === false);
+  return {
+    schema_version: "c231-domain-routing-validation-v1",
+    capture_id: String(capture && capture.capture_id || ""),
+    mode: "SIMULATION",
+    ready_for_confirmation: valid,
+    errors: valid ? [] : ["INVALID_DOMAIN_ROUTING_CANDIDATE"],
+    warnings: [],
+    items: valid ? [{category: items[0].category, status: "PASS", errors: []}] : []
+  };
+}
+
+function handleDomainFactConfirmation_(selected, intent, userId, chatId, now, dependencies) {
+  const capture = selected.capture;
+  if (!capture || String(capture.user_id) !== String(userId) || String(capture.chat_id) !== String(chatId)) {
+    return domainFactResult_(true, false, "OWNER_MISMATCH", {
+      message: "Подтверждение принадлежит другому пользователю или чату."
+    });
+  }
+  if (intent === "CANCEL") {
+    const cancelled = dependencies.cancel(userId, chatId, {now: now});
+    return domainFactResult_(true, !!(cancelled && cancelled.ok),
+      String(cancelled && cancelled.code || "CANCEL_FAILED"), {
+        message: cancelled && cancelled.ok ? "Запись отменена." : "Не удалось отменить запись."
+      });
+  }
+  const confirmed = dependencies.confirm(userId, chatId, capture.capture_id, {now: now});
+  if (!confirmed || confirmed.ok !== true) {
+    return domainFactResult_(true, false, String(confirmed && confirmed.code || "CONFIRMATION_FAILED"), {
+      message: "Не удалось подтвердить данные."
+    });
+  }
+  if (confirmed.code === "ALREADY_SAVED") {
+    return domainFactResult_(true, true, "ALREADY_SAVED", {
+      message: "Это подтверждение уже обработано."
+    });
+  }
+  const saved = dependencies.save_domain(selected.payload, userId, {
+    now: now,
+    capture_id: capture.capture_id
+  });
+  return domainFactResult_(true, !!(saved && saved.ok), String(saved && saved.code || "SAVE_FAILED"), {
+    domain: selected.payload && selected.payload.domain || null,
+    save: saved || null,
+    message: saved && saved.ok
+      ? "Данные подтверждены. Сохранение доменных данных выполнено в режиме SIMULATION."
+      : "Не удалось завершить проверку сохранения данных."
+  });
+}
+
+function findLatestDomainCapture_(userId, chatId, options) {
+  const runtime = options || {};
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  try {
+    const rows = smartConfirmationReadRows_(smartConfirmationSheet_()).filter(function(row) {
+      if (String(row.user_id) !== String(userId) || String(row.chat_id) !== String(chatId)) return false;
+      const payload = smartConfirmationParseJson_(row.payload_json, {});
+      return payload && payload.source === "C231_DOMAIN_ROUTER";
+    }).sort(smartConfirmationNewestFirst_);
+    const pending = rows.filter(function(row) {
+      return row.status === SMART_CONFIRMATION_CONFIG.STATUSES.PENDING;
+    })[0];
+    if (pending) {
+      if (smartConfirmationDate_(pending.expires_at).getTime() <= now.getTime()) {
+        return {ok: false, code: "CAPTURE_EXPIRED", capture: pending};
+      }
+      return {ok: true, code: "PENDING_CAPTURE", capture: pending,
+        payload: smartConfirmationParseJson_(pending.payload_json, {})};
+    }
+    if (runtime.include_saved === true) {
+      const saved = rows.filter(function(row) {
+        return row.status === SMART_CONFIRMATION_CONFIG.STATUSES.SAVED &&
+          smartConfirmationDate_(row.expires_at).getTime() > now.getTime();
+      })[0];
+      if (saved) return {ok: true, code: "SAVED_CAPTURE", capture: saved,
+        payload: smartConfirmationParseJson_(saved.payload_json, {})};
+    }
+    return {ok: false, code: "NO_DOMAIN_CAPTURE"};
+  } catch (error) {
+    return {ok: false, code: "CAPTURE_LOOKUP_FAILED", error: errorText_(error)};
+  }
+}
+
+function simulateDomainFactSave_(capture, userId, options) {
+  const runtime = options || {};
+  return {
+    ok: true,
+    code: "SAVE_SIMULATED",
+    capture_id: String(runtime.capture_id || capture && capture.capture_id || ""),
+    user_id: String(userId || ""),
+    domain: String(capture && capture.domain || ""),
+    domain_writes: 0,
+    production_writes: false
+  };
+}
+
+function domainFactConfirmationPrompt_(domain) {
+  const labels = {NUTRITION: "питания", WORKOUT: "тренировки", RECOVERY: "восстановления"};
+  return "Распознаны данные " + (labels[domain] || "профиля") +
+    ". Подтвердите обработку ответом Да или Нет."
+}
+
+function domainFactDependencies_(injected) {
+  return injected || {
+    detect_confirmation: detectConfirmationIntent_,
+    find_capture: findLatestDomainCapture_,
+    get_pending: getPendingCapture_,
+    create_pending: createPendingCapture_,
+    confirm: confirmPendingCapture_,
+    cancel: cancelPendingCapture_,
+    save_domain: simulateDomainFactSave_,
+    uuid: function() { return Utilities.getUuid(); }
+  };
+}
+
+function domainFactResult_(handled, ok, code, extra) {
+  const result = {
+    handled: handled === true,
+    ok: ok === true,
+    code: String(code || "NOT_DOMAIN_FACT"),
+    domain_writes: 0,
+    production_writes: false,
+    groq_calls: 0
+  };
+  Object.keys(extra || {}).forEach(function(key) { result[key] = extra[key]; });
+  return result;
 }
 
 function handleWeightFactConfirmation_(userId, chatId, text, now, dependencies, stateOptions) {

@@ -2361,7 +2361,7 @@ function memoryLoadProfileContext_(userId) {
 
 function sanitizeCoachProfileContext_(profileContext, excludeCurrentWeight) {
   const technicalHeaders = /^(?:id|user_id|telegram_id|source|confirmation_id|updated_at)$/i;
-  const currentWeightHeaders = /^(?:текущий\s+вес|current[_\s-]*weight)$/i;
+  const currentWeightHeaders = /^(?:вес|текущий\s+вес|вес\s+(?:сейчас|сегодня)|current[_\s-]*weight|current\s+body\s+weight)$/i;
   const lines = String(profileContext || "").split("\n");
   const sanitized = [];
 
@@ -2385,6 +2385,14 @@ function sanitizeCoachProfileContext_(profileContext, excludeCurrentWeight) {
   });
 
   return sanitized.join("\n").replace(/\n[^\n]+:\s*$/, "").trim();
+}
+
+function isLegacyCurrentWeightMemoryFact_(item) {
+  const category = String(item && item.category || "").trim().toLowerCase();
+  const key = String(item && item.key || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  return ["profile", "body_tracking"].indexOf(category) >= 0 &&
+    ["weight", "current_weight", "current_body_weight", "текущий_вес", "вес_сейчас", "вес_сегодня"]
+      .indexOf(key) >= 0;
 }
 
 function memoryLoadRecentSheetContext_(sheetName, userId, maxRows, label) {
@@ -2698,6 +2706,7 @@ function buildMemoryCoachContext_(userId, chatId, options) {
   order += 10;
 
   const remainingMemory = memory.filter(function(item) {
+    if (bodyCurrent && isLegacyCurrentWeightMemoryFact_(item)) return false;
     return !usedMemory[item.category + "|" + item.key];
   }).map(function(item) {
     return {
@@ -2718,7 +2727,9 @@ function buildMemoryCoachContext_(userId, chatId, options) {
 
   if (!runtime.skip_sources) {
     contextAddRecentSource_(chunks, "Goals", 2, "RECENT HISTORY — GOALS", "MEDIUM", order++);
-    contextAddRecentSource_(chunks, "Body_Tracking", 2, "RECENT HISTORY — BODY", "MEDIUM", order++);
+    if (!bodyCurrent) {
+      contextAddRecentSource_(chunks, "Body_Tracking", 2, "RECENT HISTORY — BODY", "MEDIUM", order++);
+    }
     contextAddRecentSource_(chunks, "Nutrition_Log", 3, "RECENT HISTORY — NUTRITION", "MEDIUM", order++);
     contextAddRecentSource_(chunks, "Workout_Log", 2, "RECENT HISTORY — TRAINING", "MEDIUM", order++);
     contextAddRecentSource_(chunks, "Recovery_Log", 2, "RECENT HISTORY — RECOVERY", "MEDIUM", order++);

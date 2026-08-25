@@ -991,6 +991,12 @@ function routeDomainFactConfirmation_(update, options) {
     return domainFactResult_(false, true, "AMBIGUOUS_DOMAIN");
   }
   if (!detection.domain) return domainFactResult_(false, true, "NOT_DOMAIN_FACT");
+  if (detection.domain === "NUTRITION" && detection.requires_clarification === true) {
+    return domainFactResult_(true, false, "CLARIFICATION_REQUIRED", {
+      domain: "NUTRITION",
+      message: "Укажите количество продукта: например, «банан 1 шт» или «рис 150 г»."
+    });
+  }
 
   const active = dependencies.get_pending(userId, chatId, {now: now});
   if (active && active.ok === true) {
@@ -1039,9 +1045,8 @@ function detectDomainFactCandidate_(text) {
   const domains = [];
   const workout = /(?:жим|пожал|присед|станов(?:ая)?|тяга|подтягив|штанг|гантел)/i.test(normalized) &&
     /\d+(?:[.,]\d+)?\s*кг(?=\s|$|[.,;])/i.test(normalized);
-  const nutrition = /(?:съел|съела|съели|ел|ела|выпил|выпила)(?=\s|$|[.,;])/i.test(normalized) &&
-    /\d+(?:[.,]\d+)?\s*(?:г|гр|грамм(?:а|ов)?)(?=\s|$|[.,;])/i.test(normalized) &&
-    /(?:рис|куриц|творог|яйц|овсян|греч|мяс|рыб|хлеб|сыр)/i.test(normalized);
+  const nutritionExtraction = extractNutritionFactCandidate_(normalized);
+  const nutrition = nutritionExtraction.detected === true;
   const recovery = /(?:сегодня\s+)?(?:плохо|мало|хорошо)?\s*спал(?:а)?(?=\s|$|[.,;])|(?:устал(?:а)?|усталость|сон)\s*[:=-]?\s*\d/i
     .test(normalized);
 
@@ -1050,7 +1055,129 @@ function detectDomainFactCandidate_(text) {
   if (recovery) domains.push("RECOVERY");
   if (domains.length > 1) return {domain: null, code: "AMBIGUOUS_DOMAIN", domains: domains};
   if (!domains.length) return {domain: null, code: "NOT_DOMAIN_FACT"};
+  if (domains[0] === "NUTRITION") {
+    return {
+      domain: "NUTRITION",
+      code: nutritionExtraction.invalid ? "INVALID_NUTRITION_FACT" : "DOMAIN_FACT",
+      confidence: 0.99,
+      requires_clarification: nutritionExtraction.requires_clarification === true,
+      items: nutritionExtraction.items
+    };
+  }
   return {domain: domains[0], code: "DOMAIN_FACT", confidence: 0.99, requires_clarification: false};
+}
+
+function extractNutritionFactCandidate_(text) {
+  const normalized = normalizeExplicitWeightText_(text).toLowerCase();
+  const result = {detected: false, invalid: false, requires_clarification: false, items: []};
+  if (!normalized || nutritionQuestion_(normalized)) return result;
+
+  const hasAction = /^(?:съел(?:а|и)?|ел(?:а|и)?|выпил(?:а|и)?)\b/i.test(normalized);
+  const hasKnownFood = /(?:рис|куриц|грудк|греч|кефир|банан|яйц|творог|овсян|мяс|рыб|хлеб|сыр)/i.test(normalized);
+  if (!hasAction && !hasKnownFood) return result;
+
+  const content = normalized
+    .replace(/^(?:съел(?:а|и)?|ел(?:а|и)?|выпил(?:а|и)?)\s+/i, "")
+    .replace(/[!?]+$/g, "")
+    .trim();
+  if (!content) return result;
+
+  const parts = content.split(/\s*(?:,|\s+и\s+)\s*/i).filter(Boolean);
+  parts.forEach(function(part) {
+    const parsed = parseNutritionItem_(part);
+    if (!parsed) return;
+    result.detected = true;
+    if (parsed.invalid) result.invalid = true;
+    if (parsed.requires_clarification) result.requires_clarification = true;
+    if (parsed.item) result.items.push(parsed.item);
+  });
+  if (result.detected && !result.items.length) result.requires_clarification = true;
+  return result;
+}
+
+function nutritionQuestion_(text) {
+  return /\?\s*$/.test(text) ||
+    /^(?:сколько|что\s+лучше|что\s+можно|как|можно\s+ли|стоит\s+ли)\b/i.test(text);
+}
+
+function parseNutritionItem_(part) {
+  const cleaned = String(part || "").replace(/^[\s,;:.]+|[\s,;:.]+$/g, "").trim();
+  if (!cleaned) return null;
+  const unitPattern = "(?:граммов|грамма|грамм|гр|кг|мл|литра|литров|литр|штуки|штук|штука|шт|г|л)";
+  let match = cleaned.match(new RegExp("^(.+?)\\s+(-?\\d+(?:[.,]\\d+)?)\\s*(" + unitPattern + ")(?=\\s|$)", "i"));
+  let food = "";
+  let numberText = "";
+  let unitText = "";
+  if (match) {
+    food = match[1];
+    numberText = match[2];
+    unitText = match[3];
+  } else {
+    match = cleaned.match(new RegExp("^(-?\\d+(?:[.,]\\d+)?)\\s*(" + unitPattern + ")\\s+(.+)$", "i"));
+    if (match) {
+      numberText = match[1];
+      unitText = match[2];
+      food = match[3];
+    } else {
+      match = cleaned.match(/^(-?\d+)\s+(.+)$/i);
+      if (match && /(?:яйц|банан|яблок|груш|апельсин)/i.test(match[2])) {
+        numberText = match[1];
+        unitText = "шт";
+        food = match[2];
+      }
+    }
+  }
+
+  if (!match) {
+    return {
+      requires_clarification: true,
+      invalid: false,
+      item: nutritionItemEnvelope_(cleaned, null, null, true)
+    };
+  }
+
+  const quantity = normalizeNutritionQuantity_(numberText, unitText);
+  return {
+    requires_clarification: false,
+    invalid: !quantity.valid,
+    item: nutritionItemEnvelope_(food, quantity.value, quantity.unit, false)
+  };
+}
+
+function normalizeNutritionQuantity_(numberText, unitText) {
+  const numeric = Number(String(numberText || "").replace(",", "."));
+  const unit = String(unitText || "").toLowerCase();
+  let canonical = "";
+  let value = numeric;
+  if (/^(?:г|гр|грамм|грамма|граммов)$/.test(unit)) canonical = "g";
+  else if (unit === "кг") { canonical = "g"; value = numeric * 1000; }
+  else if (unit === "мл") canonical = "ml";
+  else if (/^(?:л|литр|литра|литров)$/.test(unit)) { canonical = "ml"; value = numeric * 1000; }
+  else if (/^(?:шт|штука|штуки|штук)$/.test(unit)) canonical = "count";
+
+  const upperBound = canonical === "count" ? 100 : 10000;
+  return {value: value, unit: canonical, valid: !!canonical && isFinite(value) && value > 0 && value <= upperBound};
+}
+
+function nutritionItemEnvelope_(food, quantityValue, quantityUnit, missingQuantity) {
+  const display = normalizeNutritionFoodName_(food);
+  const fields = {
+    food_display: {value: display, confidence: 0.99, source: "EXPLICIT_USER_INPUT"},
+    food_normalized: {value: display.toLowerCase(), confidence: 0.99, source: "DETERMINISTIC_NORMALIZATION"}
+  };
+  if (!missingQuantity) {
+    fields.quantity_value = {value: quantityValue, confidence: 0.99, source: "EXPLICIT_USER_INPUT"};
+    fields.quantity_unit = {value: quantityUnit, confidence: 0.99, source: "DETERMINISTIC_NORMALIZATION"};
+  }
+  return {category: "NUTRITION_LOG", confidence: missingQuantity ? 0.8 : 0.99, fields: fields};
+}
+
+function normalizeNutritionFoodName_(food) {
+  return String(food || "")
+    .toLowerCase()
+    .replace(/[^a-zа-яё0-9\s-]/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function buildDomainFactCandidate_(detection, options) {
@@ -1063,8 +1190,11 @@ function buildDomainFactCandidate_(detection, options) {
     RECOVERY: "RECOVERY_LOG"
   };
   const uuid = typeof runtime.uuid === "function" ? runtime.uuid() : Utilities.getUuid();
+  const nutritionItems = domain === "NUTRITION" && Array.isArray(detection && detection.items)
+    ? detection.items : null;
   return {
-    schema_version: "c231-domain-routing-v1",
+    schema_version: domain === "NUTRITION"
+      ? "c232a-nutrition-extraction-v1" : "c231-domain-routing-v1",
     mode: "SIMULATION",
     writes_allowed: false,
     capture_id: "c231-" + String(uuid),
@@ -1074,7 +1204,7 @@ function buildDomainFactCandidate_(detection, options) {
     domain: domain,
     confidence: Number(detection && detection.confidence || 0),
     requires_clarification: detection && detection.requires_clarification === true,
-    items: [{
+    items: nutritionItems || [{
       category: categoryMap[domain] || "",
       confidence: Number(detection && detection.confidence || 0),
       fields: {
@@ -1091,17 +1221,34 @@ function buildDomainFactCandidate_(detection, options) {
 function validateDomainFactCandidate_(capture) {
   const allowed = {NUTRITION: "NUTRITION_LOG", WORKOUT: "WORKOUT_LOG", RECOVERY: "RECOVERY_LOG"};
   const items = capture && Array.isArray(capture.items) ? capture.items : [];
-  const valid = !!(capture && capture.source === "C231_DOMAIN_ROUTER" && capture.raw_message === "" &&
-    allowed[capture.domain] && items.length === 1 && items[0].category === allowed[capture.domain] &&
+  let valid = !!(capture && capture.source === "C231_DOMAIN_ROUTER" && capture.raw_message === "" &&
+    allowed[capture.domain] && items.length > 0 &&
+    items.every(function(item) { return item.category === allowed[capture.domain]; }) &&
     Number(capture.confidence) >= 0.9 && capture.requires_clarification === false);
+  if (valid && capture.domain === "NUTRITION") {
+    valid = capture.schema_version === "c232a-nutrition-extraction-v1" && items.every(function(item) {
+      const fields = item && item.fields || {};
+      const value = Number(fields.quantity_value && fields.quantity_value.value);
+      const unit = String(fields.quantity_unit && fields.quantity_unit.value || "");
+      const food = String(fields.food_normalized && fields.food_normalized.value || "");
+      const max = unit === "count" ? 100 : 10000;
+      return !!food && ["g", "ml", "count"].indexOf(unit) >= 0 &&
+        isFinite(value) && value > 0 && value <= max;
+    });
+  } else if (valid) {
+    valid = items.length === 1;
+  }
   return {
-    schema_version: "c231-domain-routing-validation-v1",
+    schema_version: capture && capture.domain === "NUTRITION"
+      ? "c232a-nutrition-extraction-validation-v1" : "c231-domain-routing-validation-v1",
     capture_id: String(capture && capture.capture_id || ""),
     mode: "SIMULATION",
     ready_for_confirmation: valid,
     errors: valid ? [] : ["INVALID_DOMAIN_ROUTING_CANDIDATE"],
     warnings: [],
-    items: valid ? [{category: items[0].category, status: "PASS", errors: []}] : []
+    items: valid ? items.map(function(item) {
+      return {category: item.category, status: "PASS", errors: []};
+    }) : []
   };
 }
 

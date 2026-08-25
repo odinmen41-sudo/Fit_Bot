@@ -2641,10 +2641,17 @@ function buildMemoryCoachContext_(userId, chatId, options) {
   const newestWeight = weightEvents[0] || null;
   const bodyCurrent = newestWeight ? {label: "Текущий вес", value: contextAddUnit_(newestWeight.value, "кг"),
     priority: newestWeight.priority || "HIGH"} : null;
-  const bodyHistory = weightEvents.slice(0, 5).map(function(item) {
+  const weightDateCounts = {};
+  weightEvents.forEach(function(item) {
+    const dateKey = contextDisplayDate_(item.updated_at);
+    weightDateCounts[dateKey] = (weightDateCounts[dateKey] || 0) + 1;
+  });
+  const bodyCurrentAt = newestWeight && contextTimestamp_(newestWeight.updated_at) !== null ?
+    {label: "Актуально на", value: contextWeightTimestampLabel_(newestWeight, weightDateCounts), priority: "HIGH"} : null;
+  if (newestWeight) usedMemory[newestWeight.category + "|" + newestWeight.key] = true;
+  const bodyHistory = weightEvents.slice(1, 6).map(function(item) {
     usedMemory[item.category + "|" + item.key] = true;
-    return {label: "Вес " + contextDisplayDate_(item.updated_at), value: contextAddUnit_(item.value, "кг"),
-      priority: "HIGH"};
+    return contextWeightHistoryLine_(item, weightDateCounts);
   });
   if (memoryIndex["body_tracking|current_weight"]) usedMemory["body_tracking|current_weight"] = true;
 
@@ -2667,7 +2674,10 @@ function buildMemoryCoachContext_(userId, chatId, options) {
   order += 10;
 
   if (bodyCurrent) bodyCurrent.priority = "HIGH";
-  chunks.push.apply(chunks, contextSectionChunks_("BODY_TRACKING_MEMORY", [bodyCurrent].concat(bodyHistory), order));
+  chunks.push.apply(chunks, contextSectionChunks_("BODY_TRACKING_MEMORY", [bodyCurrent, bodyCurrentAt], order));
+  if (bodyHistory.length) {
+    chunks.push(contextChunk_("Предыдущие измерения:\n" + bodyHistory.join("\n"), "HIGH", order + 1));
+  }
   order += 10;
 
   chunks.push.apply(chunks, contextSectionChunks_("GOALS", contextForcePriority_([
@@ -2838,6 +2848,22 @@ function contextDisplayDate_(value) {
   const date = new Date(time);
   return String(date.getUTCDate()).padStart(2, "0") + "." +
     String(date.getUTCMonth() + 1).padStart(2, "0") + "." + date.getUTCFullYear();
+}
+
+function contextWeightTimestampLabel_(item, dateCounts) {
+  const time = contextTimestamp_(item && item.updated_at);
+  const dateLabel = contextDisplayDate_(item && item.updated_at);
+  let timestampLabel = dateLabel;
+  if (time !== null && Number(dateCounts && dateCounts[dateLabel]) > 1) {
+    const date = new Date(time);
+    timestampLabel += " " + String(date.getUTCHours()).padStart(2, "0") + ":" +
+      String(date.getUTCMinutes()).padStart(2, "0");
+  }
+  return timestampLabel;
+}
+
+function contextWeightHistoryLine_(item, dateCounts) {
+  return contextWeightTimestampLabel_(item, dateCounts) + " — " + contextAddUnit_(item && item.value, "кг");
 }
 
 function contextForcePriority_(entries, priority) {

@@ -56,12 +56,30 @@ function runC232ANutritionExtractionTests() {
     };
   }
 
+  function referenceOptions() {
+    return {
+      aliases: [
+        {ALIAS_NORMALIZED: "рис", FOOD_ID: "rice", PRIORITY: 100, ACTIVE: true}
+      ],
+      references: [
+        {REFERENCE_ID: "rice_boiled_v1", FOOD_ID: "rice", CANONICAL_NAME: "Рис",
+          PREPARATION_STATE: "BOILED", BASIS_QUANTITY: 100, BASIS_UNIT: "g", ACTIVE: true},
+        {REFERENCE_ID: "rice_dry_v1", FOOD_ID: "rice", CANONICAL_NAME: "Рис",
+          PREPARATION_STATE: "DRY", BASIS_QUANTITY: 100, BASIS_UNIT: "g", ACTIVE: true}
+      ]
+    };
+  }
+
   function update(text) {
     return {update_id: "c232a-update", message: {text: text, from: {id: "user-a"}, chat: {id: "chat-a"}}};
   }
 
   function route(text, env) {
-    return routeDomainFactConfirmation_(update(text), {now: now, dependencies: env.dependencies});
+    return routeDomainFactConfirmation_(update(text), {
+      now: now,
+      dependencies: env.dependencies,
+      reference_options: referenceOptions()
+    });
   }
 
   let result = extraction("съел рис 150 г");
@@ -134,16 +152,17 @@ function runC232ANutritionExtractionTests() {
     env.rows.length === 0, result);
 
   env = environment();
-  result = route("съел рис 150 г", env);
+  result = route("съел рис варёный 150 г", env);
   const payload = env.rows[0] && env.rows[0].payload;
   record("C23.2A-15_RAW_TEXT_ABSENT", payload && payload.raw_message === "" &&
-    JSON.stringify(payload).indexOf("съел рис 150 г") < 0 && JSON.stringify(payload).indexOf("raw_fragment") < 0,
+    JSON.stringify(payload).indexOf("съел рис варёный 150 г") < 0 && JSON.stringify(payload).indexOf("raw_fragment") < 0,
     payload);
 
-  record("C23.2A-16_ENRICHED_PENDING_CAPTURE", result.code === "CAPTURE_CREATED" && payload &&
-    payload.schema_version === "c232a-nutrition-extraction-v1" &&
-    env.rows[0].status === "PENDING_CONFIRMATION" && payload.items[0].category === "NUTRITION_LOG" &&
-    field(payload.items[0], "food_normalized") === "рис", {result: result, payload: payload});
+  const unresolvedEnv = environment();
+  const unresolved = route("съел рис 150 г", unresolvedEnv);
+  record("C23.2A-16_B1_CLARIFICATION_EVOLUTION", unresolved.handled === true &&
+    unresolved.code === "CLARIFICATION_REQUIRED" && unresolvedEnv.rows.length === 0,
+    {result: unresolved, extraction: extraction("съел рис 150 г")});
 
   record("C23.2A-17_GROQ_ZERO", result.groq_calls === 0 && env.counters.groq_calls === 0, result);
   record("C23.2A-18_SIMULATION_WRITES_ZERO", result.domain_writes === 0 &&

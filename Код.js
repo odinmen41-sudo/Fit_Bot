@@ -986,7 +986,8 @@ function routeDomainFactConfirmation_(update, options) {
     }
   }
 
-  const detection = detectDomainFactCandidate_(message.text);
+  const referenceOptions = runtime.reference_options || (runtime.dependencies ? {resolution_disabled: true} : {});
+  const detection = detectDomainFactCandidate_(message.text, referenceOptions);
   if (detection.code === "AMBIGUOUS_DOMAIN") {
     return domainFactResult_(false, true, "AMBIGUOUS_DOMAIN");
   }
@@ -994,7 +995,17 @@ function routeDomainFactConfirmation_(update, options) {
   if (detection.domain === "NUTRITION" && detection.requires_clarification === true) {
     return domainFactResult_(true, false, "CLARIFICATION_REQUIRED", {
       domain: "NUTRITION",
-      message: "Укажите количество продукта: например, «банан 1 шт» или «рис 150 г»."
+      reference_status: detection.reference_status || "CLARIFICATION_REQUIRED",
+      message: detection.clarification_message ||
+        "Укажите количество продукта: например, «банан 1 шт» или «рис 150 г»."
+    });
+  }
+  if (detection.domain === "NUTRITION" && detection.reference_status &&
+      detection.reference_status !== "RESOLVED") {
+    return domainFactResult_(true, false, detection.reference_status, {
+      domain: "NUTRITION",
+      reference_status: detection.reference_status,
+      message: detection.clarification_message || nutritionReferenceClarification_(detection.reference_resolution)
     });
   }
 
@@ -1038,7 +1049,7 @@ function routeDomainFactConfirmation_(update, options) {
   });
 }
 
-function detectDomainFactCandidate_(text) {
+function detectDomainFactCandidate_(text, referenceOptions) {
   const normalized = normalizeExplicitWeightText_(text);
   if (!normalized || /^\//.test(normalized)) return {domain: null, code: "NOT_DOMAIN_FACT"};
 
@@ -1056,12 +1067,44 @@ function detectDomainFactCandidate_(text) {
   if (domains.length > 1) return {domain: null, code: "AMBIGUOUS_DOMAIN", domains: domains};
   if (!domains.length) return {domain: null, code: "NOT_DOMAIN_FACT"};
   if (domains[0] === "NUTRITION") {
+    if (nutritionExtraction.requires_clarification === true) {
+      return {
+        domain: "NUTRITION",
+        code: nutritionExtraction.invalid ? "INVALID_NUTRITION_FACT" : "DOMAIN_FACT",
+        confidence: 0.99,
+        requires_clarification: true,
+        clarification_message: "Укажите количество продукта: например, «банан 1 шт» или «рис 150 г».",
+        items: nutritionExtraction.items
+      };
+    }
+    if (nutritionExtraction.invalid === true) {
+      return {
+        domain: "NUTRITION",
+        code: "INVALID_NUTRITION_FACT",
+        confidence: 0.99,
+        requires_clarification: false,
+        items: nutritionExtraction.items
+      };
+    }
+    if (referenceOptions && referenceOptions.resolution_disabled === true) {
+      return {
+        domain: "NUTRITION",
+        code: "DOMAIN_FACT",
+        confidence: 0.99,
+        requires_clarification: false,
+        items: nutritionExtraction.items
+      };
+    }
+    const referenceResolution = resolveNutritionReferences_(nutritionExtraction.items, referenceOptions || {});
     return {
       domain: "NUTRITION",
       code: nutritionExtraction.invalid ? "INVALID_NUTRITION_FACT" : "DOMAIN_FACT",
       confidence: 0.99,
-      requires_clarification: nutritionExtraction.requires_clarification === true,
-      items: nutritionExtraction.items
+      requires_clarification: false,
+      items: referenceResolution.items,
+      reference_status: referenceResolution.status,
+      reference_resolution: referenceResolution,
+      clarification_message: nutritionReferenceClarification_(referenceResolution)
     };
   }
   return {domain: domains[0], code: "DOMAIN_FACT", confidence: 0.99, requires_clarification: false};
@@ -1072,7 +1115,7 @@ function extractNutritionFactCandidate_(text) {
   const result = {detected: false, invalid: false, requires_clarification: false, items: []};
   if (!normalized || nutritionQuestion_(normalized)) return result;
 
-  const hasAction = /^(?:съел(?:а|и)?|ел(?:а|и)?|выпил(?:а|и)?)\b/i.test(normalized);
+  const hasAction = /^(?:съел(?:а|и)?|ел(?:а|и)?|выпил(?:а|и)?)(?=\s|$)/i.test(normalized);
   const hasKnownFood = /(?:рис|куриц|грудк|греч|кефир|банан|яйц|творог|овсян|мяс|рыб|хлеб|сыр)/i.test(normalized);
   if (!hasAction && !hasKnownFood) return result;
 
@@ -1180,6 +1223,263 @@ function normalizeNutritionFoodName_(food) {
     .trim();
 }
 
+function resolveNutritionReferences_(items, options) {
+  const source = loadFoodReferenceData_(options || {});
+  const resolvedItems = (items || []).map(function(item) {
+    return resolveNutritionItemReference_(item, source);
+  });
+  const statuses = resolvedItems.map(function(item) {
+    return String(item && item.fields && item.fields.reference_status &&
+      item.fields.reference_status.value || "UNKNOWN_REFERENCE");
+  });
+  let status = "RESOLVED";
+  if (statuses.indexOf("AMBIGUOUS_IDENTITY") >= 0) status = "AMBIGUOUS_IDENTITY";
+  else if (statuses.indexOf("UNKNOWN_REFERENCE") >= 0) status = "UNKNOWN_REFERENCE";
+  else if (statuses.indexOf("CLARIFICATION_REQUIRED") >= 0) status = "CLARIFICATION_REQUIRED";
+  return {
+    status: status,
+    items: resolvedItems,
+    source_available: source.available === true,
+    unresolved_item: resolvedItems.filter(function(item) {
+      return String(item && item.fields && item.fields.reference_status &&
+        item.fields.reference_status.value || "") !== "RESOLVED";
+    })[0] || null
+  };
+}
+
+function resolveNutritionItemReference_(item, source) {
+  const copy = {
+    category: String(item && item.category || "NUTRITION_LOG"),
+    confidence: Number(item && item.confidence || 0),
+    fields: {}
+  };
+  Object.keys(item && item.fields || {}).forEach(function(key) {
+    const field = item.fields[key] || {};
+    copy.fields[key] = Object.assign({}, field);
+  });
+  const foodText = String(copy.fields.food_normalized && copy.fields.food_normalized.value || "");
+  const quantityUnit = String(copy.fields.quantity_unit && copy.fields.quantity_unit.value || "");
+  const preparation = resolvePreparationState_(foodText);
+  const identity = resolveFoodIdentity_(preparation.base_text, foodText, source.aliases || []);
+  let selection = {status: identity.status, reference: null};
+  if (identity.status === "RESOLVED") {
+    selection = selectNutritionReference_(identity, preparation.state, quantityUnit, source.references || []);
+  }
+  const reference = selection.reference;
+  const canonicalName = reference && reference.CANONICAL_NAME || identity.canonical_name || null;
+  const resolvedPreparation = reference && reference.PREPARATION_STATE || preparation.state;
+  const fields = {
+    food_id: identity.food_id,
+    canonical_food_name: canonicalName,
+    preparation_state: resolvedPreparation || "UNKNOWN",
+    nutrition_reference_id: reference && reference.REFERENCE_ID || null,
+    reference_status: selection.status,
+    reference_basis_quantity: reference ? Number(reference.BASIS_QUANTITY) : null,
+    reference_basis_unit: reference && reference.BASIS_UNIT || null
+  };
+  Object.keys(fields).forEach(function(key) {
+    copy.fields[key] = {
+      value: fields[key],
+      confidence: fields[key] === null ? 0 : 1,
+      source: "DETERMINISTIC_REFERENCE"
+    };
+  });
+  if (identity.variant) {
+    copy.fields.food_variant = {value: identity.variant, confidence: 1, source: "DETERMINISTIC_REFERENCE"};
+  }
+  return copy;
+}
+
+function loadFoodReferenceData_(options) {
+  const runtime = options || {};
+  if (Array.isArray(runtime.references) && Array.isArray(runtime.aliases)) {
+    return {
+      available: true,
+      references: runtime.references.map(foodReferenceNormalizeRecord_),
+      aliases: runtime.aliases.map(foodAliasNormalizeRecord_)
+    };
+  }
+  try {
+    const spreadsheet = runtime.spreadsheet || getSpreadsheet_();
+    const referenceSheet = spreadsheet.getSheetByName("FOOD_REFERENCE");
+    const aliasSheet = spreadsheet.getSheetByName("FOOD_ALIASES");
+    if (!referenceSheet || !aliasSheet) return {available: false, references: [], aliases: []};
+    return {
+      available: true,
+      references: foodReferenceSheetObjects_(referenceSheet).map(foodReferenceNormalizeRecord_),
+      aliases: foodReferenceSheetObjects_(aliasSheet).map(foodAliasNormalizeRecord_)
+    };
+  } catch (error) {
+    return {available: false, references: [], aliases: [], error: errorText_(error)};
+  }
+}
+
+function foodReferenceSheetObjects_(sheet) {
+  const lastRow = Number(sheet && sheet.getLastRow && sheet.getLastRow() || 0);
+  const lastColumn = Number(sheet && sheet.getLastColumn && sheet.getLastColumn() || 0);
+  if (lastRow < 2 || lastColumn < 1) return [];
+  const values = sheet.getRange(1, 1, lastRow, lastColumn).getValues();
+  const headers = values[0].map(function(header) { return String(header || "").trim().toUpperCase(); });
+  return values.slice(1).map(function(row) {
+    const result = {};
+    headers.forEach(function(header, index) { if (header) result[header] = row[index]; });
+    return result;
+  });
+}
+
+function foodReferenceNormalizeRecord_(record) {
+  const source = record || {};
+  return {
+    REFERENCE_ID: String(source.REFERENCE_ID || source.reference_id || "").trim(),
+    FOOD_ID: String(source.FOOD_ID || source.food_id || "").trim().toLowerCase(),
+    CANONICAL_NAME: String(source.CANONICAL_NAME || source.canonical_name || "").trim(),
+    DISPLAY_NAME: String(source.DISPLAY_NAME || source.display_name || "").trim(),
+    VARIANT: String(source.VARIANT || source.variant || "").trim().toLowerCase(),
+    PREPARATION_STATE: String(source.PREPARATION_STATE || source.preparation_state || "UNKNOWN").trim().toUpperCase(),
+    BASIS_QUANTITY: Number(source.BASIS_QUANTITY == null ? source.basis_quantity : source.BASIS_QUANTITY),
+    BASIS_UNIT: String(source.BASIS_UNIT || source.basis_unit || "").trim().toLowerCase(),
+    CALORIES: Number(source.CALORIES == null ? source.calories : source.CALORIES),
+    PROTEIN: Number(source.PROTEIN == null ? source.protein : source.PROTEIN),
+    FAT: Number(source.FAT == null ? source.fat : source.FAT),
+    CARBS: Number(source.CARBS == null ? source.carbs : source.CARBS),
+    AUTHORITY: String(source.AUTHORITY || source.authority || "").trim(),
+    SOURCE: String(source.SOURCE || source.source || "").trim(),
+    SOURCE_VERSION: String(source.SOURCE_VERSION || source.source_version || "").trim(),
+    ACTIVE: foodReferenceActive_(source.ACTIVE == null ? source.active : source.ACTIVE)
+  };
+}
+
+function foodAliasNormalizeRecord_(record) {
+  const source = record || {};
+  return {
+    ALIAS_NORMALIZED: normalizeFoodAlias_(source.ALIAS_NORMALIZED || source.alias_normalized || ""),
+    FOOD_ID: String(source.FOOD_ID || source.food_id || "").trim().toLowerCase(),
+    VARIANT_HINT: String(source.VARIANT_HINT || source.variant_hint || "").trim().toLowerCase(),
+    PREPARATION_HINT: String(source.PREPARATION_HINT || source.preparation_hint || "").trim().toUpperCase(),
+    PRIORITY: Number(source.PRIORITY == null ? source.priority || 0 : source.PRIORITY),
+    ACTIVE: foodReferenceActive_(source.ACTIVE == null ? source.active : source.ACTIVE),
+    CANONICAL_NAME: String(source.CANONICAL_NAME || source.canonical_name || "").trim()
+  };
+}
+
+function foodReferenceActive_(value) {
+  if (value === true || value === 1) return true;
+  return ["TRUE", "YES", "1", "ДА"].indexOf(String(value || "").trim().toUpperCase()) >= 0;
+}
+
+function normalizeFoodAlias_(value) {
+  return String(value || "").toLowerCase().replace(/ё/g, "е").replace(/\s+/g, " ").trim();
+}
+
+function resolvePreparationState_(foodText) {
+  let normalized = normalizeFoodAlias_(foodText);
+  const definitions = [
+    {state: "BOILED", pattern: /(?:^|\s)(?:вареный|вареная|вареное|вареную|вареного|отварной|отварная|отварную)(?=\s|$)/g},
+    {state: "DRY", pattern: /(?:^|\s)(?:сухой|сухая|сухую|сухого)(?=\s|$)/g},
+    {state: "FRIED", pattern: /(?:^|\s)(?:жареный|жареная|жареное|жареную|жареного)(?=\s|$)/g},
+    {state: "GRILLED", pattern: /(?:^|\s)(?:гриль|на\s+гриле)(?=\s|$)/g}
+  ];
+  const matched = definitions.filter(function(definition) {
+    definition.pattern.lastIndex = 0;
+    const found = definition.pattern.test(normalized);
+    definition.pattern.lastIndex = 0;
+    return found;
+  });
+  const state = matched.length === 1 ? matched[0].state : "UNKNOWN";
+  matched.forEach(function(definition) {
+    definition.pattern.lastIndex = 0;
+    normalized = normalized.replace(definition.pattern, " ");
+  });
+  return {state: state, base_text: normalizeFoodAlias_(normalized)};
+}
+
+function resolveFoodIdentity_(baseText, fullText, aliases) {
+  const base = normalizeFoodAlias_(baseText);
+  const full = normalizeFoodAlias_(fullText);
+  if (full === "курица" || base === "курица") {
+    return {status: "AMBIGUOUS_IDENTITY", food_id: null, variant: "", canonical_name: null};
+  }
+  let matches = (aliases || []).filter(function(alias) {
+    return alias.ACTIVE === true && alias.ALIAS_NORMALIZED === full;
+  });
+  if (!matches.length && base !== full) {
+    matches = (aliases || []).filter(function(alias) {
+      return alias.ACTIVE === true && alias.ALIAS_NORMALIZED === base;
+    });
+  }
+  if (!matches.length) return {status: "UNKNOWN_REFERENCE", food_id: null, variant: "", canonical_name: null};
+  const maxPriority = Math.max.apply(null, matches.map(function(alias) { return Number(alias.PRIORITY || 0); }));
+  matches = matches.filter(function(alias) { return Number(alias.PRIORITY || 0) === maxPriority; });
+  const identities = {};
+  matches.forEach(function(alias) {
+    identities[alias.FOOD_ID + "|" + alias.VARIANT_HINT + "|" + alias.PREPARATION_HINT] = alias;
+  });
+  const unique = Object.keys(identities).map(function(key) { return identities[key]; });
+  const foodIds = unique.map(function(alias) { return alias.FOOD_ID; }).filter(function(value, index, all) {
+    return value && all.indexOf(value) === index;
+  });
+  if (foodIds.length !== 1) return {status: "AMBIGUOUS_IDENTITY", food_id: null, variant: "", canonical_name: null};
+  const hints = unique[0];
+  return {
+    status: "RESOLVED",
+    food_id: hints.FOOD_ID,
+    variant: hints.VARIANT_HINT,
+    preparation_hint: hints.PREPARATION_HINT,
+    canonical_name: hints.CANONICAL_NAME || null
+  };
+}
+
+function validateFoodReferenceRecord_(reference) {
+  return !!(reference && reference.ACTIVE === true && reference.REFERENCE_ID && reference.FOOD_ID &&
+    isFinite(Number(reference.BASIS_QUANTITY)) && Number(reference.BASIS_QUANTITY) > 0 &&
+    ["g", "ml", "count"].indexOf(String(reference.BASIS_UNIT || "")) >= 0);
+}
+
+function selectNutritionReference_(identity, detectedPreparation, quantityUnit, references) {
+  const preparation = detectedPreparation !== "UNKNOWN"
+    ? detectedPreparation : String(identity.preparation_hint || "UNKNOWN");
+  let candidates = (references || []).filter(function(reference) {
+    if (!validateFoodReferenceRecord_(reference) || reference.FOOD_ID !== identity.food_id) return false;
+    return identity.variant ? reference.VARIANT === identity.variant : !reference.VARIANT;
+  });
+  if (preparation !== "UNKNOWN") {
+    candidates = candidates.filter(function(reference) { return reference.PREPARATION_STATE === preparation; });
+  } else if (candidates.length > 1) {
+    return {status: "CLARIFICATION_REQUIRED", reference: null};
+  }
+  const basisCompatible = candidates.filter(function(reference) {
+    return String(reference.BASIS_UNIT) === String(quantityUnit);
+  });
+  if (!basisCompatible.length) {
+    return {status: candidates.length ? "UNKNOWN_REFERENCE" :
+      (identity.food_id === "rice" || identity.food_id === "chicken_breast" ? "CLARIFICATION_REQUIRED" : "UNKNOWN_REFERENCE"),
+    reference: null};
+  }
+  if (basisCompatible.length !== 1) return {status: "CLARIFICATION_REQUIRED", reference: null};
+  return {status: "RESOLVED", reference: basisCompatible[0]};
+}
+
+function nutritionReferenceClarification_(resolution) {
+  const item = resolution && resolution.unresolved_item;
+  const fields = item && item.fields || {};
+  const status = String(resolution && resolution.status || fields.reference_status && fields.reference_status.value || "UNKNOWN_REFERENCE");
+  const foodId = String(fields.food_id && fields.food_id.value || "");
+  const normalizedFood = normalizeFoodAlias_(fields.food_normalized && fields.food_normalized.value);
+  if (normalizedFood === "курица") {
+    return "Укажите часть курицы и способ приготовления, например: «куриная грудка варёная 200 г».";
+  }
+  if (status === "AMBIGUOUS_IDENTITY") {
+    return "Не удалось однозначно определить продукт по справочнику. Уточните продукт полной записью.";
+  }
+  if (foodId === "rice") {
+    return "Рис был сухой или уже приготовленный? Отправьте полную запись, например: «рис варёный 150 г».";
+  }
+  if (foodId === "chicken_breast") {
+    return "Как была приготовлена куриная грудка? Отправьте полную запись, например: «куриная грудка варёная 200 г».";
+  }
+  return "Продукт отсутствует в проверенном справочнике. Уточните продукт и способ приготовления полной записью.";
+}
+
 function buildDomainFactCandidate_(detection, options) {
   const runtime = options || {};
   const now = runtime.now instanceof Date ? runtime.now : new Date();
@@ -1194,7 +1494,8 @@ function buildDomainFactCandidate_(detection, options) {
     ? detection.items : null;
   return {
     schema_version: domain === "NUTRITION"
-      ? "c232a-nutrition-extraction-v1" : "c231-domain-routing-v1",
+      ? (detection.reference_status ? "c232b1-nutrition-reference-v1" :
+        "c232a-nutrition-extraction-v1") : "c231-domain-routing-v1",
     mode: "SIMULATION",
     writes_allowed: false,
     capture_id: "c231-" + String(uuid),
@@ -1226,21 +1527,33 @@ function validateDomainFactCandidate_(capture) {
     items.every(function(item) { return item.category === allowed[capture.domain]; }) &&
     Number(capture.confidence) >= 0.9 && capture.requires_clarification === false);
   if (valid && capture.domain === "NUTRITION") {
-    valid = capture.schema_version === "c232a-nutrition-extraction-v1" && items.every(function(item) {
+    const legacySchema = capture.schema_version === "c232a-nutrition-extraction-v1";
+    const b1Schema = capture.schema_version === "c232b1-nutrition-reference-v1";
+    valid = (legacySchema || b1Schema) && items.every(function(item) {
       const fields = item && item.fields || {};
       const value = Number(fields.quantity_value && fields.quantity_value.value);
       const unit = String(fields.quantity_unit && fields.quantity_unit.value || "");
       const food = String(fields.food_normalized && fields.food_normalized.value || "");
       const max = unit === "count" ? 100 : 10000;
-      return !!food && ["g", "ml", "count"].indexOf(unit) >= 0 &&
+      const baseValid = !!food && ["g", "ml", "count"].indexOf(unit) >= 0 &&
         isFinite(value) && value > 0 && value <= max;
+      if (!baseValid || legacySchema) return baseValid;
+      const referenceStatus = String(fields.reference_status && fields.reference_status.value || "");
+      const referenceId = String(fields.nutrition_reference_id && fields.nutrition_reference_id.value || "");
+      const foodId = String(fields.food_id && fields.food_id.value || "");
+      const basisQuantity = Number(fields.reference_basis_quantity && fields.reference_basis_quantity.value);
+      const basisUnit = String(fields.reference_basis_unit && fields.reference_basis_unit.value || "");
+      return referenceStatus === "RESOLVED" && !!referenceId && !!foodId &&
+        isFinite(basisQuantity) && basisQuantity > 0 && basisUnit === unit;
     });
   } else if (valid) {
     valid = items.length === 1;
   }
   return {
     schema_version: capture && capture.domain === "NUTRITION"
-      ? "c232a-nutrition-extraction-validation-v1" : "c231-domain-routing-validation-v1",
+      ? (capture.schema_version === "c232b1-nutrition-reference-v1"
+        ? "c232b1-nutrition-reference-validation-v1" : "c232a-nutrition-extraction-validation-v1")
+      : "c231-domain-routing-validation-v1",
     capture_id: String(capture && capture.capture_id || ""),
     mode: "SIMULATION",
     ready_for_confirmation: valid,

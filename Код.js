@@ -143,6 +143,14 @@ function doPost(e) {
       return httpOk_("OK");
     }
 
+    const dailyNutrition = routeDailyNutritionSummary_(update);
+    if (dailyNutrition.handled) {
+      sendTelegramMessage_(chatId, dailyNutrition.message);
+      logAiReply_(messageText, dailyNutrition.message, "daily_nutrition_summary");
+      markBotInputProcessed_(inputRow, dailyNutrition.ok ? "Да" : "Ошибка nutrition summary");
+      return httpOk_("OK");
+    }
+
     let reply;
     let modelUsed = "";
 
@@ -2045,6 +2053,165 @@ const C232B4_NUTRITION_SCHEMA = Object.freeze([
   "ITEMS_COUNT", "CALORIES_TOTAL", "PROTEIN_TOTAL", "FAT_TOTAL", "CARBS_TOTAL",
   "ITEMS_JSON", "SNAPSHOT_HASH", "TRANSACTION_STATUS", "SOURCE", "CREATED_AT", "UPDATED_AT"
 ]);
+
+function routeDailyNutritionSummary_(update, options) {
+  const runtime = options || {};
+  const message = update && (update.message || update.edited_message);
+  if (!message || typeof message.text !== "string" ||
+      !detectDailyNutritionQueryIntent_(message.text)) {
+    return dailyNutritionResult_(false, true, "NOT_DAILY_NUTRITION_QUERY");
+  }
+  const userId = String(message.from && message.from.id || "").trim();
+  if (!userId) return dailyNutritionResult_(true, false, "INVALID_USER", {
+    message: "Не удалось надёжно рассчитать итог питания за сегодня из-за ошибки данных."
+  });
+
+  const summary = loadDailyNutritionSummary_(userId, runtime);
+  return dailyNutritionResult_(true, summary.ok === true, summary.code, {
+    date: summary.date,
+    meals_count: summary.meals_count,
+    consumed: summary.consumed,
+    message: formatDailyNutritionSummary_(summary)
+  });
+}
+
+function detectDailyNutritionQueryIntent_(text) {
+  const normalized = String(text || "").toLowerCase()
+    .replace(/ё/g, "е").replace(/[!?.,;:]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!normalized || /(?:остал(?:ось|ся)|нужно|калораж|\bв\s+(?:рис|кур|груд|продукт))/.test(normalized)) {
+    return false;
+  }
+  return /^(?:сколько\s+(?:я\s+)?(?:сегодня\s+)?съел(?:а)?|сколько\s+(?:я\s+)?съел(?:а)?\s+за\s+сегодня|сколько\s+(?:сегодня\s+)?калори(?:й|и)(?:\s+я\s+съел(?:а)?\s+сегодня)?|что\s+сегодня\s+по\s+кбжу)$/.test(normalized);
+}
+
+function loadDailyNutritionSummary_(userId, options) {
+  const runtime = options || {};
+  const dependencies = nutritionDailyReadDependencies_(runtime.dependencies);
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  let day;
+  let table;
+  try {
+    day = nutritionDayBounds_(now, dependencies.time_zone(), dependencies.format_date);
+    table = dependencies.read_table();
+  } catch (error) {
+    return dailyNutritionSummaryError_("DATA_INTEGRITY_ERROR", day && day.date);
+  }
+  if (!table || !validateNutritionLogSchema_(table.headers)) {
+    return dailyNutritionSummaryError_("DATA_INTEGRITY_ERROR", day.date);
+  }
+
+  const totals = {calories: 0, protein: 0, fat: 0, carbs: 0};
+  const captureIds = {};
+  let mealsCount = 0;
+  const rows = Array.isArray(table.rows) ? table.rows : [];
+  for (let index = 0; index < rows.length; index += 1) {
+    const record = nutritionMealValuesRecord_(rows[index]);
+    if (String(record.user_id).trim() !== String(userId)) continue;
+    const transactionStatus = String(record.transaction_status).trim();
+    if (transactionStatus === "PREPARING") continue;
+    if (transactionStatus !== "COMMITTED") {
+      return dailyNutritionSummaryError_("DATA_INTEGRITY_ERROR", day.date);
+    }
+    const parsed = parseCommittedNutritionReadRow_(record, day, dependencies.format_date);
+    if (parsed.code === "OTHER_DAY") continue;
+    if (!parsed.ok) return dailyNutritionSummaryError_("DATA_INTEGRITY_ERROR", day.date);
+    if (captureIds[parsed.capture_id]) {
+      return dailyNutritionSummaryError_("DATA_INTEGRITY_ERROR", day.date);
+    }
+    captureIds[parsed.capture_id] = true;
+    mealsCount += 1;
+    totals.calories += parsed.totals.calories;
+    totals.protein += parsed.totals.protein;
+    totals.fat += parsed.totals.fat;
+    totals.carbs += parsed.totals.carbs;
+  }
+  return {ok: true, code: "DAILY_NUTRITION_SUMMARY", date: day.date,
+    meals_count: mealsCount, consumed: totals};
+}
+
+function parseCommittedNutritionReadRow_(record, day, formatDate) {
+  const captureId = String(record && record.capture_id || "").trim();
+  const mealId = String(record && record.meal_id || "").trim();
+  const mealAt = new Date(record && record.meal_at);
+  if (!captureId || mealId !== nutritionMealId_(captureId) || isNaN(mealAt.getTime())) {
+    return {ok: false, code: "INVALID_COMMITTED_ROW"};
+  }
+  let rowDate;
+  try {
+    rowDate = formatDate(mealAt, day.time_zone);
+  } catch (error) {
+    return {ok: false, code: "INVALID_COMMITTED_ROW"};
+  }
+  if (rowDate !== day.date) return {ok: false, code: "OTHER_DAY"};
+  const validation = validateCommittedNutritionReadRow_(record);
+  if (!validation.ok) return validation;
+  return {ok: true, code: "COMMITTED_ROW", capture_id: captureId, totals: validation.totals};
+}
+
+function validateCommittedNutritionReadRow_(record) {
+  if (!record || String(record.transaction_status).trim() !== "COMMITTED") {
+    return {ok: false, code: "INVALID_COMMITTED_ROW"};
+  }
+  const totals = {};
+  const fields = ["calories", "protein", "fat", "carbs"];
+  for (let index = 0; index < fields.length; index += 1) {
+    const key = fields[index];
+    const raw = record[key + "_total"];
+    if (raw === "" || raw === null || raw === undefined || !isFinite(Number(raw)) || Number(raw) < 0) {
+      return {ok: false, code: "INVALID_COMMITTED_ROW"};
+    }
+    totals[key] = Number(raw);
+  }
+  return {ok: true, totals: totals};
+}
+
+function nutritionDayBounds_(now, timeZone, formatDate) {
+  const zone = String(timeZone || "").trim();
+  if (!zone) throw new Error("PROJECT_TIME_ZONE_MISSING");
+  return {date: formatDate(now, zone), time_zone: zone};
+}
+
+function formatDailyNutritionSummary_(summary) {
+  if (!summary || summary.ok !== true) {
+    return "Не удалось надёжно рассчитать итог питания за сегодня из-за ошибки данных.";
+  }
+  if (!summary.meals_count) return "Сегодня пока нет сохранённых записей о питании.";
+  const consumed = summary.consumed;
+  return "Сегодня:\n" + dailyNutritionNumber_(consumed.calories, 1) + " ккал\n" +
+    "Б: " + dailyNutritionNumber_(consumed.protein, 1) + " г | Ж: " +
+    dailyNutritionNumber_(consumed.fat, 1) + " г | У: " +
+    dailyNutritionNumber_(consumed.carbs, 1) + " г";
+}
+
+function dailyNutritionNumber_(value, decimals) {
+  const rounded = Number(Number(value).toFixed(decimals));
+  return String(rounded).replace(".", ",");
+}
+
+function dailyNutritionSummaryError_(code, date) {
+  return {ok: false, code: code, date: date || "", meals_count: 0, consumed: null};
+}
+
+function dailyNutritionResult_(handled, ok, code, extra) {
+  return Object.assign({handled: handled === true, ok: ok === true, code: String(code || "")}, extra || {});
+}
+
+function nutritionDailyReadDependencies_(overrides) {
+  const supplied = overrides || {};
+  return {
+    time_zone: supplied.time_zone || function() { return Session.getScriptTimeZone(); },
+    format_date: supplied.format_date || function(date, zone) {
+      return Utilities.formatDate(date, zone, "yyyy-MM-dd");
+    },
+    read_table: supplied.read_table || function() {
+      const sheet = getSpreadsheet_().getSheetByName("Nutrition_Log");
+      if (!sheet) throw new Error("NUTRITION_LOG_MISSING");
+      const lastRow = sheet.getLastRow();
+      const values = sheet.getRange(1, 1, Math.max(lastRow, 1), C232B4_NUTRITION_SCHEMA.length).getValues();
+      return {headers: values[0] || [], rows: values.slice(1)};
+    }
+  };
+}
 
 function nutritionPersistenceEnabled_(options) {
   const runtime = options || {};

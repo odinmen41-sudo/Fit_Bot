@@ -135,6 +135,14 @@ function doPost(e) {
       return httpOk_("OK");
     }
 
+    const nutritionTarget = routeNutritionTargetConfirmation_(update);
+    if (nutritionTarget.handled) {
+      sendTelegramMessage_(chatId, nutritionTarget.message);
+      logAiReply_(messageText, nutritionTarget.message, "nutrition_target_gate");
+      markBotInputProcessed_(inputRow, nutritionTarget.ok ? "Да" : "Ошибка nutrition target");
+      return httpOk_("OK");
+    }
+
     const domainFact = routeDomainFactConfirmation_(update);
     if (domainFact.handled) {
       sendTelegramMessage_(chatId, domainFact.message);
@@ -963,6 +971,397 @@ function routeWeightFactConfirmation_(update, options) {
     message: "Правильно понял, что ваш текущий вес " + weightFactNumber_(candidate.value) +
       " кг? Подтвердите: Да или Нет."
   });
+}
+
+const C232C2_TARGET_SCHEMA = Object.freeze([
+  "User_ID", "Имя", "Возраст", "Рост", "Вес старт", "Текущий вес", "Целевой вес", "Цель",
+  "Уровень подготовки", "Тренировки в неделю", "Telegram_ID", "Калории цель", "Белок цель", "Жиры цель", "Углеводы цель"
+]);
+
+const C232C2_TARGET_FIELDS = Object.freeze({
+  calories: Object.freeze({header: "Калории цель", min: 500, max: 10000, decimals: 0, unit: "ккал", label: "Калории"}),
+  protein: Object.freeze({header: "Белок цель", min: 1, max: 1000, decimals: 1, unit: "г", label: "Белок"}),
+  fat: Object.freeze({header: "Жиры цель", min: 1, max: 1000, decimals: 1, unit: "г", label: "Жиры"}),
+  carbs: Object.freeze({header: "Углеводы цель", min: 1, max: 1500, decimals: 1, unit: "г", label: "Углеводы"})
+});
+
+function routeNutritionTargetConfirmation_(update, options) {
+  const runtime = options || {};
+  const message = update && (update.message || update.edited_message);
+  if (!message || typeof message.text !== "string") return nutritionTargetResult_(false, true, "NOT_TARGET_UPDATE");
+  const userId = String(message.from && message.from.id || "");
+  const chatId = String(message.chat && message.chat.id || "");
+  if (!userId || !chatId) return nutritionTargetResult_(false, true, "NOT_TARGET_UPDATE");
+  const dependencies = nutritionTargetDependencies_(runtime.dependencies);
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  const confirmation = dependencies.detect_confirmation(message.text);
+  if (confirmation && ["CONFIRM", "CANCEL"].indexOf(confirmation.intent) >= 0) {
+    const selected = dependencies.find_capture(userId, chatId, {now: now, include_saved: confirmation.intent === "CONFIRM"});
+    if (selected && selected.ok === true) {
+      return handleNutritionTargetConfirmation_(selected, confirmation.intent, userId, chatId, now, dependencies);
+    }
+    return nutritionTargetResult_(false, true, "NO_TARGET_CAPTURE");
+  }
+  const detection = detectExplicitNutritionTargetUpdate_(message.text);
+  if (!detection) return nutritionTargetResult_(false, true, "NOT_TARGET_UPDATE");
+  if (detection.ok !== true) return nutritionTargetResult_(true, false, detection.code, {
+    message: "Проверьте целевые значения и единицы измерения."
+  });
+  const conflict = dependencies.find_conflict(userId, chatId, {now: now});
+  if (conflict && conflict.ok === true) return nutritionTargetResult_(true, false, "ACTIVE_CAPTURE_EXISTS", {
+    message: "Сначала завершите или отмените текущее подтверждение данных."
+  });
+  const current = dependencies.load_targets(userId);
+  if (!current || current.ok !== true) return nutritionTargetResult_(true, false, String(current && current.code || "TARGET_READ_FAILED"), {
+    message: "Цели по питанию пока нельзя безопасно обновить: проверьте профиль."
+  });
+  const capture = buildNutritionTargetCapture_(detection, current, {
+    now: now, update_id: update && update.update_id, user_id: userId, uuid: dependencies.uuid
+  });
+  const validation = validateNutritionTargetCapture_(capture);
+  if (!validation.ok) return nutritionTargetResult_(true, false, validation.code, {message: "Не удалось безопасно подготовить цели."});
+  const created = dependencies.create_capture(capture, {
+    now: now, ttl_minutes: 30, user_id: userId, chat_id: chatId,
+    source_update_id: update && update.update_id, validation: validation
+  });
+  if (!created || created.ok !== true) return nutritionTargetResult_(true, false, String(created && created.code || "CAPTURE_CREATE_FAILED"), {
+    message: created && created.code === "ACTIVE_CAPTURE_EXISTS"
+      ? "Сначала завершите или отмените текущее подтверждение данных."
+      : "Не удалось создать подтверждение."
+  });
+  return nutritionTargetResult_(true, true, "TARGET_CONFIRMATION_REQUESTED", {
+    capture_id: capture.capture_id, message: formatNutritionTargetConfirmation_(capture, current.targets)
+  });
+}
+
+function detectExplicitNutritionTargetUpdate_(text) {
+  const normalized = String(text || "").toLowerCase().replace(/ё/g, "е").replace(/,/g, ".")
+    .replace(/[\u00a0\s]+/g, " ").trim();
+  if (!normalized || /^\//.test(normalized) || /(?:^|\s)(?:съел|съела|ел|ела|выпил|ужин|завтрак|обед)(?:\s|$)/.test(normalized)) return null;
+  if (!/цел/.test(normalized)) return null;
+  if (/(?:^|\s)(?:сколько|какая|какой|осталось|нужно)(?:\s|$)/.test(normalized) && /\?/.test(String(text))) return null;
+  if (/(?:цел\w*\s+(?:по\s+)?вес|целев\w*\s+вес)/.test(normalized)) return null;
+  const proposed = {calories: null, protein: null, fat: null, carbs: null};
+  const patterns = {
+    calories: [/(\d+(?:\.\d+)?)\s*ккал(?:\s|$|[.,;:])/, /(?:калори(?:и|й|я|ю|ям|ях|ями)?|ккал)[^\d,;]{0,24}(\d+(?:\.\d+)?)/],
+    protein: [/(?:белок|белку|белка)[^\d]{0,24}(\d+(?:\.\d+)?)/],
+    fat: [/(?:жиры|жирам|жиру|жиров)[^\d]{0,24}(\d+(?:\.\d+)?)/],
+    carbs: [/(?:углеводы|углеводам|углеводов)[^\d]{0,24}(\d+(?:\.\d+)?)/]
+  };
+  Object.keys(patterns).forEach(function(key) {
+    for (let index = 0; index < patterns[key].length; index += 1) {
+      const match = normalized.match(patterns[key][index]);
+      if (match) { proposed[key] = parseNutritionTargetValue_(match[1]); break; }
+    }
+  });
+  const explicit = Object.keys(proposed).filter(function(key) { return proposed[key] !== null; });
+  if (!explicit.length) return null;
+  const validation = validateNutritionTargets_(proposed, explicit);
+  return {ok: validation.ok, code: validation.code, proposed_targets: proposed, explicit_fields: explicit};
+}
+
+function parseNutritionTargetValue_(value) {
+  const normalized = String(value == null ? "" : value).trim().replace(",", ".");
+  if (!/^\d+(?:\.\d+)?$/.test(normalized)) return null;
+  const number = Number(normalized);
+  return isFinite(number) ? number : null;
+}
+
+function validateNutritionTargets_(targets, explicitFields) {
+  const fields = explicitFields || Object.keys(C232C2_TARGET_FIELDS);
+  for (let index = 0; index < fields.length; index += 1) {
+    const key = fields[index];
+    const config = C232C2_TARGET_FIELDS[key];
+    const value = targets && targets[key];
+    if (!config || value === null || value === "" || !isFinite(Number(value))) return {ok: false, code: "INVALID_TARGET_VALUE", field: key};
+    const number = Number(value);
+    if (number < config.min || number > config.max) return {ok: false, code: "TARGET_OUT_OF_RANGE", field: key};
+    const factor = Math.pow(10, config.decimals);
+    if (Math.round(number * factor) / factor !== number) return {ok: false, code: "INVALID_TARGET_PRECISION", field: key};
+  }
+  return {ok: true, code: "VALID"};
+}
+
+function nutritionTargetSchema_(headers) {
+  const actual = (headers || []).map(function(value) { return String(value || "").trim(); });
+  if (actual.length !== C232C2_TARGET_SCHEMA.length) return {ok: false, code: "INVALID_PROFILE_SCHEMA"};
+  const seen = {};
+  for (let index = 0; index < C232C2_TARGET_SCHEMA.length; index += 1) {
+    if (actual[index] !== C232C2_TARGET_SCHEMA[index] || seen[actual[index]]) return {ok: false, code: "INVALID_PROFILE_SCHEMA"};
+    seen[actual[index]] = true;
+  }
+  const indexes = {};
+  actual.forEach(function(header, index) { indexes[header] = index; });
+  return {ok: true, code: "VALID_SCHEMA", headers: actual, indexes: indexes};
+}
+
+function resolveNutritionTargetProfileRow_(headers, rows, telegramUserId) {
+  const schema = nutritionTargetSchema_(headers);
+  if (!schema.ok) return schema;
+  const expected = String(telegramUserId == null ? "" : telegramUserId).trim();
+  const telegramIndex = schema.indexes.Telegram_ID;
+  const userIndex = schema.indexes.User_ID;
+  let matches = (rows || []).map(function(row, index) { return {row: row, row_index: index}; })
+    .filter(function(entry) { return String(entry.row[telegramIndex] == null ? "" : entry.row[telegramIndex]).trim() === expected; });
+  if (!matches.length) matches = (rows || []).map(function(row, index) { return {row: row, row_index: index}; })
+    .filter(function(entry) { return String(entry.row[userIndex] == null ? "" : entry.row[userIndex]).trim() === expected; });
+  if (!matches.length) return {ok: false, code: "USER_NOT_FOUND"};
+  if (matches.length !== 1) return {ok: false, code: "DUPLICATE_USER_PROFILE"};
+  return {ok: true, code: "USER_FOUND", row: matches[0].row, row_index: matches[0].row_index, schema: schema};
+}
+
+function loadAuthoritativeNutritionTargets_(telegramUserId, options) {
+  const runtime = options || {};
+  let table;
+  try { table = runtime.table || nutritionTargetProfileIo_().read_table(); }
+  catch (error) { return nutritionTargetReadResult_(false, "PROFILE_READ_FAILED", "INVALID", null); }
+  const resolved = resolveNutritionTargetProfileRow_(table.headers, table.rows, telegramUserId);
+  if (!resolved.ok) return nutritionTargetReadResult_(false, resolved.code, "INVALID", null);
+  const targets = {};
+  let configured = 0;
+  const keys = Object.keys(C232C2_TARGET_FIELDS);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    const raw = resolved.row[resolved.schema.indexes[C232C2_TARGET_FIELDS[key].header]];
+    if (raw === "" || raw === null || raw === undefined) { targets[key] = null; continue; }
+    const parsed = typeof raw === "number" ? raw : parseNutritionTargetValue_(raw);
+    targets[key] = parsed;
+    const valid = validateNutritionTargets_(targets, [key]);
+    if (!valid.ok) return nutritionTargetReadResult_(false, valid.code, "INVALID", targets, {field: key});
+    configured += 1;
+  }
+  return nutritionTargetReadResult_(true, configured === 4 ? "TARGETS_AVAILABLE" : configured ? "TARGETS_PARTIAL" : "TARGETS_NOT_CONFIGURED",
+    configured === 4 ? "AVAILABLE" : configured ? "PARTIAL" : "NOT_CONFIGURED", targets,
+    {row_index: resolved.row_index, profile_user_id: String(resolved.row[resolved.schema.indexes.User_ID] || "")});
+}
+
+function nutritionTargetReadResult_(ok, code, status, targets, extra) {
+  return Object.assign({ok: ok === true, code: code, status: status,
+    targets: targets || {calories: null, protein: null, fat: null, carbs: null}}, extra || {});
+}
+
+function buildNutritionTargetCapture_(detection, current, options) {
+  const runtime = options || {};
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  const proposed = {calories: null, protein: null, fat: null, carbs: null};
+  const base = {};
+  detection.explicit_fields.forEach(function(key) { proposed[key] = detection.proposed_targets[key]; base[key] = current.targets[key]; });
+  return {schema_version: "c232c2-nutrition-target-update-v1", domain: "NUTRITION_TARGETS",
+    source: "C232C2_NUTRITION_TARGETS", raw_message: "", capture_id: "c232c2-" + String(runtime.uuid()),
+    created_at: now.toISOString(), proposed_targets: proposed,
+    explicit_fields: detection.explicit_fields.slice(), base_values: base,
+    items: [{category: "NUTRITION_TARGETS", confidence: 1, fields: {target_update: {value: true, source: "EXPLICIT_USER_INPUT"}}}]};
+}
+
+function validateNutritionTargetCapture_(capture) {
+  const explicit = capture && Array.isArray(capture.explicit_fields) ? capture.explicit_fields : [];
+  const unique = {};
+  const validFields = explicit.length > 0 && explicit.every(function(key) {
+    if (!C232C2_TARGET_FIELDS[key] || unique[key]) return false;
+    unique[key] = true; return Object.prototype.hasOwnProperty.call(capture.base_values || {}, key);
+  });
+  const values = validFields ? validateNutritionTargets_(capture.proposed_targets, explicit) : {ok: false};
+  const ok = !!(capture && capture.schema_version === "c232c2-nutrition-target-update-v1" &&
+    capture.domain === "NUTRITION_TARGETS" && capture.source === "C232C2_NUTRITION_TARGETS" &&
+    capture.raw_message === "" && validFields && values.ok);
+  return {ok: ok, code: ok ? "VALID" : "INVALID_TARGET_CAPTURE", ready_for_confirmation: ok,
+    schema_version: "c232c2-nutrition-target-validation-v1", errors: ok ? [] : ["INVALID_TARGET_CAPTURE"]};
+}
+
+function formatNutritionTargetConfirmation_(capture, currentTargets) {
+  const explicit = capture.explicit_fields;
+  const lines = explicit.length === 1 ? ["Изменить цель по питанию:", ""] : ["Цели по питанию:", ""];
+  explicit.forEach(function(key) {
+    const config = C232C2_TARGET_FIELDS[key];
+    const before = currentTargets[key];
+    const after = capture.proposed_targets[key];
+    lines.push(config.label + ": " + (before == null ? "не задано → " : nutritionTargetNumber_(before) + " " + config.unit + " → ") +
+      nutritionTargetNumber_(after) + " " + config.unit);
+  });
+  lines.push("", "Сохранить? Да / Нет");
+  return lines.join("\n");
+}
+
+function nutritionTargetNumber_(value) { return String(Number(value)).replace(".", ","); }
+
+function handleNutritionTargetConfirmation_(selected, intent, userId, chatId, now, dependencies) {
+  const capture = selected.capture;
+  const payload = selected.payload || capture && smartConfirmationParseJson_(capture.payload_json, {});
+  if (!capture || String(capture.user_id) !== String(userId) || String(capture.chat_id) !== String(chatId)) {
+    return nutritionTargetResult_(true, false, "OWNER_MISMATCH", {message: "Подтверждение принадлежит другому пользователю или чату."});
+  }
+  if (intent === "CANCEL") {
+    const cancelled = dependencies.cancel_capture(userId, chatId, capture.capture_id, {now: now});
+    return nutritionTargetResult_(true, !!(cancelled && cancelled.ok), String(cancelled && cancelled.code || "CANCEL_FAILED"),
+      {message: cancelled && cancelled.ok ? "Изменение целей отменено." : "Не удалось отменить изменение."});
+  }
+  if (capture.status === "SAVED") return nutritionTargetResult_(true, true, "ALREADY_SAVED", {message: "Эти цели уже сохранены."});
+  if (!dependencies.persistence_enabled()) return nutritionTargetResult_(true, false, "PERSISTENCE_DISABLED", {
+    message: "Сохранение целей по питанию пока не включено. Данные не изменены."
+  });
+  const saved = dependencies.persist(selected, userId, chatId, {now: now});
+  return nutritionTargetResult_(true, !!(saved && saved.ok), String(saved && saved.code || "TARGET_SAVE_FAILED"), {
+    save: saved || null, message: saved && saved.ok ? (saved.code === "ALREADY_SAVED" ? "Эти цели уже сохранены." : "Цели по питанию сохранены.") :
+      "Не удалось сохранить цели. Подтверждение осталось незавершённым."
+  });
+}
+
+function nutritionTargetPersistenceEnabled_(options) {
+  const runtime = options || {};
+  try {
+    const properties = runtime.properties || PropertiesService.getScriptProperties();
+    const environment = runtime.deployment_env != null ? runtime.deployment_env : properties.getProperty("DEPLOYMENT_ENV");
+    const mode = runtime.data_write_mode != null ? runtime.data_write_mode : properties.getProperty("DATA_WRITE_MODE");
+    const enabled = runtime.nutrition_target_persistence_enabled != null ? runtime.nutrition_target_persistence_enabled :
+      properties.getProperty("NUTRITION_TARGET_PERSISTENCE_ENABLED");
+    return environment === "STAGING" && mode === "SIMULATION" && enabled === "true";
+  } catch (error) { return false; }
+}
+
+function persistNutritionTargets_(selected, userId, chatId, options) {
+  const runtime = options || {};
+  const io = runtime.io || nutritionTargetPersistenceIo_();
+  const lock = runtime.lock || LockService.getScriptLock();
+  let acquired = false;
+  try {
+    acquired = lock.tryLock(5000) === true;
+    if (!acquired) return nutritionTargetPersistResult_(false, "LOCK_TIMEOUT");
+    const capture = io.get_capture(selected.capture.capture_id);
+    if (!capture) return nutritionTargetPersistResult_(false, "CAPTURE_NOT_FOUND");
+    if (String(capture.user_id) !== String(userId) || String(capture.chat_id) !== String(chatId)) return nutritionTargetPersistResult_(false, "OWNER_MISMATCH");
+    if (capture.status === "SAVED") return nutritionTargetPersistResult_(true, "ALREADY_SAVED", {written: false});
+    if (capture.status !== "PENDING_CONFIRMATION") return nutritionTargetPersistResult_(false, "NOT_CONFIRMABLE");
+    const now = runtime.now instanceof Date ? runtime.now : new Date();
+    if (new Date(capture.expires_at).getTime() <= now.getTime()) return nutritionTargetPersistResult_(false, "EXPIRED");
+    const payload = capture.payload || smartConfirmationParseJson_(capture.payload_json, {});
+    const validation = validateNutritionTargetCapture_(payload);
+    if (!validation.ok || payload.source !== "C232C2_NUTRITION_TARGETS") return nutritionTargetPersistResult_(false, "INVALID_TARGET_CAPTURE");
+    const table = io.read_profile();
+    const resolved = resolveNutritionTargetProfileRow_(table.headers, table.rows, userId);
+    if (!resolved.ok) return nutritionTargetPersistResult_(false, resolved.code);
+    const current = loadAuthoritativeNutritionTargets_(userId, {table: table});
+    if (!current.ok) return nutritionTargetPersistResult_(false, current.code);
+    for (let index = 0; index < payload.explicit_fields.length; index += 1) {
+      const key = payload.explicit_fields[index];
+      const unchanged = nutritionTargetValuesEqual_(current.targets[key], payload.base_values[key]);
+      const alreadyApplied = nutritionTargetValuesEqual_(current.targets[key], payload.proposed_targets[key]);
+      if (!unchanged && !alreadyApplied) return nutritionTargetPersistResult_(false, "STALE_TARGET_PROFILE");
+    }
+    const changes = payload.explicit_fields.filter(function(key) {
+      return !nutritionTargetValuesEqual_(current.targets[key], payload.proposed_targets[key]);
+    }).map(function(key) {
+      return {key: key, column_index: resolved.schema.indexes[C232C2_TARGET_FIELDS[key].header],
+        before: current.targets[key], after: payload.proposed_targets[key]};
+    });
+    const mergedTargets = Object.assign({}, current.targets);
+    payload.explicit_fields.forEach(function(key) { mergedTargets[key] = payload.proposed_targets[key]; });
+    if (changes.length) { io.write_targets(resolved.row_index, changes, mergedTargets); io.flush(); }
+    const readbackTable = io.read_profile();
+    const readback = loadAuthoritativeNutritionTargets_(userId, {table: readbackTable});
+    if (!readback.ok || changes.some(function(change) { return !nutritionTargetValuesEqual_(readback.targets[change.key], change.after); })) {
+      return nutritionTargetPersistResult_(false, "READBACK_FAILED");
+    }
+    const result = nutritionTargetPersistResult_(true, "TARGETS_SAVED", {written: changes.length > 0,
+      reconciled: changes.length === 0,
+      changed_fields: changes.map(function(change) { return change.key; }), production_writes: false});
+    io.mark_saved(capture, result, now);
+    return result;
+  } catch (error) {
+    return nutritionTargetPersistResult_(false, "TARGET_SAVE_FAILED", {error: errorText_(error)});
+  } finally {
+    if (acquired) { try { lock.releaseLock(); } catch (releaseError) { console.error("Nutrition target unlock failed: " + errorText_(releaseError)); } }
+  }
+}
+
+function nutritionTargetValuesEqual_(left, right) {
+  if ((left === null || left === "") && (right === null || right === "" || right === undefined)) return true;
+  return Number(left) === Number(right);
+}
+
+function nutritionTargetPersistResult_(ok, code, extra) {
+  return Object.assign({ok: ok === true, code: code, written: false, profile_rows_created: 0,
+    nutrition_log_writes: 0, ai_memory_writes: 0, coach_state_writes: 0, production_writes: false}, extra || {});
+}
+
+function nutritionTargetResult_(handled, ok, code, extra) {
+  return Object.assign({handled: handled === true, ok: ok === true, code: String(code || ""), groq_calls: 0,
+    nutrition_log_writes: 0, ai_memory_writes: 0, coach_state_writes: 0, production_writes: false}, extra || {});
+}
+
+function nutritionTargetDependencies_(injected) {
+  if (injected) return Object.assign({detect_confirmation: detectConfirmationIntent_, persistence_enabled: function() { return false; }}, injected);
+  return {detect_confirmation: detectConfirmationIntent_, find_capture: findNutritionTargetCapture_,
+    find_conflict: function(userId, chatId, options) { return getPendingCapture_(userId, chatId, options); },
+    load_targets: loadAuthoritativeNutritionTargets_, create_capture: createNutritionTargetPendingCapture_,
+    cancel_capture: cancelNutritionTargetCapture_, persistence_enabled: nutritionTargetPersistenceEnabled_,
+    persist: persistNutritionTargets_, uuid: function() { return Utilities.getUuid(); }};
+}
+
+function nutritionTargetProfileIo_() {
+  return {read_table: function() {
+    const sheet = getSpreadsheet_().getSheetByName("User_Profile");
+    if (!sheet || sheet.getLastRow() < 1) throw new Error("USER_PROFILE_MISSING");
+    const values = sheet.getRange(1, 1, sheet.getLastRow(), sheet.getLastColumn()).getValues();
+    return {headers: values[0] || [], rows: values.slice(1)};
+  }};
+}
+
+function nutritionTargetPersistenceIo_() {
+  const sheet = getSpreadsheet_().getSheetByName("User_Profile");
+  return {get_capture: function(captureId) { return smartConfirmationFindByCaptureId_(smartConfirmationSheet_(), captureId); },
+    read_profile: nutritionTargetProfileIo_().read_table,
+    write_targets: function(rowIndex, changes, mergedTargets) {
+      sheet.getRange(rowIndex + 2, 12, 1, 4).setValues([[
+        mergedTargets.calories, mergedTargets.protein, mergedTargets.fat, mergedTargets.carbs
+      ]]);
+    },
+    flush: function() { SpreadsheetApp.flush(); },
+    mark_saved: function(capture, result, now) { smartConfirmationUpdateState_(smartConfirmationSheet_(), capture.row_number,
+      "SAVED", JSON.stringify(result), now, ""); SpreadsheetApp.flush(); }};
+}
+
+function findNutritionTargetCapture_(userId, chatId, options) {
+  const runtime = options || {};
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  try {
+    const rows = smartConfirmationReadRows_(smartConfirmationSheet_()).filter(function(row) {
+      const payload = smartConfirmationParseJson_(row.payload_json, {});
+      return String(row.user_id) === String(userId) && String(row.chat_id) === String(chatId) &&
+        payload.source === "C232C2_NUTRITION_TARGETS";
+    }).sort(smartConfirmationNewestFirst_);
+    const pending = rows.filter(function(row) { return row.status === "PENDING_CONFIRMATION"; })[0];
+    if (pending) return new Date(pending.expires_at).getTime() <= now.getTime() ? {ok: false, code: "CAPTURE_EXPIRED", capture: pending} :
+      {ok: true, code: "PENDING_CAPTURE", capture: pending, payload: smartConfirmationParseJson_(pending.payload_json, {})};
+    if (runtime.include_saved) {
+      const saved = rows.filter(function(row) { return row.status === "SAVED"; })[0];
+      if (saved) return {ok: true, code: "SAVED_CAPTURE", capture: saved, payload: smartConfirmationParseJson_(saved.payload_json, {})};
+    }
+    return {ok: false, code: "NO_TARGET_CAPTURE"};
+  } catch (error) { return {ok: false, code: "CAPTURE_LOOKUP_FAILED"}; }
+}
+
+function createNutritionTargetPendingCapture_(capture, metadata) {
+  const meta = metadata || {};
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) return {ok: false, code: "LOCK_TIMEOUT"};
+  try {
+    const sheet = smartConfirmationSheet_();
+    const active = smartConfirmationReadRows_(sheet).filter(function(row) {
+      return String(row.user_id) === String(meta.user_id) && String(row.chat_id) === String(meta.chat_id) &&
+        row.status === "PENDING_CONFIRMATION" && new Date(row.expires_at).getTime() > meta.now.getTime();
+    });
+    if (active.length) return {ok: false, code: "ACTIVE_CAPTURE_EXISTS"};
+    const expiresAt = new Date(meta.now.getTime() + Number(meta.ttl_minutes || 30) * 60000);
+    sheet.appendRow([capture.capture_id, meta.now, expiresAt, String(meta.user_id), String(meta.chat_id),
+      String(meta.source_update_id || ""), "", JSON.stringify(capture), JSON.stringify(meta.validation),
+      "PENDING_CONFIRMATION", "[]", "", ""]);
+    SpreadsheetApp.flush();
+    return {ok: true, code: "CREATED", capture_id: capture.capture_id, status: "PENDING_CONFIRMATION"};
+  } finally { lock.releaseLock(); }
+}
+
+function cancelNutritionTargetCapture_(userId, chatId, captureId, options) {
+  return cancelPendingCapture_(userId, chatId, options || {});
 }
 
 function routeDomainFactConfirmation_(update, options) {

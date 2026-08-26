@@ -1812,6 +1812,21 @@ function handleDomainFactConfirmation_(selected, intent, userId, chatId, now, de
       });
     }
   }
+  if (isB2NutritionCapture_(selected.payload) &&
+      typeof dependencies.nutrition_persistence_enabled === "function" &&
+      dependencies.nutrition_persistence_enabled() === true) {
+    const persisted = dependencies.persist_nutrition(selected, userId, chatId, {now: now});
+    return domainFactResult_(true, !!(persisted && persisted.ok),
+      String(persisted && persisted.code || "NUTRITION_PERSISTENCE_FAILED"), {
+        domain: "NUTRITION",
+        save: persisted || null,
+        message: persisted && persisted.ok
+          ? (persisted.idempotent_replay === true
+            ? "Эти данные питания уже сохранены."
+            : "Данные питания сохранены.")
+          : "Не удалось сохранить данные питания. Запись не отмечена как сохранённая; попробуйте подтвердить ещё раз позже."
+      });
+  }
   const confirmed = dependencies.confirm(userId, chatId, capture.capture_id, {now: now});
   if (!confirmed || confirmed.ok !== true) {
     return domainFactResult_(true, false, String(confirmed && confirmed.code || "CONFIRMATION_FAILED"), {
@@ -1855,6 +1870,17 @@ function findLatestDomainCapture_(userId, chatId, options) {
       return {ok: true, code: "PENDING_CAPTURE", capture: pending,
         payload: smartConfirmationParseJson_(pending.payload_json, {})};
     }
+    const recovery = rows.filter(function(row) {
+      if ([SMART_CONFIRMATION_CONFIG.STATUSES.SAVING, SMART_CONFIRMATION_CONFIG.STATUSES.FAILED]
+          .indexOf(row.status) < 0) return false;
+      const payload = smartConfirmationParseJson_(row.payload_json, {});
+      const transaction = smartConfirmationParseJson_(row.saved_targets_json, {});
+      return isB2NutritionCapture_(payload) &&
+        transaction.schema_version === "c232b4-nutrition-persistence-v1" &&
+        ["PREPARING", "COMMITTED"].indexOf(String(transaction.transaction_status || "")) >= 0;
+    })[0];
+    if (recovery) return {ok: true, code: "NUTRITION_RECOVERY_CAPTURE", capture: recovery,
+      payload: smartConfirmationParseJson_(recovery.payload_json, {})};
     if (runtime.include_saved === true) {
       const saved = rows.filter(function(row) {
         return row.status === SMART_CONFIRMATION_CONFIG.STATUSES.SAVED &&
@@ -2014,6 +2040,302 @@ function simulateNutritionDomainFactSave_(capture, options) {
   };
 }
 
+const C232B4_NUTRITION_SCHEMA = Object.freeze([
+  "SCHEMA_VERSION", "MEAL_ID", "CAPTURE_ID", "USER_ID", "MEAL_AT", "CONFIRMED_AT",
+  "ITEMS_COUNT", "CALORIES_TOTAL", "PROTEIN_TOTAL", "FAT_TOTAL", "CARBS_TOTAL",
+  "ITEMS_JSON", "SNAPSHOT_HASH", "TRANSACTION_STATUS", "SOURCE", "CREATED_AT", "UPDATED_AT"
+]);
+
+function nutritionPersistenceEnabled_(options) {
+  const runtime = options || {};
+  try {
+    const properties = runtime.properties || PropertiesService.getScriptProperties();
+    const environment = runtime.deployment_env != null ? runtime.deployment_env : properties.getProperty("DEPLOYMENT_ENV");
+    const mode = runtime.data_write_mode != null ? runtime.data_write_mode : properties.getProperty("DATA_WRITE_MODE");
+    const enabled = runtime.nutrition_persistence_enabled != null
+      ? runtime.nutrition_persistence_enabled : properties.getProperty("NUTRITION_PERSISTENCE_ENABLED");
+    return environment === "STAGING" && mode === "SIMULATION" && enabled === "true";
+  } catch (error) {
+    return false;
+  }
+}
+
+function canonicalNutritionJson_(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return "[" + value.map(canonicalNutritionJson_).join(",") + "]";
+  return "{" + Object.keys(value).sort().map(function(key) {
+    return JSON.stringify(key) + ":" + canonicalNutritionJson_(value[key]);
+  }).join(",") + "}";
+}
+
+function nutritionMealId_(captureId) {
+  return "meal:" + String(captureId || "");
+}
+
+function nutritionSnapshotHash_(canonical, options) {
+  const runtime = options || {};
+  const serialized = canonicalNutritionJson_(canonical);
+  if (typeof runtime.sha256 === "function") return String(runtime.sha256(serialized));
+  const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, serialized, Utilities.Charset.UTF_8);
+  return digest.map(function(byte) { return (byte + 256).toString(16).slice(-2); }).join("");
+}
+
+function buildNutritionPersistenceItems_(capture) {
+  return capture.items.map(function(item, index) {
+    const frozen = buildNutritionSaveItemSnapshot_(item);
+    const basis = frozen.reference_nutrition_basis || {};
+    const calculated = frozen.calculated_nutrition || {};
+    return {
+      item_index: index,
+      food_id: frozen.food_id,
+      food_display: frozen.food_display,
+      preparation_state: frozen.preparation_state,
+      nutrition_reference_id: frozen.nutrition_reference_id,
+      quantity_value: frozen.quantity_value,
+      quantity_unit: frozen.quantity_unit,
+      reference_basis_quantity: basis.quantity,
+      reference_basis_unit: basis.unit,
+      reference_calories: basis.calories,
+      reference_protein: basis.protein,
+      reference_fat: basis.fat,
+      reference_carbs: basis.carbs,
+      calculated_calories: calculated.calories,
+      calculated_protein: calculated.protein,
+      calculated_fat: calculated.fat,
+      calculated_carbs: calculated.carbs,
+      nutrition_authority: frozen.nutrition_authority,
+      nutrition_source: frozen.nutrition_source,
+      nutrition_source_version: frozen.nutrition_source_version,
+      nutrition_approximate: frozen.nutrition_approximate
+    };
+  });
+}
+
+function buildNutritionMealRecord_(capture, owner, confirmedAt, options) {
+  const timestamp = (confirmedAt instanceof Date ? confirmedAt : new Date(confirmedAt)).toISOString();
+  const items = buildNutritionPersistenceItems_(capture);
+  const totals = Object.assign({}, capture.nutrition_calculation.totals);
+  const canonical = {capture_id: String(owner.capture_id), user_id: String(owner.user_id), items: items, totals: totals};
+  return {
+    schema_version: "c232b4-nutrition-persistence-v1",
+    meal_id: nutritionMealId_(owner.capture_id), capture_id: String(owner.capture_id), user_id: String(owner.user_id),
+    meal_at: timestamp, confirmed_at: timestamp, items_count: items.length,
+    calories_total: totals.calories, protein_total: totals.protein, fat_total: totals.fat, carbs_total: totals.carbs,
+    items_json: JSON.stringify(items), snapshot_hash: nutritionSnapshotHash_(canonical, options),
+    transaction_status: "PREPARING", source: "C232B4_NUTRITION_PERSISTENCE",
+    created_at: timestamp, updated_at: timestamp
+  };
+}
+
+function nutritionMealRecordValues_(record) {
+  return C232B4_NUTRITION_SCHEMA.map(function(header) { return record[header.toLowerCase()]; });
+}
+
+function nutritionMealValuesRecord_(values) {
+  const record = {};
+  C232B4_NUTRITION_SCHEMA.forEach(function(header, index) { record[header.toLowerCase()] = values[index]; });
+  return record;
+}
+
+function validateNutritionLogSchema_(headers) {
+  return Array.isArray(headers) && headers.length === C232B4_NUTRITION_SCHEMA.length &&
+    headers.every(function(header, index) { return String(header) === C232B4_NUTRITION_SCHEMA[index]; });
+}
+
+function nutritionLogSheet_() {
+  const sheet = getSpreadsheet_().getSheetByName("Nutrition_Log");
+  if (!sheet) throw new Error("NUTRITION_LOG_MISSING");
+  const headers = sheet.getRange(1, 1, 1, C232B4_NUTRITION_SCHEMA.length).getValues()[0];
+  if (!validateNutritionLogSchema_(headers)) throw new Error("NUTRITION_LOG_SCHEMA_INVALID");
+  return sheet;
+}
+
+function nutritionPersistenceRealIo_() {
+  return {
+    get_capture: function(captureId) { return smartConfirmationFindByCaptureId_(smartConfirmationSheet_(), captureId); },
+    checkpoint_capture: function(capture, status, result, confirmedAt, error) {
+      smartConfirmationUpdateState_(smartConfirmationSheet_(), capture.row_number, status,
+        JSON.stringify(result || {}), confirmedAt || "", error || "");
+      SpreadsheetApp.flush();
+    },
+    find_meals: function(captureId) {
+      const sheet = nutritionLogSheet_();
+      if (sheet.getLastRow() < 2) return [];
+      return sheet.getRange(2, 1, sheet.getLastRow() - 1, C232B4_NUTRITION_SCHEMA.length).getValues()
+        .map(function(values, index) { return {row_number: index + 2, record: nutritionMealValuesRecord_(values)}; })
+        .filter(function(row) { return String(row.record.capture_id) === String(captureId); });
+    },
+    append_meal: function(record) {
+      const sheet = nutritionLogSheet_();
+      const row = sheet.getLastRow() + 1;
+      sheet.getRange(row, 1, 1, C232B4_NUTRITION_SCHEMA.length).setValues([nutritionMealRecordValues_(record)]);
+      SpreadsheetApp.flush();
+      return row;
+    },
+    read_meal: function(rowNumber) {
+      return nutritionMealValuesRecord_(nutritionLogSheet_().getRange(rowNumber, 1, 1,
+        C232B4_NUTRITION_SCHEMA.length).getValues()[0]);
+    },
+    write_meal: function(rowNumber, record) {
+      nutritionLogSheet_().getRange(rowNumber, 1, 1, C232B4_NUTRITION_SCHEMA.length)
+        .setValues([nutritionMealRecordValues_(record)]);
+      SpreadsheetApp.flush();
+    }
+  };
+}
+
+function nutritionPersistenceRecordsEqual_(actual, expected, status) {
+  return C232B4_NUTRITION_SCHEMA.every(function(header) {
+    const key = header.toLowerCase();
+    return String(actual && actual[key]) === String(key === "transaction_status" ? status : expected[key]);
+  });
+}
+
+function nutritionPersistenceCheckpoint_(capture, meal, status, code, io, error, details) {
+  const result = {schema_version: "c232b4-nutrition-persistence-v1", code: code,
+    capture_id: meal.capture_id, meal_id: meal.meal_id, transaction_status: status,
+    write_target: "Nutrition_Log", written: false, rows_written: 0,
+    idempotent_replay: false, production_writes: false};
+  Object.keys(details || {}).forEach(function(key) { result[key] = details[key]; });
+  io.checkpoint_capture(capture, status === "COMMITTED" ? SMART_CONFIRMATION_CONFIG.STATUSES.SAVED :
+    SMART_CONFIRMATION_CONFIG.STATUSES.SAVING, result, status === "COMMITTED" ? meal.confirmed_at : "", error || "");
+  return result;
+}
+
+function nutritionPersistenceResult_(ok, code, meal, extra) {
+  return Object.assign({ok: ok === true, code: code, schema_version: "c232b4-nutrition-persistence-v1",
+    capture_id: meal ? meal.capture_id : "", meal_id: meal ? meal.meal_id : "", mode: "STAGING",
+    transaction_status: meal ? meal.transaction_status : "", items_count: meal ? meal.items_count : 0,
+    nutrition_totals: meal ? {calories: meal.calories_total, protein: meal.protein_total,
+      fat: meal.fat_total, carbs: meal.carbs_total} : null,
+    rows_written: 0, idempotent_replay: false, write_target: "Nutrition_Log",
+    domain_writes: 0, production_writes: false}, extra || {});
+}
+
+function nutritionPersistenceFailPoint_(runtime, point) {
+  if (String(runtime.failure_point || "") === point) throw new Error("B4_TEST_FAILURE:" + point);
+}
+
+function nutritionPersistenceErrorCode_(error) {
+  const text = String(error && error.message || error || "");
+  const codes = ["NUTRITION_LOG_MISSING", "NUTRITION_LOG_SCHEMA_INVALID",
+    "NUTRITION_PREPARING_WRITE_FAILED", "NUTRITION_PREPARING_READ_FAILED",
+    "NUTRITION_COMMIT_FAILED", "NUTRITION_COMMIT_READ_FAILED", "NUTRITION_CAPTURE_FINALIZE_FAILED"];
+  return codes.filter(function(code) { return text.indexOf(code) === 0; })[0] || "NUTRITION_PERSISTENCE_FAILED";
+}
+
+function persistNutritionSnapshot_(selected, userId, chatId, options) {
+  const runtime = options || {};
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  const io = runtime.io || nutritionPersistenceRealIo_();
+  const lock = runtime.lock || LockService.getScriptLock();
+  if (!lock.tryLock(5000)) return nutritionPersistenceResult_(false, "LOCK_TIMEOUT", null);
+  let meal = null;
+  let capture = null;
+  let finalized = false;
+  try {
+    capture = io.get_capture(selected.capture.capture_id);
+    if (!capture) return nutritionPersistenceResult_(false, "CAPTURE_NOT_FOUND", null);
+    if (String(capture.user_id) !== String(userId) || String(capture.chat_id) !== String(chatId)) {
+      return nutritionPersistenceResult_(false, "OWNER_MISMATCH", null);
+    }
+    const payload = typeof capture.payload_json === "string" ? smartConfirmationParseJson_(capture.payload_json, {}) :
+      (capture.payload || selected.payload);
+    if (!validateNutritionSnapshotForSave_(payload).ok) {
+      return nutritionPersistenceResult_(false, "INVALID_NUTRITION_SNAPSHOT", null);
+    }
+    const recoverable = capture.status === SMART_CONFIRMATION_CONFIG.STATUSES.SAVING ||
+      capture.status === SMART_CONFIRMATION_CONFIG.STATUSES.FAILED;
+    if (capture.status === SMART_CONFIRMATION_CONFIG.STATUSES.PENDING &&
+        smartConfirmationDate_(capture.expires_at).getTime() <= now.getTime()) {
+      return nutritionPersistenceResult_(false, "EXPIRED", null);
+    }
+    if ([SMART_CONFIRMATION_CONFIG.STATUSES.PENDING, SMART_CONFIRMATION_CONFIG.STATUSES.SAVED].indexOf(capture.status) < 0 && !recoverable) {
+      return nutritionPersistenceResult_(false, "NOT_CONFIRMABLE", null);
+    }
+    meal = buildNutritionMealRecord_(payload, capture, now, runtime);
+    nutritionPersistenceFailPoint_(runtime, "AFTER_SNAPSHOT_VALIDATION");
+    const matches = io.find_meals(capture.capture_id);
+    if (matches.length > 1) return nutritionPersistenceResult_(false, "NUTRITION_PERSISTENCE_CONFLICT", meal);
+    let rowNumber = matches.length ? matches[0].row_number : null;
+    if (matches.length) {
+      const existing = matches[0].record;
+      if (String(existing.snapshot_hash) !== meal.snapshot_hash || String(existing.meal_id) !== meal.meal_id) {
+        return nutritionPersistenceResult_(false, "NUTRITION_PERSISTENCE_CONFLICT", meal);
+      }
+      if (["PREPARING", "COMMITTED"].indexOf(String(existing.transaction_status)) < 0) {
+        return nutritionPersistenceResult_(false, "NUTRITION_DURABLE_ROW_CORRUPT", meal);
+      }
+      meal.meal_at = existing.meal_at;
+      meal.confirmed_at = existing.confirmed_at;
+      meal.created_at = existing.created_at;
+      meal.updated_at = existing.updated_at;
+      if (existing.transaction_status === "COMMITTED") {
+        meal.transaction_status = "COMMITTED";
+        if (!nutritionPersistenceRecordsEqual_(existing, meal, "COMMITTED")) {
+          return nutritionPersistenceResult_(false, "NUTRITION_PERSISTENCE_CONFLICT", meal);
+        }
+        nutritionPersistenceCheckpoint_(capture, meal, "COMMITTED", "NUTRITION_ALREADY_SAVED", io, "",
+          {written: false, rows_written: 0, idempotent_replay: true});
+        return nutritionPersistenceResult_(true, "NUTRITION_ALREADY_SAVED", meal,
+          {idempotent_replay: true, rows_written: 0, domain_writes: 0});
+      }
+    }
+    nutritionPersistenceCheckpoint_(capture, meal, "PREPARING", "NUTRITION_PREPARING", io);
+    nutritionPersistenceFailPoint_(runtime, "AFTER_CAPTURE_CHECKPOINT");
+    if (!rowNumber) {
+      nutritionPersistenceFailPoint_(runtime, "BEFORE_PREPARING_WRITE");
+      try { rowNumber = io.append_meal(meal); }
+      catch (error) { throw new Error("NUTRITION_PREPARING_WRITE_FAILED:" + String(error)); }
+      nutritionPersistenceFailPoint_(runtime, "AFTER_PREPARING_WRITE");
+    } else {
+      try { io.write_meal(rowNumber, meal); }
+      catch (error) { throw new Error("NUTRITION_PREPARING_WRITE_FAILED:" + String(error)); }
+    }
+    let preparing;
+    try { preparing = io.read_meal(rowNumber); }
+    catch (error) { throw new Error("NUTRITION_PREPARING_READ_FAILED:" + String(error)); }
+    nutritionPersistenceFailPoint_(runtime, "AFTER_PREPARING_READ");
+    if (!nutritionPersistenceRecordsEqual_(preparing, meal, "PREPARING")) {
+      return nutritionPersistenceResult_(false, "NUTRITION_PREPARING_VERIFY_FAILED", meal);
+    }
+    nutritionPersistenceFailPoint_(runtime, "AFTER_PREPARING_VERIFY");
+    meal.transaction_status = "COMMITTED";
+    meal.updated_at = now.toISOString();
+    nutritionPersistenceFailPoint_(runtime, "BEFORE_COMMIT_WRITE");
+    try { io.write_meal(rowNumber, meal); }
+    catch (error) { throw new Error("NUTRITION_COMMIT_FAILED:" + String(error)); }
+    nutritionPersistenceFailPoint_(runtime, "AFTER_COMMIT_WRITE");
+    let committed;
+    try { committed = io.read_meal(rowNumber); }
+    catch (error) { throw new Error("NUTRITION_COMMIT_READ_FAILED:" + String(error)); }
+    nutritionPersistenceFailPoint_(runtime, "AFTER_COMMIT_READ");
+    if (!nutritionPersistenceRecordsEqual_(committed, meal, "COMMITTED")) {
+      return nutritionPersistenceResult_(false, "NUTRITION_COMMIT_VERIFY_FAILED", meal);
+    }
+    nutritionPersistenceFailPoint_(runtime, "AFTER_COMMIT_VERIFY");
+    nutritionPersistenceFailPoint_(runtime, "BEFORE_CAPTURE_FINALIZE");
+    try { nutritionPersistenceCheckpoint_(capture, meal, "COMMITTED", "NUTRITION_SAVED", io, "",
+      {written: matches.length === 0, rows_written: matches.length ? 0 : 1, idempotent_replay: false}); }
+    catch (error) { throw new Error("NUTRITION_CAPTURE_FINALIZE_FAILED:" + String(error)); }
+    finalized = true;
+    nutritionPersistenceFailPoint_(runtime, "AFTER_CAPTURE_FINALIZE");
+    return nutritionPersistenceResult_(true, "NUTRITION_SAVED", meal,
+      {rows_written: matches.length ? 0 : 1, domain_writes: matches.length ? 0 : 1});
+  } catch (error) {
+    if (capture && meal && !finalized) {
+      try { nutritionPersistenceCheckpoint_(capture, meal, "PREPARING", "NUTRITION_RETRY_REQUIRED", io, String(error)); } catch (ignored) {}
+    }
+    return nutritionPersistenceResult_(false, nutritionPersistenceErrorCode_(error), meal, {error: String(error)});
+  } finally {
+    try { lock.releaseLock(); } catch (ignored) {}
+  }
+}
+
+function saveNutritionDomainFact_(selected, userId, chatId, options) {
+  return persistNutritionSnapshot_(selected, userId, chatId, options);
+}
+
 function domainFactConfirmationPrompt_(domain, capture) {
   if (domain === "NUTRITION" && capture && capture.schema_version === "c232b2-nutrition-calculation-v1") {
     return formatNutritionConfirmation_(capture);
@@ -2078,7 +2400,9 @@ function nutritionCalculationFailureMessage_(code) {
 function domainFactDependencies_(injected) {
   if (injected) {
     return Object.assign({
-      validate_nutrition_snapshot: validateNutritionSnapshotForSave_
+      validate_nutrition_snapshot: validateNutritionSnapshotForSave_,
+      nutrition_persistence_enabled: function() { return false; },
+      persist_nutrition: saveNutritionDomainFact_
     }, injected);
   }
   return {
@@ -2090,6 +2414,8 @@ function domainFactDependencies_(injected) {
     cancel: cancelPendingCapture_,
     save_domain: simulateDomainFactSave_,
     validate_nutrition_snapshot: validateNutritionSnapshotForSave_,
+    nutrition_persistence_enabled: nutritionPersistenceEnabled_,
+    persist_nutrition: saveNutritionDomainFact_,
     uuid: function() { return Utilities.getUuid(); }
   };
 }

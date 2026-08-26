@@ -1802,6 +1802,16 @@ function handleDomainFactConfirmation_(selected, intent, userId, chatId, now, de
         message: cancelled && cancelled.ok ? "Запись отменена." : "Не удалось отменить запись."
       });
   }
+  if (isB2NutritionCapture_(selected.payload) &&
+      capture.status !== SMART_CONFIRMATION_CONFIG.STATUSES.SAVED) {
+    const snapshotValidation = dependencies.validate_nutrition_snapshot(selected.payload);
+    if (!snapshotValidation || snapshotValidation.ok !== true) {
+      return domainFactResult_(true, false, "INVALID_NUTRITION_SNAPSHOT", {
+        domain: "NUTRITION",
+        message: "Не удалось подтвердить данные питания из-за ошибки сохранённого расчёта. Повторите запись."
+      });
+    }
+  }
   const confirmed = dependencies.confirm(userId, chatId, capture.capture_id, {now: now});
   if (!confirmed || confirmed.ok !== true) {
     return domainFactResult_(true, false, String(confirmed && confirmed.code || "CONFIRMATION_FAILED"), {
@@ -1861,6 +1871,9 @@ function findLatestDomainCapture_(userId, chatId, options) {
 
 function simulateDomainFactSave_(capture, userId, options) {
   const runtime = options || {};
+  if (isB2NutritionCapture_(capture)) {
+    return simulateNutritionDomainFactSave_(capture, runtime);
+  }
   const result = {
     ok: true,
     code: "SAVE_SIMULATED",
@@ -1870,11 +1883,135 @@ function simulateDomainFactSave_(capture, userId, options) {
     domain_writes: 0,
     production_writes: false
   };
-  if (capture && capture.schema_version === "c232b2-nutrition-calculation-v1" && capture.nutrition_calculation) {
-    result.items_count = Number(capture.nutrition_calculation.items_count || 0);
-    result.nutrition_totals = Object.assign({}, capture.nutrition_calculation.totals || {});
-  }
   return result;
+}
+
+function isB2NutritionCapture_(capture) {
+  return !!(capture && capture.domain === "NUTRITION" &&
+    capture.schema_version === "c232b2-nutrition-calculation-v1");
+}
+
+function nutritionSnapshotNumberValid_(value, positive) {
+  if (value === null || value === undefined || value === "" || !isFinite(Number(value))) return false;
+  return positive === true ? Number(value) > 0 : Number(value) >= 0;
+}
+
+function nutritionSnapshotTotalsMatch_(items, totals, tolerance) {
+  if (!totals) return false;
+  const keys = ["calories", "protein", "fat", "carbs"];
+  const limit = Number(tolerance == null ? 1e-6 : tolerance);
+  const sums = {calories: 0, protein: 0, fat: 0, carbs: 0};
+  for (let i = 0; i < items.length; i += 1) {
+    const fields = items[i] && items[i].fields || {};
+    const calculated = fields.calculated_nutrition && fields.calculated_nutrition.value;
+    if (!calculated) return false;
+    for (let j = 0; j < keys.length; j += 1) {
+      const key = keys[j];
+      if (!nutritionSnapshotNumberValid_(calculated[key], false)) return false;
+      sums[key] += Number(calculated[key]);
+    }
+  }
+  return keys.every(function(key) {
+    return nutritionSnapshotNumberValid_(totals[key], false) &&
+      Math.abs(Number(totals[key]) - sums[key]) <= limit;
+  });
+}
+
+function validateNutritionSnapshotForSave_(capture) {
+  const items = capture && Array.isArray(capture.items) ? capture.items : [];
+  const summary = capture && capture.nutrition_calculation;
+  if (!isB2NutritionCapture_(capture) || capture.raw_message !== "" || !summary ||
+      summary.status !== "CALCULATED" || items.length < 1 || items.length > 10 ||
+      Number(summary.items_count) !== items.length ||
+      Number(summary.calculable_items_count) !== items.length ||
+      Number(summary.approximate_items_count) !== items.length || !summary.totals) {
+    return {ok: false, code: "INVALID_NUTRITION_SNAPSHOT"};
+  }
+  const supportedUnits = ["g", "ml", "count"];
+  const nutritionKeys = ["calories", "protein", "fat", "carbs"];
+  const itemsValid = items.every(function(item) {
+    const fields = item && item.fields || {};
+    const quantity = fields.quantity_value && fields.quantity_value.value;
+    const quantityUnit = String(fields.quantity_unit && fields.quantity_unit.value || "");
+    const basisQuantity = fields.reference_basis_quantity && fields.reference_basis_quantity.value;
+    const basisUnit = String(fields.reference_basis_unit && fields.reference_basis_unit.value || "");
+    const basis = fields.reference_nutrition_basis && fields.reference_nutrition_basis.value;
+    const calculated = fields.calculated_nutrition && fields.calculated_nutrition.value;
+    const referenceStatus = String(fields.reference_status && fields.reference_status.value || "");
+    const referenceId = String(fields.nutrition_reference_id && fields.nutrition_reference_id.value || "");
+    if (item.category !== "NUTRITION_LOG" || referenceStatus !== "RESOLVED" || !referenceId ||
+        !nutritionSnapshotNumberValid_(quantity, true) || supportedUnits.indexOf(quantityUnit) < 0 ||
+        !nutritionSnapshotNumberValid_(basisQuantity, true) || basisUnit !== quantityUnit ||
+        !basis || !calculated || String(basis.unit || "") !== basisUnit ||
+        !nutritionSnapshotNumberValid_(basis.quantity, true) ||
+        !fields.nutrition_authority || !fields.nutrition_authority.value ||
+        !fields.nutrition_source || !fields.nutrition_source.value ||
+        !fields.nutrition_source_version || !fields.nutrition_source_version.value ||
+        !fields.nutrition_approximate || fields.nutrition_approximate.value !== true) return false;
+    return nutritionKeys.every(function(key) {
+      return nutritionSnapshotNumberValid_(basis[key], false) &&
+        nutritionSnapshotNumberValid_(calculated[key], false);
+    });
+  });
+  if (!itemsValid || !nutritionSnapshotTotalsMatch_(items, summary.totals, 1e-6)) {
+    return {ok: false, code: "INVALID_NUTRITION_SNAPSHOT"};
+  }
+  return {ok: true, code: "NUTRITION_SNAPSHOT_VALID"};
+}
+
+function buildNutritionSaveItemSnapshot_(item) {
+  const fields = item && item.fields || {};
+  function value(name) { return fields[name] && fields[name].value; }
+  return {
+    food_id: value("food_id"),
+    food_display: value("food_display"),
+    preparation_state: value("preparation_state"),
+    nutrition_reference_id: value("nutrition_reference_id"),
+    quantity_value: value("quantity_value"),
+    quantity_unit: value("quantity_unit"),
+    reference_nutrition_basis: Object.assign({}, value("reference_nutrition_basis")),
+    calculated_nutrition: Object.assign({}, value("calculated_nutrition")),
+    nutrition_authority: value("nutrition_authority"),
+    nutrition_source: value("nutrition_source"),
+    nutrition_source_version: value("nutrition_source_version"),
+    nutrition_approximate: value("nutrition_approximate")
+  };
+}
+
+function simulateNutritionDomainFactSave_(capture, options) {
+  const runtime = options || {};
+  const validation = validateNutritionSnapshotForSave_(capture);
+  if (!validation.ok) {
+    return {
+      ok: false,
+      code: "INVALID_NUTRITION_SNAPSHOT",
+      capture_id: String(runtime.capture_id || capture && capture.capture_id || ""),
+      domain: "NUTRITION",
+      domain_writes: 0,
+      production_writes: false
+    };
+  }
+  return {
+    ok: true,
+    code: "SAVE_SIMULATED",
+    schema_version: "c232b3-nutrition-save-v1",
+    capture_id: String(runtime.capture_id || capture.capture_id || ""),
+    domain: "NUTRITION",
+    mode: "SIMULATION",
+    saved_at: (runtime.now instanceof Date ? runtime.now : new Date()).toISOString(),
+    items_count: capture.items.length,
+    items: capture.items.map(buildNutritionSaveItemSnapshot_),
+    nutrition_totals: Object.assign({}, capture.nutrition_calculation.totals),
+    snapshot_preserved: true,
+    writes: {
+      nutrition_log: false,
+      ai_memory: false,
+      coach_state: false,
+      production: false
+    },
+    domain_writes: 0,
+    production_writes: false
+  };
 }
 
 function domainFactConfirmationPrompt_(domain, capture) {
@@ -1939,7 +2076,12 @@ function nutritionCalculationFailureMessage_(code) {
 }
 
 function domainFactDependencies_(injected) {
-  return injected || {
+  if (injected) {
+    return Object.assign({
+      validate_nutrition_snapshot: validateNutritionSnapshotForSave_
+    }, injected);
+  }
+  return {
     detect_confirmation: detectConfirmationIntent_,
     find_capture: findLatestDomainCapture_,
     get_pending: getPendingCapture_,
@@ -1947,6 +2089,7 @@ function domainFactDependencies_(injected) {
     confirm: confirmPendingCapture_,
     cancel: cancelPendingCapture_,
     save_domain: simulateDomainFactSave_,
+    validate_nutrition_snapshot: validateNutritionSnapshotForSave_,
     uuid: function() { return Utilities.getUuid(); }
   };
 }

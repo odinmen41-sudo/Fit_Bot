@@ -1000,6 +1000,13 @@ function routeDomainFactConfirmation_(update, options) {
         "Укажите количество продукта: например, «банан 1 шт» или «рис 150 г»."
     });
   }
+  if (detection.domain === "NUTRITION" && detection.calculation_status &&
+      detection.calculation_status !== "CALCULATED") {
+    return domainFactResult_(true, false, detection.calculation_status, {
+      domain: "NUTRITION",
+      message: nutritionCalculationFailureMessage_(detection.calculation_status)
+    });
+  }
   if (detection.domain === "NUTRITION" && detection.reference_status &&
       detection.reference_status !== "RESOLVED") {
     return domainFactResult_(true, false, detection.reference_status, {
@@ -1028,6 +1035,13 @@ function routeDomainFactConfirmation_(update, options) {
       message: "Не удалось безопасно подготовить подтверждение данных."
     });
   }
+  const confirmationMessage = domainFactConfirmationPrompt_(detection.domain, capture);
+  if (confirmationMessage.length > 3500) {
+    return domainFactResult_(true, false, "CONFIRMATION_MESSAGE_TOO_LONG", {
+      domain: detection.domain,
+      message: nutritionCalculationFailureMessage_("CONFIRMATION_MESSAGE_TOO_LONG")
+    });
+  }
   const created = dependencies.create_pending(capture, {
     now: now,
     ttl_minutes: SMART_CONFIRMATION_CONFIG.DEFAULT_TTL_MINUTES,
@@ -1045,7 +1059,7 @@ function routeDomainFactConfirmation_(update, options) {
   return domainFactResult_(true, true, "CAPTURE_CREATED", {
     domain: detection.domain,
     capture_id: created.capture_id || capture.capture_id,
-    message: domainFactConfirmationPrompt_(detection.domain)
+    message: confirmationMessage
   });
 }
 
@@ -1103,6 +1117,8 @@ function detectDomainFactCandidate_(text, referenceOptions) {
       requires_clarification: false,
       items: referenceResolution.items,
       reference_status: referenceResolution.status,
+      calculation_status: referenceResolution.calculation_status || null,
+      nutrition_calculation: referenceResolution.nutrition_calculation || null,
       reference_resolution: referenceResolution,
       clarification_message: nutritionReferenceClarification_(referenceResolution)
     };
@@ -1236,7 +1252,7 @@ function resolveNutritionReferences_(items, options) {
   if (statuses.indexOf("AMBIGUOUS_IDENTITY") >= 0) status = "AMBIGUOUS_IDENTITY";
   else if (statuses.indexOf("UNKNOWN_REFERENCE") >= 0) status = "UNKNOWN_REFERENCE";
   else if (statuses.indexOf("CLARIFICATION_REQUIRED") >= 0) status = "CLARIFICATION_REQUIRED";
-  return {
+  const result = {
     status: status,
     items: resolvedItems,
     source_available: source.available === true,
@@ -1245,6 +1261,45 @@ function resolveNutritionReferences_(items, options) {
         item.fields.reference_status.value || "") !== "RESOLVED";
     })[0] || null
   };
+  const injectedFixture = Array.isArray(options && options.references) && Array.isArray(options && options.aliases);
+  const calculationEnabled = !injectedFixture || options.calculation_enabled === true;
+  if (!calculationEnabled) return result;
+  if (status !== "RESOLVED") {
+    result.calculation_status = nutritionReferenceFailureCode_(resolvedItems, source.references || []);
+    return result;
+  }
+  const calculated = calculateNutritionReferences_(resolvedItems, source.references || []);
+  result.items = calculated.items;
+  result.calculation_status = calculated.status;
+  result.calculation_error = calculated.error || null;
+  result.nutrition_calculation = calculated.nutrition_calculation || null;
+  return result;
+}
+
+function nutritionReferenceFailureCode_(items, references) {
+  const sourceItems = Array.isArray(items) ? items : [];
+  for (let index = 0; index < sourceItems.length; index += 1) {
+    const fields = sourceItems[index] && sourceItems[index].fields || {};
+    const foodId = String(fields.food_id && fields.food_id.value || "");
+    if (!foodId) continue;
+    const quantityUnit = String(fields.quantity_unit && fields.quantity_unit.value || "");
+    if (["g", "ml", "count"].indexOf(quantityUnit) < 0) return "UNSUPPORTED_NUTRITION_UNIT";
+    const preparation = String(fields.preparation_state && fields.preparation_state.value || "UNKNOWN");
+    const variant = String(fields.food_variant && fields.food_variant.value || "");
+    let candidates = (references || []).filter(function(reference) {
+      if (!reference || reference.ACTIVE !== true || reference.FOOD_ID !== foodId) return false;
+      if (variant ? reference.VARIANT !== variant : !!reference.VARIANT) return false;
+      return preparation === "UNKNOWN" || reference.PREPARATION_STATE === preparation;
+    });
+    if (preparation === "UNKNOWN" && candidates.length !== 1) continue;
+    if (candidates.some(function(reference) {
+      return !isFinite(Number(reference.BASIS_QUANTITY)) || Number(reference.BASIS_QUANTITY) <= 0;
+    })) return "INVALID_REFERENCE_BASIS";
+    if (candidates.length && !candidates.some(function(reference) {
+      return String(reference.BASIS_UNIT || "") === quantityUnit;
+    })) return "NUTRITION_UNIT_MISMATCH";
+  }
+  return null;
 }
 
 function resolveNutritionItemReference_(item, source) {
@@ -1338,15 +1393,147 @@ function foodReferenceNormalizeRecord_(record) {
     PREPARATION_STATE: String(source.PREPARATION_STATE || source.preparation_state || "UNKNOWN").trim().toUpperCase(),
     BASIS_QUANTITY: Number(source.BASIS_QUANTITY == null ? source.basis_quantity : source.BASIS_QUANTITY),
     BASIS_UNIT: String(source.BASIS_UNIT || source.basis_unit || "").trim().toLowerCase(),
-    CALORIES: Number(source.CALORIES == null ? source.calories : source.CALORIES),
-    PROTEIN: Number(source.PROTEIN == null ? source.protein : source.PROTEIN),
-    FAT: Number(source.FAT == null ? source.fat : source.FAT),
-    CARBS: Number(source.CARBS == null ? source.carbs : source.CARBS),
+    CALORIES: foodReferenceOptionalNumber_(source.CALORIES == null ? source.calories : source.CALORIES),
+    PROTEIN: foodReferenceOptionalNumber_(source.PROTEIN == null ? source.protein : source.PROTEIN),
+    FAT: foodReferenceOptionalNumber_(source.FAT == null ? source.fat : source.FAT),
+    CARBS: foodReferenceOptionalNumber_(source.CARBS == null ? source.carbs : source.CARBS),
     AUTHORITY: String(source.AUTHORITY || source.authority || "").trim(),
     SOURCE: String(source.SOURCE || source.source || "").trim(),
     SOURCE_VERSION: String(source.SOURCE_VERSION || source.source_version || "").trim(),
     ACTIVE: foodReferenceActive_(source.ACTIVE == null ? source.active : source.ACTIVE)
   };
+}
+
+function foodReferenceOptionalNumber_(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  return Number(value);
+}
+
+function validateCalculableFoodReference_(reference) {
+  if (!reference || String(reference.REFERENCE_ID || "") === "") return {ok: false, code: "REFERENCE_NOT_RESOLVED"};
+  const basis = Number(reference.BASIS_QUANTITY);
+  if (!isFinite(basis) || basis <= 0) return {ok: false, code: "INVALID_REFERENCE_BASIS"};
+  const unit = String(reference.BASIS_UNIT || "");
+  if (["g", "ml", "count"].indexOf(unit) < 0) return {ok: false, code: "UNSUPPORTED_NUTRITION_UNIT"};
+  if (reference.ACTIVE !== true || !reference.FOOD_ID || !reference.AUTHORITY ||
+      !reference.SOURCE || !reference.SOURCE_VERSION) {
+    return {ok: false, code: "INCOMPLETE_NUTRITION_REFERENCE"};
+  }
+  const keys = ["CALORIES", "PROTEIN", "FAT", "CARBS"];
+  for (let index = 0; index < keys.length; index += 1) {
+    const value = reference[keys[index]];
+    if (value === null || value === undefined || value === "") {
+      return {ok: false, code: "INCOMPLETE_NUTRITION_REFERENCE"};
+    }
+    if (!isFinite(Number(value))) return {ok: false, code: "INVALID_NUTRITION_NUMBER"};
+    if (Number(value) < 0) return {ok: false, code: "NEGATIVE_NUTRITION_VALUE"};
+  }
+  return {ok: true, code: "CALCULABLE"};
+}
+
+function nutritionUnitsCompatible_(quantityUnit, basisUnit) {
+  const allowed = ["g", "ml", "count"];
+  const quantity = String(quantityUnit || "");
+  const basis = String(basisUnit || "");
+  return allowed.indexOf(quantity) >= 0 && allowed.indexOf(basis) >= 0 && quantity === basis;
+}
+
+function nutritionRoundInternal_(value) {
+  return Number(Number(value).toFixed(6));
+}
+
+function nutritionCalculationNumber_(value, maximum) {
+  const number = Number(value);
+  if (!isFinite(number)) return {ok: false, code: "NUTRITION_CALCULATION_NON_FINITE"};
+  if (number < 0) return {ok: false, code: "NEGATIVE_NUTRITION_VALUE"};
+  if (number > maximum) return {ok: false, code: "NUTRITION_CALCULATION_OUT_OF_RANGE"};
+  return {ok: true, value: number};
+}
+
+function calculateNutritionItem_(item, reference) {
+  const validation = validateCalculableFoodReference_(reference);
+  if (!validation.ok) return {ok: false, code: validation.code};
+  const fields = item && item.fields || {};
+  const quantity = Number(fields.quantity_value && fields.quantity_value.value);
+  const quantityUnit = String(fields.quantity_unit && fields.quantity_unit.value || "");
+  if (!isFinite(quantity) || quantity <= 0) return {ok: false, code: "INVALID_NUTRITION_NUMBER"};
+  if (["g", "ml", "count"].indexOf(quantityUnit) < 0) return {ok: false, code: "UNSUPPORTED_NUTRITION_UNIT"};
+  if (!nutritionUnitsCompatible_(quantityUnit, reference.BASIS_UNIT)) {
+    return {ok: false, code: "NUTRITION_UNIT_MISMATCH"};
+  }
+  const factor = quantity / Number(reference.BASIS_QUANTITY);
+  if (!isFinite(factor) || factor <= 0) return {ok: false, code: "NUTRITION_CALCULATION_NON_FINITE"};
+  const raw = {
+    calories: Number(reference.CALORIES) * factor,
+    protein: Number(reference.PROTEIN) * factor,
+    fat: Number(reference.FAT) * factor,
+    carbs: Number(reference.CARBS) * factor
+  };
+  const maxima = {calories: 100000, protein: 10000, fat: 10000, carbs: 10000};
+  const keys = ["calories", "protein", "fat", "carbs"];
+  for (let index = 0; index < keys.length; index += 1) {
+    const checked = nutritionCalculationNumber_(raw[keys[index]], maxima[keys[index]]);
+    if (!checked.ok) return {ok: false, code: checked.code};
+  }
+  const copy = {category: item.category, confidence: item.confidence, fields: {}};
+  Object.keys(fields).forEach(function(key) { copy.fields[key] = Object.assign({}, fields[key]); });
+  copy.fields.reference_nutrition_basis = {value: {
+    quantity: Number(reference.BASIS_QUANTITY), unit: String(reference.BASIS_UNIT),
+    calories: Number(reference.CALORIES), protein: Number(reference.PROTEIN),
+    fat: Number(reference.FAT), carbs: Number(reference.CARBS)
+  }, confidence: 1, source: "DETERMINISTIC_REFERENCE"};
+  copy.fields.calculated_nutrition = {value: {
+    calories: nutritionRoundInternal_(raw.calories), protein: nutritionRoundInternal_(raw.protein),
+    fat: nutritionRoundInternal_(raw.fat), carbs: nutritionRoundInternal_(raw.carbs)
+  }, confidence: 1, source: "DETERMINISTIC_CALCULATION"};
+  copy.fields.nutrition_authority = {value: reference.AUTHORITY, confidence: 1, source: "DETERMINISTIC_REFERENCE"};
+  copy.fields.nutrition_source = {value: reference.SOURCE, confidence: 1, source: "DETERMINISTIC_REFERENCE"};
+  copy.fields.nutrition_source_version = {value: reference.SOURCE_VERSION, confidence: 1, source: "DETERMINISTIC_REFERENCE"};
+  copy.fields.nutrition_approximate = {value: true, confidence: 1, source: "SYSTEM_POLICY"};
+  return {ok: true, code: "CALCULATED", item: copy, raw: raw};
+}
+
+function nutritionTotals_(rawItems) {
+  const totals = {calories: 0, protein: 0, fat: 0, carbs: 0};
+  (rawItems || []).forEach(function(raw) {
+    Object.keys(totals).forEach(function(key) { totals[key] += Number(raw[key]); });
+  });
+  const maxima = {calories: 100000, protein: 10000, fat: 10000, carbs: 10000};
+  const keys = Object.keys(totals);
+  for (let index = 0; index < keys.length; index += 1) {
+    const checked = nutritionCalculationNumber_(totals[keys[index]], maxima[keys[index]]);
+    if (!checked.ok) return {ok: false, code: checked.code};
+  }
+  keys.forEach(function(key) { totals[key] = nutritionRoundInternal_(totals[key]); });
+  return {ok: true, totals: totals};
+}
+
+function calculateNutritionReferences_(items, references) {
+  const sourceItems = Array.isArray(items) ? items : [];
+  if (sourceItems.length > 10) return {status: "TOO_MANY_NUTRITION_ITEMS", items: sourceItems};
+  const calculatedItems = [];
+  const rawItems = [];
+  for (let index = 0; index < sourceItems.length; index += 1) {
+    const item = sourceItems[index];
+    const fields = item && item.fields || {};
+    if (String(fields.reference_status && fields.reference_status.value || "") !== "RESOLVED") {
+      return {status: "REFERENCE_NOT_RESOLVED", items: sourceItems};
+    }
+    const referenceId = String(fields.nutrition_reference_id && fields.nutrition_reference_id.value || "");
+    const matches = (references || []).filter(function(reference) { return reference.REFERENCE_ID === referenceId; });
+    if (matches.length !== 1) return {status: "REFERENCE_NOT_RESOLVED", items: sourceItems};
+    const calculated = calculateNutritionItem_(item, matches[0]);
+    if (!calculated.ok) return {status: calculated.code, items: sourceItems};
+    calculatedItems.push(calculated.item);
+    rawItems.push(calculated.raw);
+  }
+  const totalResult = nutritionTotals_(rawItems);
+  if (!totalResult.ok) return {status: totalResult.code, items: sourceItems};
+  return {status: "CALCULATED", items: calculatedItems, nutrition_calculation: {
+    status: "CALCULATED", items_count: calculatedItems.length,
+    calculable_items_count: calculatedItems.length, approximate_items_count: calculatedItems.length,
+    totals: totalResult.totals
+  }};
 }
 
 function foodAliasNormalizeRecord_(record) {
@@ -1492,9 +1679,10 @@ function buildDomainFactCandidate_(detection, options) {
   const uuid = typeof runtime.uuid === "function" ? runtime.uuid() : Utilities.getUuid();
   const nutritionItems = domain === "NUTRITION" && Array.isArray(detection && detection.items)
     ? detection.items : null;
-  return {
+  const candidate = {
     schema_version: domain === "NUTRITION"
-      ? (detection.reference_status ? "c232b1-nutrition-reference-v1" :
+      ? (detection.calculation_status === "CALCULATED" ? "c232b2-nutrition-calculation-v1" :
+        detection.reference_status ? "c232b1-nutrition-reference-v1" :
         "c232a-nutrition-extraction-v1") : "c231-domain-routing-v1",
     mode: "SIMULATION",
     writes_allowed: false,
@@ -1517,6 +1705,10 @@ function buildDomainFactCandidate_(detection, options) {
       }
     }]
   };
+  if (candidate.schema_version === "c232b2-nutrition-calculation-v1") {
+    candidate.nutrition_calculation = detection.nutrition_calculation;
+  }
+  return candidate;
 }
 
 function validateDomainFactCandidate_(capture) {
@@ -1529,7 +1721,8 @@ function validateDomainFactCandidate_(capture) {
   if (valid && capture.domain === "NUTRITION") {
     const legacySchema = capture.schema_version === "c232a-nutrition-extraction-v1";
     const b1Schema = capture.schema_version === "c232b1-nutrition-reference-v1";
-    valid = (legacySchema || b1Schema) && items.every(function(item) {
+    const b2Schema = capture.schema_version === "c232b2-nutrition-calculation-v1";
+    valid = (legacySchema || b1Schema || b2Schema) && items.every(function(item) {
       const fields = item && item.fields || {};
       const value = Number(fields.quantity_value && fields.quantity_value.value);
       const unit = String(fields.quantity_unit && fields.quantity_unit.value || "");
@@ -1543,16 +1736,20 @@ function validateDomainFactCandidate_(capture) {
       const foodId = String(fields.food_id && fields.food_id.value || "");
       const basisQuantity = Number(fields.reference_basis_quantity && fields.reference_basis_quantity.value);
       const basisUnit = String(fields.reference_basis_unit && fields.reference_basis_unit.value || "");
-      return referenceStatus === "RESOLVED" && !!referenceId && !!foodId &&
+      const referenceValid = referenceStatus === "RESOLVED" && !!referenceId && !!foodId &&
         isFinite(basisQuantity) && basisQuantity > 0 && basisUnit === unit;
+      return referenceValid && (!b2Schema || validateNutritionCalculatedSnapshot_(item));
     });
+    if (valid && b2Schema) valid = validateNutritionCalculationSummary_(capture.nutrition_calculation, items.length);
   } else if (valid) {
     valid = items.length === 1;
   }
   return {
     schema_version: capture && capture.domain === "NUTRITION"
-      ? (capture.schema_version === "c232b1-nutrition-reference-v1"
-        ? "c232b1-nutrition-reference-validation-v1" : "c232a-nutrition-extraction-validation-v1")
+      ? (capture.schema_version === "c232b2-nutrition-calculation-v1"
+        ? "c232b2-nutrition-calculation-validation-v1"
+        : capture.schema_version === "c232b1-nutrition-reference-v1"
+          ? "c232b1-nutrition-reference-validation-v1" : "c232a-nutrition-extraction-validation-v1")
       : "c231-domain-routing-validation-v1",
     capture_id: String(capture && capture.capture_id || ""),
     mode: "SIMULATION",
@@ -1563,6 +1760,32 @@ function validateDomainFactCandidate_(capture) {
       return {category: item.category, status: "PASS", errors: []};
     }) : []
   };
+}
+
+function validateNutritionCalculatedSnapshot_(item) {
+  const fields = item && item.fields || {};
+  const basis = fields.reference_nutrition_basis && fields.reference_nutrition_basis.value;
+  const calculated = fields.calculated_nutrition && fields.calculated_nutrition.value;
+  if (!basis || !calculated || !fields.nutrition_approximate || fields.nutrition_approximate.value !== true) return false;
+  if (!fields.nutrition_authority || !fields.nutrition_authority.value ||
+      !fields.nutrition_source || !fields.nutrition_source.value ||
+      !fields.nutrition_source_version || !fields.nutrition_source_version.value) return false;
+  if (!isFinite(Number(basis.quantity)) || Number(basis.quantity) <= 0 ||
+      ["g", "ml", "count"].indexOf(String(basis.unit || "")) < 0) return false;
+  return ["calories", "protein", "fat", "carbs"].every(function(key) {
+    return basis[key] !== null && basis[key] !== undefined && isFinite(Number(basis[key])) && Number(basis[key]) >= 0 &&
+      calculated[key] !== null && calculated[key] !== undefined && isFinite(Number(calculated[key])) && Number(calculated[key]) >= 0;
+  });
+}
+
+function validateNutritionCalculationSummary_(summary, itemCount) {
+  if (!summary || summary.status !== "CALCULATED" || Number(summary.items_count) !== Number(itemCount) ||
+      Number(summary.calculable_items_count) !== Number(itemCount) ||
+      Number(summary.approximate_items_count) !== Number(itemCount) || !summary.totals) return false;
+  return ["calories", "protein", "fat", "carbs"].every(function(key) {
+    return summary.totals[key] !== null && summary.totals[key] !== undefined &&
+      isFinite(Number(summary.totals[key])) && Number(summary.totals[key]) >= 0;
+  });
 }
 
 function handleDomainFactConfirmation_(selected, intent, userId, chatId, now, dependencies) {
@@ -1638,7 +1861,7 @@ function findLatestDomainCapture_(userId, chatId, options) {
 
 function simulateDomainFactSave_(capture, userId, options) {
   const runtime = options || {};
-  return {
+  const result = {
     ok: true,
     code: "SAVE_SIMULATED",
     capture_id: String(runtime.capture_id || capture && capture.capture_id || ""),
@@ -1647,12 +1870,72 @@ function simulateDomainFactSave_(capture, userId, options) {
     domain_writes: 0,
     production_writes: false
   };
+  if (capture && capture.schema_version === "c232b2-nutrition-calculation-v1" && capture.nutrition_calculation) {
+    result.items_count = Number(capture.nutrition_calculation.items_count || 0);
+    result.nutrition_totals = Object.assign({}, capture.nutrition_calculation.totals || {});
+  }
+  return result;
 }
 
-function domainFactConfirmationPrompt_(domain) {
+function domainFactConfirmationPrompt_(domain, capture) {
+  if (domain === "NUTRITION" && capture && capture.schema_version === "c232b2-nutrition-calculation-v1") {
+    return formatNutritionConfirmation_(capture);
+  }
   const labels = {NUTRITION: "питания", WORKOUT: "тренировки", RECOVERY: "восстановления"};
   return "Распознаны данные " + (labels[domain] || "профиля") +
     ". Подтвердите обработку ответом Да или Нет."
+}
+
+function nutritionRoundDisplay_(value, digits) {
+  const factor = Math.pow(10, Number(digits || 0));
+  return Math.round((Number(value) + Number.EPSILON) * factor) / factor;
+}
+
+function formatNutritionDisplayNumber_(value, digits) {
+  return String(nutritionRoundDisplay_(value, digits)).replace(".", ",");
+}
+
+function nutritionQuantityLabel_(value, unit) {
+  const labels = {g: "г", ml: "мл", count: "шт"};
+  return formatNutritionDisplayNumber_(value, 3) + " " + (labels[unit] || unit);
+}
+
+function nutritionMacroLine_(nutrition) {
+  return "≈ " + formatNutritionDisplayNumber_(nutrition.calories, 0) + " ккал | Б " +
+    formatNutritionDisplayNumber_(nutrition.protein, 1) + " г | Ж " +
+    formatNutritionDisplayNumber_(nutrition.fat, 1) + " г | У " +
+    formatNutritionDisplayNumber_(nutrition.carbs, 1) + " г";
+}
+
+function formatNutritionConfirmation_(capture) {
+  const lines = ["Распознал:", ""];
+  (capture.items || []).forEach(function(item, index) {
+    const fields = item && item.fields || {};
+    lines.push(String(fields.food_display && fields.food_display.value || "Продукт") + " — " +
+      nutritionQuantityLabel_(fields.quantity_value && fields.quantity_value.value,
+        fields.quantity_unit && fields.quantity_unit.value));
+    lines.push(nutritionMacroLine_(fields.calculated_nutrition && fields.calculated_nutrition.value || {}));
+    if (index < capture.items.length - 1) lines.push("");
+  });
+  lines.push("", "Итого:", nutritionMacroLine_(capture.nutrition_calculation.totals), "", "Сохранить? Да / Нет");
+  return lines.join("\n");
+}
+
+function nutritionCalculationFailureMessage_(code) {
+  const messages = {
+    TOO_MANY_NUTRITION_ITEMS: "Слишком много продуктов в одной записи. Разделите приём пищи на несколько сообщений.",
+    CONFIRMATION_MESSAGE_TOO_LONG: "Запись слишком длинная для безопасного подтверждения. Разделите её на несколько сообщений.",
+    NUTRITION_UNIT_MISMATCH: "Единица количества не совместима со справочником продукта. Уточните количество.",
+    UNSUPPORTED_NUTRITION_UNIT: "Эта единица количества пока не поддерживается для расчёта питания.",
+    REFERENCE_NOT_RESOLVED: "Не удалось однозначно определить справочную запись продукта.",
+    INCOMPLETE_NUTRITION_REFERENCE: "Для продукта пока нет полного проверенного набора КБЖУ.",
+    INVALID_REFERENCE_BASIS: "Справочная порция продукта некорректна.",
+    INVALID_NUTRITION_NUMBER: "Справочные данные продукта некорректны.",
+    NEGATIVE_NUTRITION_VALUE: "Справочные данные продукта некорректны.",
+    NUTRITION_CALCULATION_NON_FINITE: "Не удалось безопасно рассчитать КБЖУ.",
+    NUTRITION_CALCULATION_OUT_OF_RANGE: "Результат расчёта выходит за безопасный технический диапазон. Проверьте количество."
+  };
+  return messages[code] || "Не удалось безопасно рассчитать КБЖУ для этой записи.";
 }
 
 function domainFactDependencies_(injected) {

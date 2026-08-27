@@ -805,6 +805,191 @@ function rowToText_(headers, row) {
   return pairs.join(", ");
 }
 
+const SAFE_CONTEXT_POLICIES = Object.freeze({
+  User_Profile: Object.freeze({projection:"SAFE_USER_PROFILE", singleton:true, max_rows:1, fields:Object.freeze([
+    ["Имя", "Имя"], ["Возраст", "Возраст"], ["Рост", "Рост"], ["Вес старт", "Стартовый вес"],
+    ["Текущий вес", "Текущий вес"], ["Целевой вес", "Целевой вес"], ["Цель", "Цель"],
+    ["Уровень подготовки", "Уровень подготовки"], ["Тренировки в неделю", "Тренировки в неделю"],
+    ["Калории цель", "Калории цель"], ["Белок цель", "Белок цель"], ["Жиры цель", "Жиры цель"], ["Углеводы цель", "Углеводы цель"]
+  ])}),
+  Goals: Object.freeze({projection:"SAFE_GOALS", max_rows:2, date_fields:["Дата старта","start_date","Дата цели","target_date"], fields:Object.freeze([
+    [["Цель","goal"], "Цель"], [["Дата старта","start_date"], "Дата старта"], [["Целевое значение","target_weight","target"], "Целевое значение"],
+    [["Текущее значение","current_weight","current"], "Текущее значение"], [["Статус","status"], "Статус"],
+    [["Дата цели","target_date"], "Дата цели"], [["Этапы","milestones"], "Этапы"]
+  ])}),
+  Body_Tracking: Object.freeze({projection:"SAFE_BODY_TRACKING", max_rows:2, date_fields:["Дата","date"], fields:Object.freeze([
+    [["Дата","date"], "Дата"], [["Вес","weight"], "Вес"], ["Процент жира", "Процент жира"], ["Талия", "Талия"],
+    ["Грудь", "Грудь"], ["Рука", "Рука"], ["Бедро", "Бедро"], ["Шаги", "Шаги"]
+  ])}),
+  Workout_Log: Object.freeze({projection:"SAFE_WORKOUT_LOG", max_rows:2, date_fields:["Дата","date"], fields:Object.freeze([
+    [["Дата","date"], "Дата"], [["Тип тренировки","training_type"], "Тип тренировки"], [["Упражнение","exercise"], "Упражнение"],
+    [["Вес","weight"], "Вес"], [["Подходы","sets"], "Подходы"], [["Повторы","reps"], "Повторы"], ["RPE", "RPE"],
+    ["Боль/ограничения", "Боль/ограничения"]
+  ])}),
+  Recovery_Log: Object.freeze({projection:"SAFE_RECOVERY_LOG", max_rows:2, date_fields:["Дата","date"], fields:Object.freeze([
+    [["Дата","date"], "Дата"], [["Сон часы","sleep","sleep_hours"], "Сон часы"], [["Качество сна","sleep_quality"], "Качество сна"],
+    [["Стресс","stress"], "Стресс"], [["Усталость","fatigue"], "Усталость"], [["Энергия","energy"], "Энергия"],
+    [["Боль плечо","shoulder_pain","pain_shoulder"], "Боль плечо"], [["Боль поясница","lower_back_pain","pain_lower_back"], "Боль поясница"],
+    [["Боль другая/локализация","other_pain","pain_other"], "Другая боль"]
+  ])})
+});
+
+function safeContextHeaderIndexes_(headers, aliases) {
+  const normalized = (headers || []).map(function(header) { return String(header || "").trim().toLowerCase(); });
+  const indexes = [];
+  (aliases || []).forEach(function(alias) {
+    const expected = String(alias).trim().toLowerCase();
+    normalized.forEach(function(header, index) { if (header === expected) indexes.push(index); });
+  });
+  return indexes.filter(function(index, position) { return indexes.indexOf(index) === position; });
+}
+
+function resolveSafeContextIdentity_(telegramUserId, spreadsheet, options) {
+  const runtime = options || {};
+  const telegramId = String(telegramUserId == null ? "" : telegramUserId).trim();
+  const result = {ok:false, code:"PROFILE_UNRESOLVED", telegram_id:telegramId, internal_user_id:"", environment:""};
+  if (!telegramId) return result;
+  let environment = String(runtime.deployment_env || "").trim().toUpperCase();
+  if (!environment && typeof PropertiesService !== "undefined") {
+    try { environment = String(PropertiesService.getScriptProperties().getProperty("DEPLOYMENT_ENV") || "").trim().toUpperCase(); }
+    catch (ignored) {}
+  }
+  result.environment = environment;
+  try {
+    const sheet = (spreadsheet || getSpreadsheet_()).getSheetByName("User_Profile");
+    if (!sheet || sheet.getLastRow() < 2 || sheet.getLastColumn() < 1) return result;
+    const values = sheet.getRange(1, 1, Math.min(sheet.getLastRow(), 100), sheet.getLastColumn()).getDisplayValues();
+    const headers = values[0] || [];
+    const profileSchema = nutritionTargetSchema_(headers);
+    if (!profileSchema.ok) return Object.assign(result, {code:"PROFILE_SCHEMA_INVALID"});
+    const telegramColumns = safeContextHeaderIndexes_(headers, ["Telegram_ID"]);
+    const userColumns = safeContextHeaderIndexes_(headers, ["User_ID"]);
+    if (telegramColumns.length > 1 || userColumns.length !== 1) return Object.assign(result, {code:"PROFILE_IDENTITY_SCHEMA_INVALID"});
+    const rows = values.slice(1);
+    function matches(column, expected) { return rows.map(function(row, index) { return {row:row, index:index}; })
+      .filter(function(entry) { return String(entry.row[column] == null ? "" : entry.row[column]).trim() === expected; }); }
+    const directUserMatches = matches(userColumns[0], telegramId);
+    let found = telegramColumns.length ? matches(telegramColumns[0], telegramId) : [];
+    if (found.length > 1) return Object.assign(result, {code:"DUPLICATE_USER_PROFILE"});
+    if (found.length === 1 && directUserMatches.length &&
+        directUserMatches.some(function(entry) { return entry.index !== found[0].index; })) {
+      return Object.assign(result, {code:"CONFLICTING_PROFILE_IDENTITY"});
+    }
+    if (!found.length) {
+      found = directUserMatches;
+      if (found.length > 1) return Object.assign(result, {code:"DUPLICATE_USER_PROFILE"});
+    }
+    if (!found.length && environment === "STAGING" && CONTEXT_STAGING_USER_ALIASES[telegramId]) {
+      found = matches(userColumns[0], CONTEXT_STAGING_USER_ALIASES[telegramId]);
+      if (found.length > 1) return Object.assign(result, {code:"DUPLICATE_USER_PROFILE"});
+    }
+    if (found.length !== 1) return Object.assign(result, {code:"USER_NOT_FOUND"});
+    const internalId = String(found[0].row[userColumns[0]] || "").trim();
+    if (!internalId) return Object.assign(result, {code:"PROFILE_INTERNAL_ID_MISSING"});
+    return {ok:true, code:"USER_FOUND", telegram_id:telegramId, internal_user_id:internalId,
+      environment:environment, headers:headers, row:found[0].row};
+  } catch (error) { return Object.assign(result, {code:"PROFILE_READ_FAILED"}); }
+}
+
+function safeContextFieldIndex_(headers, aliases) {
+  const indexes = safeContextHeaderIndexes_(headers, Array.isArray(aliases) ? aliases : [aliases]);
+  return indexes.length === 1 ? indexes[0] : -1;
+}
+
+function validateSafeContextFragment_(fragment) {
+  if (!fragment || fragment.scope !== "USER" || fragment.identity_verified !== true || !SAFE_CONTEXT_POLICIES[fragment.source] ||
+      SAFE_CONTEXT_POLICIES[fragment.source].projection !== fragment.projection_id) return false;
+  const forbidden = /(?:^|[;\s])(?:USER_ID|TELEGRAM_ID|CAPTURE_ID|MEAL_ID|SNAPSHOT_HASH|TRANSACTION_STATUS|CONFIRMATION_ID|RAW_MESSAGE|SCHEMA_VERSION|UPDATED_AT|CREATED_AT|SOURCE)\s*[:=]/i;
+  if (forbidden.test(String(fragment.text || "")) || /\{\s*"(?:capture_id|meal_id|snapshot_hash)"/i.test(String(fragment.text || ""))) return false;
+  return (fragment.fields_projected || []).every(function(field) { return (fragment.allowed_fields || []).indexOf(field) >= 0; });
+}
+
+function readSafeUserContextSource_(sourceName, identity, spreadsheet) {
+  const policy = SAFE_CONTEXT_POLICIES[sourceName];
+  const diagnostics = {source:sourceName, rows_examined:0, rows_accepted:0, rows_rejected:0, omission_reason:"", projected_field_count:0};
+  function omit(code, integrity) { diagnostics.omission_reason = code; return {ok:false, omitted:true, integrity_failure:integrity === true,
+    code:code, diagnostics:diagnostics, fragments:[]}; }
+  if (!policy) return omit("UNSUPPORTED_LAYOUT", false);
+  if (!identity || identity.ok !== true) return omit("IDENTITY_UNRESOLVED", true);
+  let sheet;
+  try { sheet = (spreadsheet || getSpreadsheet_()).getSheetByName(sourceName); }
+  catch (error) { return omit("READ_FAILED", true); }
+  if (!sheet) return omit("SHEET_ABSENT", false);
+  try {
+    if (sheet.getLastRow() < 2 || sheet.getLastColumn() < 1) return omit("NO_ROWS", false);
+    const values = sheet.getRange(1, 1, sheet.getLastRow(), sheet.getLastColumn()).getDisplayValues();
+    const headers = values[0] || [];
+    const telegramColumns = safeContextHeaderIndexes_(headers, ["Telegram_ID"]);
+    const userColumns = safeContextHeaderIndexes_(headers, ["User_ID"]);
+    if (telegramColumns.length > 1 || userColumns.length > 1) return omit("DUPLICATE_IDENTITY_HEADER", true);
+    if (!telegramColumns.length && !userColumns.length) return omit("IDENTITY_HEADER_MISSING", false);
+    const rows = values.slice(1);
+    diagnostics.rows_examined = rows.length;
+    let matching = rows.filter(function(row) {
+      const telegramValue = telegramColumns.length ? String(row[telegramColumns[0]] || "").trim() : "";
+      const userValue = userColumns.length ? String(row[userColumns[0]] || "").trim() : "";
+      if (telegramValue && telegramValue !== identity.telegram_id) return false;
+      if (userValue && userValue !== identity.internal_user_id) return false;
+      return (telegramValue && telegramValue === identity.telegram_id) ||
+        (userValue && userValue === identity.internal_user_id);
+    });
+    diagnostics.rows_accepted = matching.length;
+    diagnostics.rows_rejected = rows.length - matching.length;
+    if (!matching.length) return omit("NO_USER_ROWS", false);
+    if (policy.singleton && matching.length !== 1) return omit("DUPLICATE_SINGLETON_USER", true);
+    const dateIndex = policy.date_fields ? safeContextFieldIndex_(headers, policy.date_fields) : -1;
+    if (dateIndex >= 0) matching = matching.map(function(row, order) {
+      const time = Date.parse(String(row[dateIndex] || "")); return {row:row, order:order, time:isFinite(time) ? time : null};
+    }).sort(function(a, b) {
+      if (a.time !== null && b.time !== null && a.time !== b.time) return a.time - b.time;
+      if (a.time !== null && b.time === null) return 1;
+      if (a.time === null && b.time !== null) return -1;
+      return a.order - b.order;
+    }).map(function(entry) { return entry.row; });
+    matching = matching.slice(-Math.max(1, Number(policy.max_rows) || 1));
+    const allowedLabels = policy.fields.map(function(field) { return field[1]; });
+    const fragments = matching.map(function(row) {
+      const projected = [];
+      policy.fields.forEach(function(field) {
+        const index = safeContextFieldIndex_(headers, field[0]);
+        const value = index >= 0 ? String(row[index] == null ? "" : row[index]).trim() : "";
+        if (value) projected.push({label:field[1], value:value});
+      });
+      if (!projected.length) return null;
+      const fragment = {source:sourceName, scope:"USER", identity_verified:true, projection_id:policy.projection,
+        fields_projected:projected.map(function(item) { return item.label; }), allowed_fields:allowedLabels,
+        text:projected.map(function(item) { return item.label + ": " + item.value; }).join("; ")};
+      return validateSafeContextFragment_(fragment) ? fragment : null;
+    }).filter(Boolean);
+    diagnostics.projected_field_count = fragments.reduce(function(total, fragment) { return total + fragment.fields_projected.length; }, 0);
+    if (!fragments.length) return omit("NO_SEMANTIC_FIELDS", false);
+    return {ok:true, code:"SAFE_SOURCE", diagnostics:diagnostics, fragments:fragments};
+  } catch (error) { return omit("READ_FAILED", true); }
+}
+
+function addSafeUserContext_(parts, sourceName, identity, maxRows, label, spreadsheet) {
+  const result = readSafeUserContextSource_(sourceName, identity, spreadsheet);
+  if (!result.ok) return result;
+  const rows = result.fragments.slice(-(Number(maxRows) || result.fragments.length)).map(function(fragment) { return fragment.text; });
+  if (rows.length) parts.push(label + ": " + rows.join(" | "));
+  return result;
+}
+
+function safeProfileContext_(identity) {
+  if (!identity || identity.ok !== true) return "";
+  const policy = SAFE_CONTEXT_POLICIES.User_Profile;
+  const projected = [];
+  policy.fields.forEach(function(field) {
+    const index = safeContextFieldIndex_(identity.headers, field[0]);
+    const value = index >= 0 ? String(identity.row[index] == null ? "" : identity.row[index]).trim() : "";
+    if (value) projected.push({label:field[1], value:value});
+  });
+  const fragment = {source:"User_Profile", scope:"USER", identity_verified:true, projection_id:policy.projection,
+    fields_projected:projected.map(function(item) { return item.label; }), allowed_fields:policy.fields.map(function(field) { return field[1]; }),
+    text:projected.map(function(item) { return item.label + ": " + item.value; }).join("; ")};
+  return validateSafeContextFragment_(fragment) ? fragment.text : "";
+}
+
 function loadChatHistory_(telegramUserId, options) {
   const runtime = options || {};
   const coachState = readCoachState_(telegramUserId, runtime);
@@ -4472,13 +4657,11 @@ function getUserContext(userId) {
 
     sections.push(memoryFormatPersona_(persona));
     sections.push(memoryFormatRules_(rules));
-    sections.push(memoryFormatUserMemory_(memory));
+    sections.push(memoryFormatUserMemory_(memory.filter(isApprovedContextMemoryFact_)));
     sections.push(memoryLoadProfileContext_(normalizedUserId));
     sections.push(memoryLoadRecentSheetContext_("Goals", normalizedUserId, 2, "GOALS"));
     sections.push(memoryLoadRecentSheetContext_("Body_Tracking", normalizedUserId, 3, "RECENT BODY TRACKING"));
-    sections.push(memoryLoadRecentSheetContext_("Nutrition_Log", normalizedUserId, 3, "RECENT NUTRITION"));
     sections.push(memoryLoadRecentSheetContext_("Workout_Log", normalizedUserId, 3, "RECENT WORKOUTS"));
-    sections.push(memoryLoadAnalyticsContext_(normalizedUserId, 10));
 
     return memoryLimitText_(sections.filter(Boolean).join("\n\n"), MEMORY_LAYER_CONFIG.MAX_CONTEXT_CHARS);
   } catch (error) {
@@ -4530,6 +4713,8 @@ function syncProfilesToMemory_(userId) {
 }
 
 function refreshUserAnalytics_(userId) {
+  return {ok: false, code: "ANALYTICS_REFRESH_DISABLED_UNSAFE_SOURCE", reads: 0, writes: 0};
+  /* C-22.2 containment: legacy implementation retained unreachable for later scoped repair.
   try {
     const normalizedUserId = memoryRequiredText_(userId, "userId");
     const period = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM");
@@ -4593,6 +4778,7 @@ function refreshUserAnalytics_(userId) {
     memoryLogError_("refreshUserAnalytics_", error);
     throw error;
   }
+  */
 }
 
 function callAIProvider(apiKey, model, messages, provider) {
@@ -4642,7 +4828,7 @@ function testAIContext_() {
 function runMemoryLayerTests() {
   const result = {
     memory: testUserMemory_(),
-    analytics: refreshUserAnalytics_(MEMORY_LAYER_CONFIG.USER_ID),
+    analytics: {ok: false, code: "ANALYTICS_REFRESH_DISABLED_UNSAFE_SOURCE", reads: 0, writes: 0},
     context: testAIContext_()
   };
   console.log("runMemoryLayerTests: OK");
@@ -4698,13 +4884,9 @@ function memoryFormatUserMemory_(memory) {
 }
 
 function memoryLoadProfileContext_(userId) {
-  const sheet = getSpreadsheet_().getSheetByName("User_Profile");
-  if (!sheet || sheet.getLastRow() < 2 || sheet.getLastColumn() < 1) return "";
-  const values = sheet.getRange(1, 1, Math.min(sheet.getLastRow(), 100), sheet.getLastColumn())
-    .getDisplayValues();
-  const headers = values[0];
-  const match = resolveContextUser_(headers, values.slice(1), userId);
-  return match ? "USER PROFILE:\n" + memoryRowToText_(headers, match.row) : "";
+  const identity = resolveSafeContextIdentity_(userId, getSpreadsheet_());
+  const profile = safeProfileContext_(identity);
+  return profile ? "USER PROFILE:\n- " + profile : "";
 }
 
 function sanitizeCoachProfileContext_(profileContext, excludeCurrentWeight) {
@@ -4744,17 +4926,13 @@ function isLegacyCurrentWeightMemoryFact_(item) {
 }
 
 function memoryLoadRecentSheetContext_(sheetName, userId, maxRows, label) {
-  const table = memoryReadSheetTable_(sheetName);
-  if (!table.displayRows.length) return "";
-  const userIndex = memoryHeaderIndex_(table.headers, ["User_ID", "user_id", "Telegram_ID", "telegram_id"]);
-  let rows = table.displayRows.filter(function(row) {
-    return userIndex < 0 || String(row[userIndex]).trim() === String(userId);
-  });
-  rows = rows.slice(-maxRows);
-  if (!rows.length) return "";
-  return label + ":\n" + rows.map(function(row) {
-    return memoryRowToText_(table.headers, row);
-  }).join("\n");
+  if (sheetName === "Nutrition_Log" || sheetName === "Health_Data" || !SAFE_CONTEXT_POLICIES[sheetName]) return "";
+  const spreadsheet = getSpreadsheet_();
+  const identity = resolveSafeContextIdentity_(userId, spreadsheet);
+  const result = readSafeUserContextSource_(sheetName, identity, spreadsheet);
+  if (!result.ok) return "";
+  return label + ":\n" + result.fragments.slice(-(Number(maxRows) || result.fragments.length))
+    .map(function(fragment) { return "- " + fragment.text; }).join("\n");
 }
 
 function memoryLoadAnalyticsContext_(userId, maxRows) {
@@ -4914,16 +5092,14 @@ function buildLegacyCoachContext_(userId, chatId, options) {
   const spreadsheet = runtime.spreadsheet || getSpreadsheet_();
   const parts = [];
 
-  const profile = findUserProfile_(userId, spreadsheet, {
-    deployment_env: runtime.deployment_env
-  });
+  const identity = resolveSafeContextIdentity_(userId, spreadsheet, {deployment_env:runtime.deployment_env});
+  const profile = safeProfileContext_(identity);
   if (profile) parts.push("Профиль: " + profile);
 
-  addRecentUserSheetContext_(parts, "Goals", userId, 2, "Цели", spreadsheet);
-  addRecentUserSheetContext_(parts, "Body_Tracking", userId, 2, "Тело", spreadsheet);
-  addRecentUserSheetContext_(parts, "Nutrition_Log", userId, 3, "Питание", spreadsheet);
-  addRecentUserSheetContext_(parts, "Workout_Log", userId, 2, "Тренировки", spreadsheet);
-  addRecentUserSheetContext_(parts, "Recovery_Log", userId, 2, "Восстановление", spreadsheet);
+  addSafeUserContext_(parts, "Goals", identity, 2, "Цели", spreadsheet);
+  addSafeUserContext_(parts, "Body_Tracking", identity, 2, "Тело", spreadsheet);
+  addSafeUserContext_(parts, "Workout_Log", identity, 2, "Тренировки", spreadsheet);
+  addSafeUserContext_(parts, "Recovery_Log", identity, 2, "Восстановление", spreadsheet);
   addKnowledgeBaseContext_(parts, spreadsheet);
 
   const history = runtime.chat_history == null ? loadChatHistory_(userId) : String(runtime.chat_history);
@@ -4945,6 +5121,7 @@ function buildMemoryCoachContext_(userId, chatId, options) {
       memory = [];
     }
   }
+  memory = memory.filter(isApprovedContextMemoryFact_);
   const memoryIndex = contextMemoryIndex_(memory);
   const usedMemory = {};
   const chunks = [];
@@ -5063,35 +5240,24 @@ function buildMemoryCoachContext_(userId, chatId, options) {
   ], "LOW"), order));
   order += 10;
 
-  const remainingMemory = memory.filter(function(item) {
-    if (bodyCurrent && isLegacyCurrentWeightMemoryFact_(item)) return false;
-    return !usedMemory[item.category + "|" + item.key];
-  }).map(function(item) {
-    return {
-      label: item.category + "." + item.key,
-      value: item.value,
-      priority: item.priority
-    };
-  });
-  chunks.push.apply(chunks, contextSectionChunks_("MEMORY — ADDITIONAL FACTS", remainingMemory, order));
-  order += 10;
-
+  const spreadsheet = runtime.spreadsheet || (runtime.skip_sources ? null : getSpreadsheet_());
+  const identity = runtime.identity || (runtime.skip_sources ? null : resolveSafeContextIdentity_(String(userId), spreadsheet, {
+    deployment_env:runtime.deployment_env
+  }));
   const rawProfileSource = runtime.profile_context == null ?
-    (runtime.skip_sources ? "" : memoryLoadProfileContext_(String(userId))) : String(runtime.profile_context);
+    (runtime.skip_sources ? "" : safeProfileContext_(identity)) : String(runtime.profile_context);
   const profileSource = sanitizeCoachProfileContext_(rawProfileSource, Boolean(bodyCurrent));
   if (profileSource) {
     chunks.push(contextChunk_("PROFILE DETAILS:\n" + profileSource, "MEDIUM", order++));
   }
 
   if (!runtime.skip_sources) {
-    contextAddRecentSource_(chunks, "Goals", 2, "RECENT HISTORY — GOALS", "MEDIUM", order++);
+    contextAddRecentSource_(chunks, "Goals", identity, 2, "RECENT HISTORY — GOALS", "MEDIUM", order++, spreadsheet);
     if (!bodyCurrent) {
-      contextAddRecentSource_(chunks, "Body_Tracking", 2, "RECENT HISTORY — BODY", "MEDIUM", order++);
+      contextAddRecentSource_(chunks, "Body_Tracking", identity, 2, "RECENT HISTORY — BODY", "MEDIUM", order++, spreadsheet);
     }
-    contextAddRecentSource_(chunks, "Nutrition_Log", 3, "RECENT HISTORY — NUTRITION", "MEDIUM", order++);
-    contextAddRecentSource_(chunks, "Workout_Log", 2, "RECENT HISTORY — TRAINING", "MEDIUM", order++);
-    contextAddRecentSource_(chunks, "Recovery_Log", 2, "RECENT HISTORY — RECOVERY", "MEDIUM", order++);
-    contextAddRecentSource_(chunks, "Health_Data", 2, "RECENT HISTORY — HEALTH", "MEDIUM", order++);
+    contextAddRecentSource_(chunks, "Workout_Log", identity, 2, "RECENT HISTORY — TRAINING", "MEDIUM", order++, spreadsheet);
+    contextAddRecentSource_(chunks, "Recovery_Log", identity, 2, "RECENT HISTORY — RECOVERY", "MEDIUM", order++, spreadsheet);
   }
 
   const history = runtime.chat_history == null ? (runtime.skip_sources ? "" : loadChatHistory_(userId)) :
@@ -5266,12 +5432,24 @@ function contextChunk_(text, priority, order) {
   return {text: text, priority: priority, order: order};
 }
 
-function contextAddRecentSource_(chunks, sheetName, rowCount, label, priority, order) {
+function contextAddRecentSource_(chunks, sheetName, identity, rowCount, label, priority, order, spreadsheet) {
   const parts = [];
-  addRecentSheetContext_(parts, sheetName, rowCount, label);
+  addSafeUserContext_(parts, sheetName, identity, rowCount, label, spreadsheet);
   parts.forEach(function(part) {
     chunks.push(contextChunk_(part, priority, order));
   });
+}
+
+function isApprovedContextMemoryFact_(item) {
+  const category = String(item && item.category || "").trim().toLowerCase();
+  const key = String(item && item.key || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  const registry = {
+    profile:["name","gender","age","height","current_weight","start_weight"],
+    body_tracking:["weight_event","current_weight"], goal:["goal_type","target_weight","main_priority"],
+    training:["experience","frequency","style"], nutrition:["calories_target","maximum_calories","protein_priority"],
+    health:["shoulder","lower_back","limitations","injuries"], preferences:["response_style","avoid"]
+  };
+  return !!(registry[category] && registry[category].indexOf(key) >= 0 && String(item && item.value || "").trim());
 }
 
 function contextAddUnit_(value, unit) {

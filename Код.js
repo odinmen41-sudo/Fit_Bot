@@ -1004,7 +1004,7 @@ function routeNutritionTargetConfirmation_(update, options) {
   const now = runtime.now instanceof Date ? runtime.now : new Date();
   const confirmation = dependencies.detect_confirmation(message.text);
   if (confirmation && ["CONFIRM", "CANCEL"].indexOf(confirmation.intent) >= 0) {
-    const selected = dependencies.find_capture(userId, chatId, {now: now, include_saved: confirmation.intent === "CONFIRM"});
+    const selected = dependencies.find_capture(userId, chatId, {now: now, include_saved: false});
     if (selected && selected.ok === true) {
       return handleNutritionTargetConfirmation_(selected, confirmation.intent, userId, chatId, now, dependencies);
     }

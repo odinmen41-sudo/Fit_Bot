@@ -79,6 +79,52 @@ function runC232C2NutritionTargetsTests() {
   result=routeNutritionTargetConfirmation_(update("Да"),{now:now,dependencies:routeEnv(false).dependencies});
   record("C23.2C2-30_MEAL_CONFIRM_FALLTHROUGH", !result.handled&&result.code==="NO_TARGET_CAPTURE",result);
 
+  function targetSelection(status) {
+    return {ok:status==="PENDING_CONFIRMATION",code:status==="PENDING_CONFIRMATION"?"PENDING_CAPTURE":"NO_TARGET_CAPTURE",
+      capture:{capture_id:"target-"+status,user_id:"tg1",chat_id:"c1",status:status,
+        expires_at:new Date(now.getTime()+60000)},payload:capture};
+  }
+  function ownershipRoute(status,text,counters) {
+    const counts=counters||{};
+    return routeNutritionTargetConfirmation_(update(text),{now:now,dependencies:{
+      detect_confirmation:detectConfirmationIntent_,find_capture:function(userId,chatId,options){
+        counts.lookups=(counts.lookups||0)+1;counts.include_saved=options.include_saved;
+        return targetSelection(status);
+      },persistence_enabled:function(){return true;},persist:function(){counts.saves=(counts.saves||0)+1;return {ok:true,code:"TARGETS_SAVED"};},
+      cancel_capture:function(){counts.cancels=(counts.cancels||0)+1;return {ok:true,code:"CANCELLED"};}
+    }});
+  }
+  let ownership={};result=ownershipRoute("PENDING_CONFIRMATION","Да",ownership);
+  record("C23.2C2-30A_ACTIVE_TARGET_YES_OWNS",result.handled&&result.code==="TARGETS_SAVED"&&ownership.saves===1&&ownership.include_saved===false,{result:result,ownership:ownership});
+  ownership={};result=ownershipRoute("PENDING_CONFIRMATION","Нет",ownership);
+  record("C23.2C2-30B_ACTIVE_TARGET_NO_OWNS",result.handled&&result.code==="CANCELLED"&&ownership.cancels===1&&ownership.include_saved===false,{result:result,ownership:ownership});
+  ["SAVED","CANCELLED","EXPIRED"].forEach(function(status,index){
+    ownership={};const value=ownershipRoute(status,"Да",ownership);
+    record(["C23.2C2-30C_SAVED_FALLTHROUGH","C23.2C2-30D_CANCELLED_FALLTHROUGH","C23.2C2-30E_EXPIRED_FALLTHROUGH"][index],
+      !value.handled&&value.code==="NO_TARGET_CAPTURE"&&!ownership.saves&&ownership.include_saved===false,{result:value,ownership:ownership});
+  });
+  function downstreamMeal(intent) {
+    const counts={target_saves:0,meal_confirms:0,meal_cancels:0};
+    const text=intent==="CONFIRM"?"Да":"Нет";
+    const targetResult=ownershipRoute("SAVED",text,counts);
+    const mealPayload={schema_version:"c232b2-nutrition-calculation-v1",source:"C231_DOMAIN_ROUTER",domain:"NUTRITION"};
+    const mealSelected={ok:true,code:"PENDING_CAPTURE",capture:{capture_id:"meal-pending",user_id:"tg1",chat_id:"c1",status:"PENDING_CONFIRMATION"},payload:mealPayload};
+    const mealResult=targetResult.handled?null:routeDomainFactConfirmation_(update(text),{now:now,dependencies:{
+      detect_confirmation:detectConfirmationIntent_,find_capture:function(){return mealSelected;},
+      validate_nutrition_snapshot:function(){return {ok:true};},nutrition_persistence_enabled:function(){return false;},
+      confirm:function(){counts.meal_confirms+=1;return {ok:true,code:"SAVED"};},
+      cancel:function(){counts.meal_cancels+=1;return {ok:true,code:"CANCELLED"};},
+      save_domain:function(){return {ok:true,code:"SAVE_SIMULATED"};}
+    },reference_options:{resolution_disabled:true}});
+    return {target:targetResult,meal:mealResult,counts:counts};
+  }
+  let downstream=downstreamMeal("CONFIRM");
+  record("C23.2C2-30F_LIVE_SAVED_TARGET_MEAL_YES",!downstream.target.handled&&downstream.meal.handled&&downstream.meal.code==="SAVE_SIMULATED"&&downstream.counts.meal_confirms===1&&downstream.counts.target_saves===0,downstream);
+  downstream=downstreamMeal("CANCEL");
+  record("C23.2C2-30G_LIVE_SAVED_TARGET_MEAL_NO",!downstream.target.handled&&downstream.meal.handled&&downstream.meal.code==="CANCELLED"&&downstream.counts.meal_cancels===1,downstream);
+  ownership={};result=ownershipRoute("PENDING_CONFIRMATION","Да",ownership);
+  record("C23.2C2-30H_ACTIVE_TARGET_BEATS_HISTORICAL_MEAL",result.handled&&result.code==="TARGETS_SAVED"&&ownership.saves===1,result);
+
   const selected={capture:{capture_id:"cap",user_id:"tg1",chat_id:"c1",status:"PENDING_CONFIRMATION",expires_at:new Date(now.getTime()+60000)},payload:capture};
   result=handleNutritionTargetConfirmation_(selected,"CONFIRM","tg1","c1",now,{persistence_enabled:function(){return false;}});
   record("C23.2C2-31_GATE_OFF_PENDING", result.code==="PERSISTENCE_DISABLED"&&selected.capture.status==="PENDING_CONFIRMATION",result);

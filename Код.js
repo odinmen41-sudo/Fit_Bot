@@ -151,6 +151,14 @@ function doPost(e) {
       return httpOk_("OK");
     }
 
+    const remainingNutrition = routeRemainingNutritionTargets_(update);
+    if (remainingNutrition.handled) {
+      sendTelegramMessage_(chatId, remainingNutrition.message);
+      logAiReply_(messageText, remainingNutrition.message, "remaining_nutrition_targets");
+      markBotInputProcessed_(inputRow, remainingNutrition.ok ? "Да" : "Ошибка remaining nutrition");
+      return httpOk_("OK");
+    }
+
     const dailyNutrition = routeDailyNutritionSummary_(update);
     if (dailyNutrition.handled) {
       sendTelegramMessage_(chatId, dailyNutrition.message);
@@ -2610,6 +2618,162 @@ function nutritionDailyReadDependencies_(overrides) {
       return {headers: values[0] || [], rows: values.slice(1)};
     }
   };
+}
+
+const C232C3_REMAINING_EPSILON = 1e-9;
+
+function routeRemainingNutritionTargets_(update, options) {
+  const runtime = options || {};
+  const message = update && (update.message || update.edited_message);
+  const intent = message && typeof message.text === "string"
+    ? detectRemainingNutritionQueryIntent_(message.text) : null;
+  if (!intent) return remainingNutritionResult_(false, true, "NOT_REMAINING_NUTRITION_QUERY");
+  const userId = String(message.from && message.from.id || "").trim();
+  if (!userId) return remainingNutritionResult_(true, false, "INVALID_USER", {
+    intent: intent,
+    message: "Не удалось надёжно прочитать цели по питанию из профиля."
+  });
+  return loadRemainingNutritionTargets_(userId, intent, runtime);
+}
+
+function detectRemainingNutritionQueryIntent_(text) {
+  const normalized = String(text || "").toLowerCase().replace(/ё/g, "е")
+    .replace(/[!?.,;:]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!normalized || /^\//.test(normalized)) return null;
+  const hasRemaining = /(?:^|\s)(?:остал(?:ось|ся)|остается)(?:\s|$)/.test(normalized) ||
+    /(?:^|\s)еще\s+можно(?:\s|$)/.test(normalized);
+  if (!hasRemaining) return null;
+  const metrics = [
+    {intent:"REMAINING_CALORIES", pattern:/(?:^|\s)(?:калори(?:я|и|й|ю|ях|ями)?|ккал)(?:\s|$)/},
+    {intent:"REMAINING_PROTEIN", pattern:/(?:^|\s)бел(?:ок|ка|ку|ке|ком)(?:\s|$)/},
+    {intent:"REMAINING_FAT", pattern:/(?:^|\s)жир(?:ы|а|ов|ам|ами|ах|у)?(?:\s|$)/},
+    {intent:"REMAINING_CARBS", pattern:/(?:^|\s)углевод(?:ы|а|ов|ам|ами|ах|у)?(?:\s|$)/}
+  ];
+  const matched = metrics.filter(function(metric) { return metric.pattern.test(normalized); });
+  if (matched.length === 1) return matched[0].intent;
+  if (matched.length > 1 || /(?:^|\s)(?:кбжу|бжу)(?:\s|$)/.test(normalized)) return "REMAINING_ALL";
+  const explicitContext = /(?:^|\s)(?:питани(?:е|ю|я)|по\s+питанию)(?:\s|$)/.test(normalized) &&
+    /(?:^|\s)(?:сегодня|на\s+сегодня)(?:\s|$)/.test(normalized);
+  return explicitContext ? "REMAINING_ALL" : null;
+}
+
+function loadRemainingNutritionTargets_(userId, intent, options) {
+  const runtime = options || {};
+  const dependencies = runtime.dependencies || {};
+  const loadTargets = dependencies.load_targets || loadAuthoritativeNutritionTargets_;
+  const loadConsumed = dependencies.load_consumed || loadDailyNutritionSummary_;
+  const targetsResult = loadTargets(userId);
+  if (!targetsResult || targetsResult.ok !== true) {
+    return remainingNutritionResult_(true, false, String(targetsResult && targetsResult.code || "TARGET_READ_FAILED"), {
+      intent: intent, targets: targetsResult && targetsResult.targets || null,
+      message: "Не удалось надёжно прочитать цели по питанию из профиля."
+    });
+  }
+  if (targetsResult.status === "NOT_CONFIGURED") {
+    return remainingNutritionResult_(true, true, "TARGETS_NOT_CONFIGURED", {
+      intent: intent, targets: targetsResult.targets,
+      message: "Цели по питанию пока не настроены."
+    });
+  }
+  const requested = remainingNutritionIntentFields_(intent);
+  if (requested.length === 1 && targetsResult.targets[requested[0]] == null) {
+    return remainingNutritionResult_(true, true, "TARGET_NOT_CONFIGURED", {
+      intent: intent, targets: targetsResult.targets,
+      message: "Цель по " + remainingNutritionMissingLabel_(requested[0]) + " не задана."
+    });
+  }
+  const consumedResult = loadConsumed(userId, runtime);
+  if (!consumedResult || consumedResult.ok !== true) {
+    return remainingNutritionResult_(true, false, String(consumedResult && consumedResult.code || "DATA_INTEGRITY_ERROR"), {
+      intent: intent, targets: targetsResult.targets,
+      message: "Не удалось надёжно рассчитать остаток питания за сегодня из-за ошибки данных."
+    });
+  }
+  const calculation = calculateRemainingNutritionTargets_(targetsResult.targets, consumedResult.consumed, requested);
+  const result = remainingNutritionResult_(true, true,
+    targetsResult.status === "PARTIAL" ? "REMAINING_NUTRITION_PARTIAL" : "REMAINING_NUTRITION", {
+      intent: intent, date: consumedResult.date, meals_count: consumedResult.meals_count,
+      consumed: consumedResult.consumed, targets: targetsResult.targets,
+      remaining: calculation.remaining, states: calculation.states
+    });
+  result.message = formatRemainingNutritionTargets_(result);
+  return result;
+}
+
+function calculateRemainingNutritionTargets_(targets, consumed, fields) {
+  const remaining = {calories:null, protein:null, fat:null, carbs:null};
+  const states = {calories:null, protein:null, fat:null, carbs:null};
+  fields.forEach(function(key) {
+    if (targets[key] == null) return;
+    const value = Number(targets[key]) - Number(consumed[key]);
+    remaining[key] = value;
+    states[key] = value > C232C3_REMAINING_EPSILON ? "REMAINING" :
+      value < -C232C3_REMAINING_EPSILON ? "EXCEEDED" : "ON_TARGET";
+  });
+  return {remaining:remaining, states:states};
+}
+
+function formatRemainingNutritionTargets_(result) {
+  const fields = remainingNutritionIntentFields_(result.intent).filter(function(key) {
+    return result.targets[key] != null;
+  });
+  if (fields.length === 1) return formatRemainingNutritionMetric_(fields[0], result);
+  const short = {calories:"", protein:"Б ", fat:"Ж ", carbs:"У "};
+  function values(source) { return fields.map(function(key) {
+    return short[key] + dailyNutritionNumber_(source[key], 1) + (key === "calories" ? " ккал" : " г");
+  }).join(" | "); }
+  const remainingFields = fields.filter(function(key) { return result.states[key] === "REMAINING"; });
+  const lines = ["Сегодня:", "Съедено: " + values(result.consumed), "Цель: " + values(result.targets)];
+  if (remainingFields.length) lines.push("Осталось: " + remainingFields.map(function(key) {
+    return short[key] + dailyNutritionNumber_(result.remaining[key], 1) + (key === "calories" ? " ккал" : " г");
+  }).join(" | "));
+  fields.filter(function(key) { return result.states[key] !== "REMAINING"; }).forEach(function(key) {
+    lines.push(remainingNutritionMetricLabel_(key) + ": " + (result.states[key] === "EXCEEDED"
+      ? "превышение на " + dailyNutritionNumber_(Math.abs(result.remaining[key]), 1) + (key === "calories" ? " ккал." : " г.")
+      : "цель достигнута."));
+  });
+  const missing = remainingNutritionIntentFields_(result.intent).filter(function(key) { return result.targets[key] == null; });
+  if (missing.length) lines.push("", "Не заданы цели: " + missing.map(remainingNutritionMissingListLabel_).join(", ") + ".");
+  return lines.join("\n");
+}
+
+function formatRemainingNutritionMetric_(key, result) {
+  const unit = key === "calories" ? " ккал" : " г";
+  const label = remainingNutritionMetricLabel_(key);
+  if (result.states[key] === "EXCEEDED") return label + ": превышение на " +
+    dailyNutritionNumber_(Math.abs(result.remaining[key]), 1) + unit + ".";
+  if (result.states[key] === "ON_TARGET") return label + ": цель достигнута.";
+  const consumedLabel = {calories:"Сегодня съедено ", protein:"Сегодня белка: ", fat:"Сегодня жиров: ", carbs:"Сегодня углеводов: "}[key];
+  const targetUnit = key === "calories" ? "" : unit;
+  return consumedLabel + dailyNutritionNumber_(result.consumed[key], 1) + unit + " из " +
+    dailyNutritionNumber_(result.targets[key], 1) + targetUnit + ".\nОсталось " +
+    dailyNutritionNumber_(result.remaining[key], 1) + unit + ".";
+}
+
+function remainingNutritionIntentFields_(intent) {
+  const field = {REMAINING_CALORIES:"calories", REMAINING_PROTEIN:"protein",
+    REMAINING_FAT:"fat", REMAINING_CARBS:"carbs"}[intent];
+  return field ? [field] : ["calories", "protein", "fat", "carbs"];
+}
+
+function remainingNutritionMetricLabel_(key) {
+  return {calories:"Калории", protein:"Белок", fat:"Жиры", carbs:"Углеводы"}[key];
+}
+
+function remainingNutritionMissingLabel_(key) {
+  return {calories:"калориям", protein:"белку", fat:"жирам", carbs:"углеводам"}[key];
+}
+
+function remainingNutritionMissingListLabel_(key) {
+  return {calories:"калории", protein:"белок", fat:"жиры", carbs:"углеводы"}[key];
+}
+
+function remainingNutritionResult_(handled, ok, code, extra) {
+  return Object.assign({handled:handled === true, ok:ok === true, code:String(code || ""),
+    intent:null, date:null, meals_count:null, consumed:null, targets:null, remaining:null, message:"",
+    groq_calls:0, user_profile_writes:0, nutrition_log_writes:0, pending_capture_writes:0,
+    ai_memory_reads:0, ai_memory_writes:0, coach_state_reads:0, coach_state_writes:0,
+    food_reference_reads:0, food_alias_reads:0, locks:0, production_writes:0}, extra || {});
 }
 
 function nutritionPersistenceEnabled_(options) {

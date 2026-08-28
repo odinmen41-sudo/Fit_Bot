@@ -3908,6 +3908,184 @@ function persistNutritionSnapshot_(selected, userId, chatId, options) {
   }
 }
 
+function nutritionVoidResult_(ok, code, meal, extra) {
+  return Object.assign({ok: ok === true, code: String(code || ""),
+    schema_version: "c232d3-nutrition-void-v1", capture_id: meal ? meal.capture_id : "",
+    meal_id: meal ? meal.meal_id : "", logical_meal_id: meal ? meal.logical_meal_id : "",
+    revision: meal ? meal.revision : null, transaction_status: meal ? meal.transaction_status : "",
+    written: false, rows_written: 0, idempotent_replay: false, nutrition_log_writes: 0,
+    pending_capture_writes: 0, groq_calls: 0, production_writes: false}, extra || {});
+}
+
+function nutritionVoidFrozenMealTarget_(targetResolution) {
+  if (!targetResolution || ["RESOLVED_MEAL", "RESOLVED_ITEM"].indexOf(targetResolution.status) < 0 ||
+      !targetResolution.resolved_target) return null;
+  return targetResolution.status === "RESOLVED_ITEM"
+    ? targetResolution.resolved_target.meal_target : targetResolution.resolved_target;
+}
+
+function buildNutritionVoidRecord_(frozenTarget, captureId, confirmedAt, options) {
+  const timestamp = (confirmedAt instanceof Date ? confirmedAt : new Date(confirmedAt)).toISOString();
+  const logicalMealId = String(frozenTarget.logical_meal_id || "");
+  const predecessorId = String(frozenTarget.effective_meal_id || "");
+  const revision = Number(frozenTarget.revision) + 1;
+  const items = [];
+  const totals = {calories: 0, protein: 0, fat: 0, carbs: 0};
+  const canonical = {capture_id: String(captureId), user_id: String(frozenTarget.user_id),
+    operation_type: "VOID", logical_meal_id: logicalMealId, replaces_meal_id: predecessorId,
+    revision: revision, items: items, totals: totals};
+  return {schema_version: C232D1_NUTRITION_LIFECYCLE_SCHEMA_VERSION,
+    meal_id: nutritionMealId_(captureId), capture_id: String(captureId), user_id: String(frozenTarget.user_id),
+    meal_at: new Date(frozenTarget.meal_at).toISOString(), confirmed_at: timestamp, items_count: 0,
+    calories_total: 0, protein_total: 0, fat_total: 0, carbs_total: 0, items_json: "[]",
+    snapshot_hash: nutritionSnapshotHash_(canonical, options || {}), transaction_status: "PREPARING",
+    source: "C232D3_NUTRITION_VOID", created_at: timestamp, updated_at: timestamp,
+    operation_type: "VOID", logical_meal_id: logicalMealId, replaces_meal_id: predecessorId,
+    revision: revision};
+}
+
+function nutritionVoidRealIo_() {
+  return {
+    read_table: function() {
+      const sheet = nutritionLogSheet_();
+      const lastRow = sheet.getLastRow();
+      const values = sheet.getRange(1, 1, Math.max(lastRow, 1), C232B4_NUTRITION_SCHEMA.length).getValues();
+      return {headers: values[0] || [], rows: values.slice(1)};
+    },
+    find_meals: function(captureId) {
+      const sheet = nutritionLogSheet_();
+      if (sheet.getLastRow() < 2) return [];
+      return sheet.getRange(2, 1, sheet.getLastRow() - 1, C232B4_NUTRITION_SCHEMA.length).getValues()
+        .map(function(values, index) { return {row_number: index + 2, record: nutritionMealValuesRecord_(values)}; })
+        .filter(function(row) { return String(row.record.capture_id) === String(captureId); });
+    },
+    append_meal: function(record) {
+      const sheet = nutritionLogSheet_();
+      const row = sheet.getLastRow() + 1;
+      sheet.getRange(row, 1, 1, C232B4_NUTRITION_SCHEMA.length).setValues([nutritionMealRecordValues_(record)]);
+      SpreadsheetApp.flush();
+      return row;
+    },
+    read_meal: function(rowNumber) {
+      return nutritionMealValuesRecord_(nutritionLogSheet_().getRange(rowNumber, 1, 1,
+        C232B4_NUTRITION_SCHEMA.length).getValues()[0]);
+    },
+    write_meal: function(rowNumber, record) {
+      nutritionLogSheet_().getRange(rowNumber, 1, 1, C232B4_NUTRITION_SCHEMA.length)
+        .setValues([nutritionMealRecordValues_(record)]);
+      SpreadsheetApp.flush();
+    }
+  };
+}
+
+function nutritionVoidCurrentState_(userId, logicalMealId, io) {
+  let table;
+  try { table = io.read_table(); }
+  catch (error) { return {ok: false, code: "VOID_READ_FAILED"}; }
+  const resolved = loadEffectiveNutritionMeals_(String(userId), table, null, function() {});
+  if (!resolved.ok) return {ok: false, code: "EFFECTIVE_MEAL_INTEGRITY_ERROR"};
+  const active = resolved.effective_meals.filter(function(meal) {
+    return meal.logical_meal_id === logicalMealId;
+  });
+  const voided = resolved.voided_meals.filter(function(meal) {
+    return meal.logical_meal_id === logicalMealId;
+  });
+  if (active.length > 1 || voided.length > 1 || (active.length && voided.length)) {
+    return {ok: false, code: "EFFECTIVE_MEAL_INTEGRITY_ERROR"};
+  }
+  if (voided.length) return {ok: true, status: "VOIDED", meal: voided[0]};
+  if (!active.length) return {ok: true, status: "NOT_FOUND", meal: null};
+  return {ok: true, status: "ACTIVE", meal: active[0]};
+}
+
+function nutritionVoidTargetMatches_(frozen, current) {
+  return current && current.operation_type !== "VOID" &&
+    String(current.logical_meal_id) === String(frozen.logical_meal_id) &&
+    String(current.effective_meal_id) === String(frozen.effective_meal_id) &&
+    Number(current.revision) === Number(frozen.revision) &&
+    String(current.snapshot_hash) === String(frozen.snapshot_hash);
+}
+
+function voidNutritionMeal_(userId, targetResolution, options) {
+  const runtime = options || {};
+  const frozen = nutritionVoidFrozenMealTarget_(targetResolution);
+  if (!frozen) return nutritionVoidResult_(false, String(targetResolution && targetResolution.reason_code ||
+    targetResolution && targetResolution.status || "TARGET_NOT_RESOLVED"), null);
+  if (String(frozen.user_id) !== String(userId)) return nutritionVoidResult_(false, "OWNER_MISMATCH", null);
+  if (!validateNutritionFrozenMeal_(frozen).ok) return nutritionVoidResult_(false, "INVALID_FROZEN_TARGET", null);
+  const captureId = String(runtime.capture_id || runtime.action_id || "").trim();
+  if (!captureId) return nutritionVoidResult_(false, "ACTION_ID_REQUIRED", null);
+  if (runtime.persistence_enabled !== true && !nutritionPersistenceEnabled_(runtime)) {
+    return nutritionVoidResult_(false, "PERSISTENCE_DISABLED", null);
+  }
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  const io = runtime.io || nutritionVoidRealIo_();
+  const lock = runtime.lock || LockService.getScriptLock();
+  if (!lock.tryLock(5000)) return nutritionVoidResult_(false, "LOCK_TIMEOUT", null);
+  let meal = null;
+  try {
+    const matches = io.find_meals(captureId);
+    if (matches.length > 1) return nutritionVoidResult_(false, "VOID_PERSISTENCE_CONFLICT", null);
+    let rowNumber = matches.length ? matches[0].row_number : null;
+    let existing = matches.length ? matches[0].record : null;
+    if (existing) {
+      meal = buildNutritionVoidRecord_(frozen, captureId, existing.confirmed_at, runtime);
+      meal.created_at = existing.created_at;
+      meal.updated_at = existing.updated_at;
+      if (String(existing.snapshot_hash) !== meal.snapshot_hash || String(existing.meal_id) !== meal.meal_id ||
+          String(existing.operation_type) !== "VOID" ||
+          ["PREPARING", "COMMITTED"].indexOf(String(existing.transaction_status)) < 0) {
+        return nutritionVoidResult_(false, "VOID_PERSISTENCE_CONFLICT", meal);
+      }
+      if (existing.transaction_status === "COMMITTED") {
+        meal.transaction_status = "COMMITTED";
+        if (!nutritionPersistenceRecordsEqual_(existing, meal, "COMMITTED")) {
+          return nutritionVoidResult_(false, "VOID_PERSISTENCE_CONFLICT", meal);
+        }
+        return nutritionVoidResult_(true, "VOID_ALREADY_COMMITTED", meal,
+          {idempotent_replay: true, rows_written: 0});
+      }
+    }
+    const currentState = nutritionVoidCurrentState_(userId, frozen.logical_meal_id, io);
+    if (!currentState.ok) return nutritionVoidResult_(false, currentState.code, meal);
+    if (currentState.status === "VOIDED") return nutritionVoidResult_(false, "MEAL_ALREADY_VOIDED", meal);
+    if (currentState.status !== "ACTIVE") return nutritionVoidResult_(false, "MEAL_NOT_FOUND", meal);
+    if (!nutritionVoidTargetMatches_(frozen, currentState.meal)) {
+      return nutritionVoidResult_(false, "STALE_TARGET_CONFLICT", meal);
+    }
+    if (!meal) meal = buildNutritionVoidRecord_(frozen, captureId, now, runtime);
+    if (!rowNumber) {
+      try { rowNumber = io.append_meal(meal); }
+      catch (error) { return nutritionVoidResult_(false, "VOID_PREPARING_WRITE_FAILED", meal); }
+    } else {
+      try { io.write_meal(rowNumber, meal); }
+      catch (error) { return nutritionVoidResult_(false, "VOID_PREPARING_WRITE_FAILED", meal); }
+    }
+    let preparing;
+    try { preparing = io.read_meal(rowNumber); }
+    catch (error) { return nutritionVoidResult_(false, "VOID_PREPARING_READ_FAILED", meal); }
+    if (!nutritionPersistenceRecordsEqual_(preparing, meal, "PREPARING")) {
+      return nutritionVoidResult_(false, "VOID_PREPARING_VERIFY_FAILED", meal);
+    }
+    meal.transaction_status = "COMMITTED";
+    meal.updated_at = now.toISOString();
+    try { io.write_meal(rowNumber, meal); }
+    catch (error) { return nutritionVoidResult_(false, "VOID_COMMIT_FAILED", meal); }
+    let committed;
+    try { committed = io.read_meal(rowNumber); }
+    catch (error) { return nutritionVoidResult_(false, "VOID_COMMIT_READ_FAILED", meal); }
+    if (!nutritionPersistenceRecordsEqual_(committed, meal, "COMMITTED")) {
+      return nutritionVoidResult_(false, "VOID_COMMIT_VERIFY_FAILED", meal);
+    }
+    return nutritionVoidResult_(true, "MEAL_VOIDED", meal,
+      {written: true, rows_written: 1, nutrition_log_writes: 1});
+  } catch (error) {
+    return nutritionVoidResult_(false, "VOID_PERSISTENCE_FAILED", meal, {error: String(error)});
+  } finally {
+    try { lock.releaseLock(); } catch (ignored) {}
+  }
+}
+
 function saveNutritionDomainFact_(selected, userId, chatId, options) {
   return persistNutritionSnapshot_(selected, userId, chatId, options);
 }

@@ -3066,9 +3066,10 @@ function resolveNutritionMealLifecycles_(operations) {
     if (chain.length !== group.length) return nutritionLifecycleIntegrityError_("DISCONNECTED_LIFECYCLE", {logical_meal_id: logicalId});
     const terminal = chain[chain.length - 1];
     chains.push({logical_meal_id: logicalId, operations: chain.slice(), terminal_operation: terminal.operation_type});
-    const effective = {logical_meal_id: logicalId, effective_meal_id: terminal.meal_id,
+    const effective = {user_id: terminal.user_id, logical_meal_id: logicalId, effective_meal_id: terminal.meal_id,
       meal_at: terminal.meal_at, confirmed_at: terminal.confirmed_at, revision: terminal.revision,
-      operation_type: terminal.operation_type, items: terminal.items.slice(), totals: {
+      operation_type: terminal.operation_type, schema_version: terminal.schema_version,
+      snapshot_hash: terminal.snapshot_hash, source: terminal.source, items: terminal.items.slice(), totals: {
         items_count: terminal.items_count, calories: terminal.totals.calories, protein: terminal.totals.protein,
         fat: terminal.totals.fat, carbs: terminal.totals.carbs}};
     if (terminal.operation_type === "VOID") voidedMeals.push(effective);
@@ -3112,6 +3113,309 @@ function nutritionDayBounds_(now, timeZone, formatDate) {
   const zone = String(timeZone || "").trim();
   if (!zone) throw new Error("PROJECT_TIME_ZONE_MISSING");
   return {date: formatDate(now, zone), time_zone: zone};
+}
+
+function nutritionCalendarDate_(now, timeZone, dayOffset, formatDate) {
+  const zone = String(timeZone || "").trim();
+  const offset = Number(dayOffset == null ? 0 : dayOffset);
+  if (!zone || !Number.isInteger(offset)) throw new Error("INVALID_NUTRITION_CALENDAR_DATE");
+  const localDate = String(formatDate(now, zone));
+  const parts = localDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!parts) throw new Error("INVALID_PROJECT_LOCAL_DATE");
+  const shifted = new Date(Date.UTC(Number(parts[1]), Number(parts[2]) - 1, Number(parts[3]) + offset));
+  return shifted.getUTCFullYear() + "-" + String(shifted.getUTCMonth() + 1).padStart(2, "0") + "-" +
+    String(shifted.getUTCDate()).padStart(2, "0");
+}
+
+function nutritionTargetResolutionResult_(status, reasonCode, extra) {
+  const resolved = status === "RESOLVED_MEAL" || status === "RESOLVED_ITEM";
+  return Object.assign({ok: resolved, status: status, reason_code: String(reasonCode || ""),
+    resolved_target: null, candidates: []}, extra || {});
+}
+
+function normalizeNutritionTargetQueryText_(text) {
+  return String(text || "").toLowerCase().replace(/ё/g, "е")
+    .replace(/[!?.,;:]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function parseNutritionTargetQuery_(text) {
+  const normalized = normalizeNutritionTargetQueryText_(text);
+  if (!normalized) return nutritionTargetResolutionResult_("UNSUPPORTED_QUERY", "UNSUPPORTED_TARGET_GRAMMAR");
+  if (/(?:^|\s)(?:завтрак|обед|ужин|перекус)(?:\s|$)/.test(normalized)) {
+    return nutritionTargetResolutionResult_("UNSUPPORTED_QUERY", "MEAL_LABEL_NOT_AVAILABLE");
+  }
+  if (/(?:^|\s)(?:тот|этот|эта|это|его|ее)(?:\s|$)/.test(normalized)) {
+    return nutritionTargetResolutionResult_("UNSUPPORTED_QUERY", "AUTHORITATIVE_REFERENCE_CONTEXT_MISSING");
+  }
+  if (/(?:^|\s)\d{1,2}[.\/-]\d{1,2}(?:[.\/-]\d{2,4})?(?:\s|$)|(?:^|\s)(?:позавчера|на\s+этой\s+неделе|за\s+неделю)(?:\s|$)/.test(normalized)) {
+    return nutritionTargetResolutionResult_("UNSUPPORTED_QUERY", "UNSUPPORTED_TEMPORAL_SCOPE");
+  }
+  let temporalScope = "ANY";
+  let fragment = normalized;
+  if (/(?:^|\s)сегодня$/.test(fragment)) {
+    temporalScope = "TODAY";
+    fragment = fragment.replace(/(?:^|\s)сегодня$/, "").trim();
+  } else if (/(?:^|\s)вчера$/.test(fragment)) {
+    temporalScope = "YESTERDAY";
+    fragment = fragment.replace(/(?:^|\s)вчера$/, "").trim();
+  }
+  if (/^последний\s+прием\s+пищи$/.test(fragment)) {
+    return {ok: true, status: "QUERY_PARSED", reason_code: "LAST_MEAL", query_spec: {
+      relation: "LAST_MEAL", target_scope_hint: "MEAL", temporal_scope: temporalScope,
+      food_text: null, preparation_state: null}};
+  }
+  let relation = "EXACT_FOOD";
+  if (/^последн(?:ий|яя|ее|ие|юю)\s+/.test(fragment)) {
+    relation = "LAST_MATCHING_MEAL";
+    fragment = fragment.replace(/^последн(?:ий|яя|ее|ие|юю)\s+/, "").trim();
+  }
+  if (!fragment || /(?:^|\s)(?:исправь|удали|отмени|замени)(?:\s|$)/.test(fragment)) {
+    return nutritionTargetResolutionResult_("UNSUPPORTED_QUERY", "UNSUPPORTED_TARGET_GRAMMAR");
+  }
+  return {ok: true, status: "QUERY_PARSED", reason_code: relation, query_spec: {
+    relation: relation, target_scope_hint: "ITEM", temporal_scope: temporalScope,
+    food_text: fragment, preparation_state: null}};
+}
+
+function resolveNutritionTargetFoodIdentity_(querySpec, dependencies) {
+  if (!querySpec || querySpec.relation === "LAST_MEAL") return {ok: true, food_identity: null};
+  const runtime = dependencies || {};
+  const source = typeof runtime.load_food_data === "function"
+    ? runtime.load_food_data() : loadFoodReferenceData_(runtime.food_reference_options || {});
+  if (!source || source.available !== true) {
+    return nutritionTargetResolutionResult_("DATA_INTEGRITY_ERROR", "FOOD_REFERENCE_UNAVAILABLE");
+  }
+  const normalized = normalizeFoodAlias_(querySpec.food_text);
+  const preparation = resolvePreparationState_(normalized);
+  const identity = resolveFoodIdentity_(preparation.base_text, normalized, source.aliases || []);
+  if (identity.status === "UNKNOWN_REFERENCE") {
+    return nutritionTargetResolutionResult_("UNSUPPORTED_QUERY", "FOOD_ALIAS_NOT_FOUND");
+  }
+  if (identity.status !== "RESOLVED" || !identity.food_id) {
+    return nutritionTargetResolutionResult_("UNSUPPORTED_QUERY", "FOOD_ALIAS_AMBIGUOUS");
+  }
+  const explicitPreparation = preparation.state !== "UNKNOWN"
+    ? preparation.state : String(identity.preparation_hint || "UNKNOWN");
+  return {ok: true, food_identity: {food_id: identity.food_id,
+    preparation_state: explicitPreparation === "UNKNOWN" ? null : explicitPreparation}};
+}
+
+function nutritionTargetTemporalWindow_(scope, now, dependencies) {
+  if (scope === "ANY") return null;
+  if (scope !== "TODAY" && scope !== "YESTERDAY") throw new Error("UNSUPPORTED_TEMPORAL_SCOPE");
+  const timeZone = dependencies.time_zone();
+  return {date: nutritionCalendarDate_(now, timeZone, scope === "YESTERDAY" ? -1 : 0,
+    dependencies.format_date), time_zone: timeZone};
+}
+
+function loadNutritionTargetCandidates_(userId, temporalScope, options) {
+  const runtime = options || {};
+  const dependencies = nutritionDailyReadDependencies_(runtime.dependencies);
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  let window;
+  try { window = nutritionTargetTemporalWindow_(temporalScope, now, dependencies); }
+  catch (error) { return nutritionTargetResolutionResult_("DATA_INTEGRITY_ERROR", "EFFECTIVE_MEAL_INTEGRITY_ERROR"); }
+  let effective;
+  try {
+    if (runtime.dependencies && typeof runtime.dependencies.load_effective === "function") {
+      effective = runtime.dependencies.load_effective(String(userId), window);
+    } else {
+      effective = loadEffectiveNutritionMeals_(String(userId), dependencies.read_table(), window,
+        dependencies.format_date);
+    }
+  } catch (error) {
+    return nutritionTargetResolutionResult_("DATA_INTEGRITY_ERROR", "EFFECTIVE_MEAL_INTEGRITY_ERROR");
+  }
+  if (!effective || effective.ok !== true || !Array.isArray(effective.effective_meals)) {
+    return nutritionTargetResolutionResult_("DATA_INTEGRITY_ERROR", "EFFECTIVE_MEAL_INTEGRITY_ERROR");
+  }
+  return {ok: true, effective_meals: effective.effective_meals, temporal_window: window};
+}
+
+function validateNutritionTargetableItem_(item, expectedIndex) {
+  const source = item || {};
+  const index = Number(source.item_index);
+  const quantity = Number(source.quantity_value);
+  const unit = String(source.quantity_unit || "");
+  const foodId = String(source.food_id || "").trim().toLowerCase();
+  const preparation = String(source.preparation_state || "").trim().toUpperCase();
+  const referenceId = String(source.nutrition_reference_id || "").trim();
+  const macroKeys = ["calculated_calories", "calculated_protein", "calculated_fat", "calculated_carbs"];
+  const valid = Number.isInteger(index) && index >= 0 && index === expectedIndex &&
+    /^[a-z0-9][a-z0-9_-]*$/.test(foodId) && /^[A-Z][A-Z0-9_]*$/.test(preparation) &&
+    isFinite(quantity) && quantity > 0 && ["g", "ml", "count"].indexOf(unit) >= 0 && !!referenceId &&
+    macroKeys.every(function(key) { return source[key] !== "" && source[key] !== null &&
+      source[key] !== undefined && isFinite(Number(source[key])) && Number(source[key]) >= 0; });
+  return valid ? {ok: true, item: source} : nutritionTargetResolutionResult_("DATA_INTEGRITY_ERROR", "ITEM_IDENTITY_INVALID");
+}
+
+function validateNutritionTargetableMeals_(meals) {
+  for (let mealIndex = 0; mealIndex < meals.length; mealIndex += 1) {
+    const items = meals[mealIndex] && meals[mealIndex].items;
+    if (!Array.isArray(items) || !items.length) {
+      return nutritionTargetResolutionResult_("DATA_INTEGRITY_ERROR", "ITEM_IDENTITY_INVALID");
+    }
+    for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
+      const checked = validateNutritionTargetableItem_(items[itemIndex], itemIndex);
+      if (!checked.ok) return checked;
+    }
+  }
+  return {ok: true};
+}
+
+function nutritionTargetMealTime_(meal) {
+  const value = new Date(meal && meal.meal_at).getTime();
+  return isFinite(value) ? value : NaN;
+}
+
+function selectLatestNutritionTargetMeals_(meals) {
+  if (!meals.length) return [];
+  const times = meals.map(nutritionTargetMealTime_);
+  if (times.some(function(value) { return !isFinite(value); })) return null;
+  const maximum = Math.max.apply(null, times);
+  return meals.filter(function(meal) { return nutritionTargetMealTime_(meal) === maximum; });
+}
+
+function validateNutritionFrozenMeal_(meal) {
+  const revision = Number(meal && meal.revision);
+  const operation = String(meal && meal.operation_type || "");
+  const valid = !!meal && String(meal.user_id || "").trim() !== "" &&
+    String(meal.logical_meal_id || "").trim() !== "" &&
+    String(meal.effective_meal_id || "").trim() !== "" &&
+    String(meal.snapshot_hash || "").trim() !== "" &&
+    Number.isInteger(revision) && revision >= 1 && ["CREATE", "REPLACE"].indexOf(operation) >= 0 &&
+    isFinite(nutritionTargetMealTime_(meal)) && Array.isArray(meal.items) && meal.totals &&
+    ["calories", "protein", "fat", "carbs"].every(function(key) {
+      return meal.totals[key] !== "" && meal.totals[key] !== null && meal.totals[key] !== undefined &&
+        isFinite(Number(meal.totals[key])) && Number(meal.totals[key]) >= 0;
+    });
+  return valid ? {ok: true} : nutritionTargetResolutionResult_("DATA_INTEGRITY_ERROR", "EFFECTIVE_MEAL_INTEGRITY_ERROR");
+}
+
+function validateNutritionFrozenMeals_(meals) {
+  for (let index = 0; index < meals.length; index += 1) {
+    const checked = validateNutritionFrozenMeal_(meals[index]);
+    if (!checked.ok) return checked;
+  }
+  return {ok: true};
+}
+
+function buildNutritionFrozenMealTarget_(meal) {
+  return {target_scope: "MEAL", user_id: meal.user_id, logical_meal_id: meal.logical_meal_id,
+    effective_meal_id: meal.effective_meal_id, revision: meal.revision, meal_at: meal.meal_at,
+    snapshot_hash: meal.snapshot_hash, operation_type: meal.operation_type,
+    items: JSON.parse(JSON.stringify(meal.items)), totals: JSON.parse(JSON.stringify(meal.totals))};
+}
+
+function nutritionItemFingerprint_(item, options) {
+  const canonical = {item_index: Number(item.item_index), food_id: String(item.food_id),
+    preparation_state: String(item.preparation_state), quantity_value: Number(item.quantity_value),
+    quantity_unit: String(item.quantity_unit), nutrition_reference_id: String(item.nutrition_reference_id),
+    calculated_calories: Number(item.calculated_calories), calculated_protein: Number(item.calculated_protein),
+    calculated_fat: Number(item.calculated_fat), calculated_carbs: Number(item.calculated_carbs)};
+  return nutritionSnapshotHash_(canonical, options || {});
+}
+
+function buildNutritionFrozenItemTarget_(meal, item, options) {
+  return {target_scope: "ITEM", meal_target: buildNutritionFrozenMealTarget_(meal), item_selector: {
+    item_index: Number(item.item_index), food_id: String(item.food_id),
+    preparation_state: String(item.preparation_state), quantity_value: Number(item.quantity_value),
+    quantity_unit: String(item.quantity_unit), item_fingerprint: nutritionItemFingerprint_(item, options)}};
+}
+
+function resolveNutritionTargetCandidates_(effectiveMeals, querySpec, foodIdentity, options) {
+  const meals = Array.isArray(effectiveMeals) ? effectiveMeals.slice() : [];
+  if (!meals.length) return nutritionTargetResolutionResult_("NOT_FOUND", "NO_EFFECTIVE_MEALS");
+  const mealValidation = validateNutritionFrozenMeals_(meals);
+  if (!mealValidation.ok) return mealValidation;
+  if (querySpec.relation === "LAST_MEAL") {
+    const latest = selectLatestNutritionTargetMeals_(meals);
+    if (latest === null) return nutritionTargetResolutionResult_("DATA_INTEGRITY_ERROR", "EFFECTIVE_MEAL_INTEGRITY_ERROR");
+    if (latest.length !== 1) return nutritionTargetResolutionResult_("AMBIGUOUS_MEAL", "LATEST_MEAL_TIME_TIE", {candidates: latest});
+    return nutritionTargetResolutionResult_("RESOLVED_MEAL", "MEAL_TARGET_RESOLVED", {
+      resolved_target: buildNutritionFrozenMealTarget_(latest[0])});
+  }
+  const validation = validateNutritionTargetableMeals_(meals);
+  if (!validation.ok) return validation;
+  const matching = [];
+  meals.forEach(function(meal) {
+    const items = meal.items.filter(function(item) {
+      return item.food_id === foodIdentity.food_id && (!foodIdentity.preparation_state ||
+        item.preparation_state === foodIdentity.preparation_state);
+    });
+    if (items.length) matching.push({meal: meal, items: items});
+  });
+  if (!matching.length) return nutritionTargetResolutionResult_("NOT_FOUND", "FOOD_NOT_FOUND");
+  let selected = matching;
+  if (querySpec.relation === "LAST_MATCHING_MEAL") {
+    const latestMeals = selectLatestNutritionTargetMeals_(matching.map(function(value) { return value.meal; }));
+    if (latestMeals === null) return nutritionTargetResolutionResult_("DATA_INTEGRITY_ERROR", "EFFECTIVE_MEAL_INTEGRITY_ERROR");
+    const ids = {};
+    latestMeals.forEach(function(meal) { ids[meal.logical_meal_id] = true; });
+    selected = matching.filter(function(value) { return ids[value.meal.logical_meal_id]; });
+  }
+  if (selected.length > 1) {
+    return nutritionTargetResolutionResult_("AMBIGUOUS_MEAL",
+      querySpec.relation === "LAST_MATCHING_MEAL" ? "LATEST_MEAL_TIME_TIE" : "MULTIPLE_MATCHING_MEALS",
+      {candidates: selected.map(function(value) { return value.meal; })});
+  }
+  if (selected[0].items.length > 1) {
+    return nutritionTargetResolutionResult_("AMBIGUOUS_ITEM", "MULTIPLE_MATCHING_ITEMS", {
+      candidates: selected[0].items.map(function(item) { return {meal: selected[0].meal, item: item}; })});
+  }
+  return nutritionTargetResolutionResult_("RESOLVED_ITEM", "ITEM_TARGET_RESOLVED", {
+    resolved_target: buildNutritionFrozenItemTarget_(selected[0].meal, selected[0].items[0], options)});
+}
+
+function formatNutritionTargetCandidates_(candidates, options) {
+  const runtime = options || {};
+  const zone = runtime.time_zone || (typeof Session !== "undefined" ? Session.getScriptTimeZone() : "UTC");
+  const format = runtime.format_date_time || function(date, timeZone, pattern) {
+    return Utilities.formatDate(date, timeZone, pattern);
+  };
+  const today = runtime.today || null;
+  return (candidates || []).map(function(candidate, index) {
+    const meal = candidate && candidate.meal || candidate;
+    const date = new Date(meal.meal_at);
+    const localDate = format(date, zone, "yyyy-MM-dd");
+    const localTime = format(date, zone, "HH:mm");
+    const selectedItem = candidate && candidate.item || null;
+    const items = selectedItem ? [selectedItem] : (Array.isArray(meal.items) ? meal.items : []);
+    const names = items.slice(0, 3).map(function(item) {
+      const display = String(item.food_display || "").trim();
+      const quantity = Number(item.quantity_value);
+      const unit = {g: "г", ml: "мл", count: "шт"}[String(item.quantity_unit || "")];
+      return display && isFinite(quantity) && quantity > 0 && unit ? display + " " + quantity + " " + unit : "";
+    }).filter(Boolean);
+    let summary = names.length ? names.join(", ") : "прием пищи";
+    if (items.length > names.length && names.length) summary += ", еще " + (items.length - names.length);
+    return {ordinal: index + 1, local_date: localDate, local_time: localTime,
+      date_label: today && localDate === today ? "Сегодня" : localDate, items_summary: summary,
+      calories: selectedItem ? Number(selectedItem.calculated_calories) : meal.totals && Number(meal.totals.calories)};
+  });
+}
+
+function resolveNutritionTarget_(userId, textOrQuerySpec, options) {
+  const runtime = options || {};
+  const parsed = typeof textOrQuerySpec === "string" ? parseNutritionTargetQuery_(textOrQuerySpec) :
+    {ok: true, query_spec: textOrQuerySpec};
+  if (!parsed || parsed.ok !== true || !parsed.query_spec) return parsed ||
+    nutritionTargetResolutionResult_("UNSUPPORTED_QUERY", "UNSUPPORTED_TARGET_GRAMMAR");
+  const spec = parsed.query_spec;
+  if (["ANY", "TODAY", "YESTERDAY"].indexOf(spec.temporal_scope) < 0) {
+    return nutritionTargetResolutionResult_("UNSUPPORTED_QUERY", "UNSUPPORTED_TEMPORAL_SCOPE");
+  }
+  const identity = resolveNutritionTargetFoodIdentity_(spec, runtime.dependencies);
+  if (!identity.ok) return identity;
+  const loaded = loadNutritionTargetCandidates_(userId, spec.temporal_scope, runtime);
+  if (!loaded.ok) return loaded;
+  const resolved = resolveNutritionTargetCandidates_(loaded.effective_meals, spec, identity.food_identity,
+    {sha256: runtime.dependencies && runtime.dependencies.sha256});
+  if ((resolved.status === "AMBIGUOUS_MEAL" || resolved.status === "AMBIGUOUS_ITEM") && resolved.candidates.length) {
+    resolved.candidate_descriptors = formatNutritionTargetCandidates_(resolved.candidates,
+      runtime.candidate_format_options || {});
+  }
+  return resolved;
 }
 
 function formatDailyNutritionSummary_(summary) {

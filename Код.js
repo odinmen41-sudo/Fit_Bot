@@ -2858,8 +2858,13 @@ function simulateNutritionDomainFactSave_(capture, options) {
 const C232B4_NUTRITION_SCHEMA = Object.freeze([
   "SCHEMA_VERSION", "MEAL_ID", "CAPTURE_ID", "USER_ID", "MEAL_AT", "CONFIRMED_AT",
   "ITEMS_COUNT", "CALORIES_TOTAL", "PROTEIN_TOTAL", "FAT_TOTAL", "CARBS_TOTAL",
-  "ITEMS_JSON", "SNAPSHOT_HASH", "TRANSACTION_STATUS", "SOURCE", "CREATED_AT", "UPDATED_AT"
+  "ITEMS_JSON", "SNAPSHOT_HASH", "TRANSACTION_STATUS", "SOURCE", "CREATED_AT", "UPDATED_AT",
+  "OPERATION_TYPE", "LOGICAL_MEAL_ID", "REPLACES_MEAL_ID", "REVISION"
 ]);
+
+const C232D1_NUTRITION_LEGACY_SCHEMA_VERSION = "c232b4-nutrition-persistence-v1";
+const C232D1_NUTRITION_LIFECYCLE_SCHEMA_VERSION = "c232d1-nutrition-lifecycle-v1";
+const C232D1_NUTRITION_OPERATIONS = Object.freeze({CREATE: true, REPLACE: true, VOID: true});
 
 function routeDailyNutritionSummary_(update, options) {
   const runtime = options || {};
@@ -2907,69 +2912,200 @@ function loadDailyNutritionSummary_(userId, options) {
     return dailyNutritionSummaryError_("DATA_INTEGRITY_ERROR", day.date);
   }
 
+  const effective = loadEffectiveNutritionMeals_(userId, table, day, dependencies.format_date);
+  if (!effective.ok) return dailyNutritionSummaryError_("DATA_INTEGRITY_ERROR", day.date);
   const totals = {calories: 0, protein: 0, fat: 0, carbs: 0};
-  const captureIds = {};
-  let mealsCount = 0;
-  const rows = Array.isArray(table.rows) ? table.rows : [];
-  for (let index = 0; index < rows.length; index += 1) {
-    const record = nutritionMealValuesRecord_(rows[index]);
-    if (String(record.user_id).trim() !== String(userId)) continue;
-    const transactionStatus = String(record.transaction_status).trim();
-    if (transactionStatus === "PREPARING") continue;
-    if (transactionStatus !== "COMMITTED") {
-      return dailyNutritionSummaryError_("DATA_INTEGRITY_ERROR", day.date);
-    }
-    const parsed = parseCommittedNutritionReadRow_(record, day, dependencies.format_date);
-    if (parsed.code === "OTHER_DAY") continue;
-    if (!parsed.ok) return dailyNutritionSummaryError_("DATA_INTEGRITY_ERROR", day.date);
-    if (captureIds[parsed.capture_id]) {
-      return dailyNutritionSummaryError_("DATA_INTEGRITY_ERROR", day.date);
-    }
-    captureIds[parsed.capture_id] = true;
-    mealsCount += 1;
-    totals.calories += parsed.totals.calories;
-    totals.protein += parsed.totals.protein;
-    totals.fat += parsed.totals.fat;
-    totals.carbs += parsed.totals.carbs;
-  }
+  effective.effective_meals.forEach(function(meal) {
+    totals.calories += meal.totals.calories;
+    totals.protein += meal.totals.protein;
+    totals.fat += meal.totals.fat;
+    totals.carbs += meal.totals.carbs;
+  });
   return {ok: true, code: "DAILY_NUTRITION_SUMMARY", date: day.date,
-    meals_count: mealsCount, consumed: totals};
+    meals_count: effective.effective_meals.length, consumed: totals};
 }
 
-function parseCommittedNutritionReadRow_(record, day, formatDate) {
-  const captureId = String(record && record.capture_id || "").trim();
-  const mealId = String(record && record.meal_id || "").trim();
-  const mealAt = new Date(record && record.meal_at);
-  if (!captureId || mealId !== nutritionMealId_(captureId) || isNaN(mealAt.getTime())) {
-    return {ok: false, code: "INVALID_COMMITTED_ROW"};
-  }
-  let rowDate;
-  try {
-    rowDate = formatDate(mealAt, day.time_zone);
-  } catch (error) {
-    return {ok: false, code: "INVALID_COMMITTED_ROW"};
-  }
-  if (rowDate !== day.date) return {ok: false, code: "OTHER_DAY"};
-  const validation = validateCommittedNutritionReadRow_(record);
-  if (!validation.ok) return validation;
-  return {ok: true, code: "COMMITTED_ROW", capture_id: captureId, totals: validation.totals};
+function nutritionLifecycleIntegrityError_(reason, details) {
+  return Object.assign({ok: false, code: "DATA_INTEGRITY_ERROR", reason: String(reason || "INVALID_NUTRITION_LIFECYCLE")}, details || {});
 }
 
-function validateCommittedNutritionReadRow_(record) {
-  if (!record || String(record.transaction_status).trim() !== "COMMITTED") {
-    return {ok: false, code: "INVALID_COMMITTED_ROW"};
+function nutritionLifecycleBlank_(value) {
+  return value === null || value === undefined || String(value).trim() === "";
+}
+
+function normalizeNutritionLifecycleRow_(record) {
+  if (!record || String(record.transaction_status || "").trim() !== "COMMITTED") {
+    return nutritionLifecycleIntegrityError_("NOT_COMMITTED");
   }
+  const schemaVersion = String(record.schema_version || "").trim();
+  const mealId = String(record.meal_id || "").trim();
+  const captureId = String(record.capture_id || "").trim();
+  const userId = String(record.user_id == null ? "" : record.user_id).trim();
+  if (!mealId || !captureId || !userId || mealId !== nutritionMealId_(captureId)) {
+    return nutritionLifecycleIntegrityError_("INVALID_IDENTITY");
+  }
+  const physicalLifecycle = [record.operation_type, record.logical_meal_id, record.replaces_meal_id, record.revision];
+  let operationType;
+  let logicalMealId;
+  let replacesMealId;
+  let revision;
+  if (schemaVersion === C232D1_NUTRITION_LEGACY_SCHEMA_VERSION) {
+    if (!physicalLifecycle.every(nutritionLifecycleBlank_)) return nutritionLifecycleIntegrityError_("LEGACY_LIFECYCLE_HYBRID");
+    operationType = "CREATE";
+    logicalMealId = mealId;
+    replacesMealId = null;
+    revision = 1;
+  } else if (schemaVersion === C232D1_NUTRITION_LIFECYCLE_SCHEMA_VERSION) {
+    operationType = String(record.operation_type || "").trim();
+    logicalMealId = String(record.logical_meal_id || "").trim();
+    replacesMealId = nutritionLifecycleBlank_(record.replaces_meal_id) ? null : String(record.replaces_meal_id).trim();
+    const revisionNumber = Number(record.revision);
+    if (!C232D1_NUTRITION_OPERATIONS[operationType] || !logicalMealId ||
+        !Number.isInteger(revisionNumber) || revisionNumber < 1) {
+      return nutritionLifecycleIntegrityError_("INVALID_LIFECYCLE_METADATA");
+    }
+    revision = revisionNumber;
+    if (operationType === "CREATE") {
+      if (logicalMealId !== mealId || replacesMealId !== null || revision !== 1) {
+        return nutritionLifecycleIntegrityError_("INVALID_CREATE_METADATA");
+      }
+    } else if (!replacesMealId || revision < 2) {
+      return nutritionLifecycleIntegrityError_("INVALID_CHILD_METADATA");
+    }
+  } else {
+    return nutritionLifecycleIntegrityError_("UNKNOWN_SCHEMA_VERSION");
+  }
+  const mealAt = new Date(record.meal_at);
+  const confirmedAt = new Date(record.confirmed_at);
+  if (isNaN(mealAt.getTime()) || isNaN(confirmedAt.getTime())) return nutritionLifecycleIntegrityError_("INVALID_TIMESTAMPS");
+  const itemCount = Number(record.items_count);
+  if (!Number.isInteger(itemCount) || itemCount < 0) return nutritionLifecycleIntegrityError_("INVALID_ITEMS_COUNT");
   const totals = {};
   const fields = ["calories", "protein", "fat", "carbs"];
   for (let index = 0; index < fields.length; index += 1) {
     const key = fields[index];
     const raw = record[key + "_total"];
     if (raw === "" || raw === null || raw === undefined || !isFinite(Number(raw)) || Number(raw) < 0) {
-      return {ok: false, code: "INVALID_COMMITTED_ROW"};
+      return nutritionLifecycleIntegrityError_("INVALID_TOTALS");
     }
     totals[key] = Number(raw);
   }
-  return {ok: true, totals: totals};
+  let items;
+  try { items = JSON.parse(String(record.items_json == null ? "" : record.items_json)); }
+  catch (error) { return nutritionLifecycleIntegrityError_("INVALID_ITEMS_JSON"); }
+  if (!Array.isArray(items) || items.length !== itemCount) return nutritionLifecycleIntegrityError_("ITEMS_COUNT_MISMATCH");
+  if (operationType === "VOID") {
+    if (itemCount !== 0 || items.length !== 0 || fields.some(function(key) { return totals[key] !== 0; })) {
+      return nutritionLifecycleIntegrityError_("INVALID_VOID_SNAPSHOT");
+    }
+  } else if (itemCount < 1) {
+    return nutritionLifecycleIntegrityError_("EMPTY_EFFECTIVE_MEAL");
+  }
+  return {ok: true, code: "NUTRITION_LIFECYCLE_ROW", operation: {
+    meal_id: mealId, capture_id: captureId, user_id: userId, schema_version: schemaVersion,
+    operation_type: operationType, logical_meal_id: logicalMealId, replaces_meal_id: replacesMealId,
+    revision: revision, meal_at: mealAt.toISOString(), confirmed_at: confirmedAt.toISOString(),
+    items_count: itemCount, calories_total: totals.calories, protein_total: totals.protein,
+    fat_total: totals.fat, carbs_total: totals.carbs, totals: totals, items: items,
+    items_json: String(record.items_json), snapshot_hash: String(record.snapshot_hash || ""),
+    transaction_status: "COMMITTED", source: String(record.source || ""),
+    created_at: record.created_at, updated_at: record.updated_at
+  }};
+}
+
+function resolveNutritionMealLifecycles_(operations) {
+  const source = Array.isArray(operations) ? operations : [];
+  const byMealId = {};
+  const groups = {};
+  for (let index = 0; index < source.length; index += 1) {
+    const operation = source[index];
+    if (!operation || !operation.meal_id || byMealId[operation.meal_id]) {
+      return nutritionLifecycleIntegrityError_("DUPLICATE_MEAL_ID");
+    }
+    byMealId[operation.meal_id] = operation;
+    if (!groups[operation.logical_meal_id]) groups[operation.logical_meal_id] = [];
+    groups[operation.logical_meal_id].push(operation);
+  }
+  const effectiveMeals = [];
+  const voidedMeals = [];
+  const chains = [];
+  const logicalIds = Object.keys(groups);
+  for (let groupIndex = 0; groupIndex < logicalIds.length; groupIndex += 1) {
+    const logicalId = logicalIds[groupIndex];
+    const group = groups[logicalId];
+    const roots = group.filter(function(operation) { return operation.operation_type === "CREATE"; });
+    if (roots.length !== 1) return nutritionLifecycleIntegrityError_("INVALID_CREATE_ROOT_COUNT", {logical_meal_id: logicalId});
+    const root = roots[0];
+    const children = {};
+    const revisions = {};
+    for (let index = 0; index < group.length; index += 1) {
+      const operation = group[index];
+      if (revisions[operation.revision]) return nutritionLifecycleIntegrityError_("DUPLICATE_REVISION", {logical_meal_id: logicalId});
+      revisions[operation.revision] = true;
+      if (operation.operation_type === "CREATE") continue;
+      if (operation.replaces_meal_id === operation.meal_id) return nutritionLifecycleIntegrityError_("SELF_PARENT", {logical_meal_id: logicalId});
+      const parent = byMealId[operation.replaces_meal_id];
+      if (!parent) return nutritionLifecycleIntegrityError_("MISSING_PARENT", {logical_meal_id: logicalId});
+      if (parent.user_id !== operation.user_id) return nutritionLifecycleIntegrityError_("CROSS_USER_PARENT", {logical_meal_id: logicalId});
+      if (parent.logical_meal_id !== logicalId) return nutritionLifecycleIntegrityError_("CROSS_LOGICAL_PARENT", {logical_meal_id: logicalId});
+      if (operation.revision !== parent.revision + 1) return nutritionLifecycleIntegrityError_("REVISION_GAP", {logical_meal_id: logicalId});
+      if (operation.meal_at !== parent.meal_at) return nutritionLifecycleIntegrityError_("MEAL_AT_CHANGED", {logical_meal_id: logicalId});
+      if (parent.operation_type === "VOID") return nutritionLifecycleIntegrityError_("CHILD_AFTER_VOID", {logical_meal_id: logicalId});
+      if (children[parent.meal_id]) return nutritionLifecycleIntegrityError_("LIFECYCLE_FORK", {logical_meal_id: logicalId});
+      children[parent.meal_id] = operation;
+    }
+    const chain = [];
+    const visited = {};
+    let current = root;
+    while (current) {
+      if (visited[current.meal_id]) return nutritionLifecycleIntegrityError_("LIFECYCLE_CYCLE", {logical_meal_id: logicalId});
+      visited[current.meal_id] = true;
+      chain.push(current);
+      current = children[current.meal_id] || null;
+    }
+    if (chain.length !== group.length) return nutritionLifecycleIntegrityError_("DISCONNECTED_LIFECYCLE", {logical_meal_id: logicalId});
+    const terminal = chain[chain.length - 1];
+    chains.push({logical_meal_id: logicalId, operations: chain.slice(), terminal_operation: terminal.operation_type});
+    const effective = {logical_meal_id: logicalId, effective_meal_id: terminal.meal_id,
+      meal_at: terminal.meal_at, confirmed_at: terminal.confirmed_at, revision: terminal.revision,
+      operation_type: terminal.operation_type, items: terminal.items.slice(), totals: {
+        items_count: terminal.items_count, calories: terminal.totals.calories, protein: terminal.totals.protein,
+        fat: terminal.totals.fat, carbs: terminal.totals.carbs}};
+    if (terminal.operation_type === "VOID") voidedMeals.push(effective);
+    else effectiveMeals.push(effective);
+  }
+  return {ok: true, code: "NUTRITION_LIFECYCLES_RESOLVED", effective_meals: effectiveMeals,
+    voided_meals: voidedMeals, chains: chains};
+}
+
+function loadEffectiveNutritionMeals_(userId, table, temporalWindow, formatDate) {
+  if (!table || !validateNutritionLogSchema_(table.headers)) return nutritionLifecycleIntegrityError_("INVALID_NUTRITION_SCHEMA");
+  const expectedUser = String(userId == null ? "" : userId).trim();
+  if (!expectedUser) return nutritionLifecycleIntegrityError_("INVALID_USER");
+  const operations = [];
+  const rows = Array.isArray(table.rows) ? table.rows : [];
+  for (let index = 0; index < rows.length; index += 1) {
+    const record = nutritionMealValuesRecord_(rows[index]);
+    if (String(record.user_id == null ? "" : record.user_id).trim() !== expectedUser) continue;
+    const status = String(record.transaction_status || "").trim();
+    if (status === "PREPARING") continue;
+    if (status !== "COMMITTED") return nutritionLifecycleIntegrityError_("UNKNOWN_TRANSACTION_STATUS");
+    const normalized = normalizeNutritionLifecycleRow_(record);
+    if (!normalized.ok) return normalized;
+    operations.push(normalized.operation);
+  }
+  const resolved = resolveNutritionMealLifecycles_(operations);
+  if (!resolved.ok) return resolved;
+  if (!temporalWindow) return resolved;
+  let filtered;
+  try {
+    filtered = resolved.effective_meals.filter(function(meal) {
+      return formatDate(new Date(meal.meal_at), temporalWindow.time_zone) === temporalWindow.date;
+    });
+  } catch (error) {
+    return nutritionLifecycleIntegrityError_("TEMPORAL_FILTER_FAILED");
+  }
+  return Object.assign({}, resolved, {effective_meals: filtered});
 }
 
 function nutritionDayBounds_(now, timeZone, formatDate) {
@@ -3245,15 +3381,21 @@ function buildNutritionMealRecord_(capture, owner, confirmedAt, options) {
   const timestamp = (confirmedAt instanceof Date ? confirmedAt : new Date(confirmedAt)).toISOString();
   const items = buildNutritionPersistenceItems_(capture);
   const totals = Object.assign({}, capture.nutrition_calculation.totals);
-  const canonical = {capture_id: String(owner.capture_id), user_id: String(owner.user_id), items: items, totals: totals};
+  const mealId = nutritionMealId_(owner.capture_id);
+  const lifecycle = {operation_type: "CREATE", logical_meal_id: mealId, replaces_meal_id: "", revision: 1};
+  const canonical = {capture_id: String(owner.capture_id), user_id: String(owner.user_id),
+    operation_type: lifecycle.operation_type, logical_meal_id: lifecycle.logical_meal_id,
+    replaces_meal_id: lifecycle.replaces_meal_id, revision: lifecycle.revision, items: items, totals: totals};
   return {
-    schema_version: "c232b4-nutrition-persistence-v1",
-    meal_id: nutritionMealId_(owner.capture_id), capture_id: String(owner.capture_id), user_id: String(owner.user_id),
+    schema_version: C232D1_NUTRITION_LIFECYCLE_SCHEMA_VERSION,
+    meal_id: mealId, capture_id: String(owner.capture_id), user_id: String(owner.user_id),
     meal_at: timestamp, confirmed_at: timestamp, items_count: items.length,
     calories_total: totals.calories, protein_total: totals.protein, fat_total: totals.fat, carbs_total: totals.carbs,
     items_json: JSON.stringify(items), snapshot_hash: nutritionSnapshotHash_(canonical, options),
     transaction_status: "PREPARING", source: "C232B4_NUTRITION_PERSISTENCE",
-    created_at: timestamp, updated_at: timestamp
+    created_at: timestamp, updated_at: timestamp, operation_type: lifecycle.operation_type,
+    logical_meal_id: lifecycle.logical_meal_id, replaces_meal_id: lifecycle.replaces_meal_id,
+    revision: lifecycle.revision
   };
 }
 

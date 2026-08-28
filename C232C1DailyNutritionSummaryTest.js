@@ -4,9 +4,9 @@ function runC232C1DailyNutritionSummaryTests() {
   const headers = C232B4_NUTRITION_SCHEMA.slice();
   const today = new Date("2026-08-26T12:00:00.000Z");
   function values(id, user, at, status, totals) {
-    const record = {schema_version:"v",meal_id:"meal:"+id,capture_id:id,user_id:user,meal_at:at,
+    const record = {schema_version:C232D1_NUTRITION_LEGACY_SCHEMA_VERSION,meal_id:"meal:"+id,capture_id:id,user_id:user,meal_at:at,
       confirmed_at:at,items_count:1,calories_total:totals.calories,protein_total:totals.protein,
-      fat_total:totals.fat,carbs_total:totals.carbs,items_json:"DO_NOT_PARSE",snapshot_hash:"hash",
+      fat_total:totals.fat,carbs_total:totals.carbs,items_json:JSON.stringify([{item_index:0}]),snapshot_hash:"hash",
       transaction_status:status,source:"test",created_at:at,updated_at:at};
     return nutritionMealRecordValues_(record);
   }

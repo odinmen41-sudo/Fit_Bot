@@ -12,6 +12,7 @@ const CONFIG = Object.freeze({
   PRIMARY_MODEL: "llama-3.3-70b-versatile",
   FALLBACK_MODEL: "llama-3.1-8b-instant",
   MAX_OUTPUT_TOKENS: 300,
+  MAX_RECOVERY_OUTPUT_TOKENS: 600,
   MAX_USER_CHARS: 1200,
   MAX_CONTEXT_CHARS: 3500,
   MAX_TELEGRAM_CHARS: 3500,
@@ -249,26 +250,51 @@ function generateCoachReply_(userId, chatId, userText, options) {
   const messages = buildGroqMessages_(context, userText, nutritionTodayContext && nutritionTodayContext.block);
 
   try {
-    return callGroq_(apiKey, primaryModel, messages, runtime);
+    return callGroq_(apiKey, primaryModel, messages, Object.assign({}, runtime, {
+      completion_budget: CONFIG.MAX_OUTPUT_TOKENS,
+      attempt_type: "primary"
+    }));
   } catch (primaryError) {
     console.error("Primary Groq model failed: " + errorText_(primaryError));
 
-    const fallbackEligible = primaryError &&
-      (primaryError.retryable === true || primaryError.fallbackEligible === true);
-    if (!fallbackEligible ||
-        !fallbackModel || fallbackModel === primaryModel) {
-      throw primaryError;
+    if (primaryError && primaryError.code === "GROQ_COMPLETION_INCOMPLETE" &&
+        primaryError.finishReason === "length" && primaryError.nonEmpty === true) {
+      try {
+        return callGroq_(apiKey, primaryModel, messages, Object.assign({}, runtime, {
+          completion_budget: CONFIG.MAX_RECOVERY_OUTPUT_TOKENS,
+          attempt_type: "primary_recovery"
+        }));
+      } catch (recoveryError) {
+        if (recoveryError && (recoveryError.code === "GROQ_COMPLETION_INCOMPLETE" ||
+            recoveryError.code === "GROQ_COMPLETION_NON_NORMAL")) {
+          throw recoveryError;
+        }
+        return callGroqFallback_(apiKey, fallbackModel, primaryModel, messages, recoveryError, runtime);
+      }
     }
 
-    try {
-      recordAiUsageMetrics_({groq_fallback_calls: 1}, runtime.metrics);
-      return callGroq_(apiKey, fallbackModel, messages, runtime);
-    } catch (fallbackError) {
-      throw new Error(
-        "Groq primary failed: " + errorText_(primaryError) +
-        "; fallback failed: " + errorText_(fallbackError)
-      );
-    }
+    return callGroqFallback_(apiKey, fallbackModel, primaryModel, messages, primaryError, runtime);
+  }
+}
+
+function callGroqFallback_(apiKey, fallbackModel, primaryModel, messages, sourceError, options) {
+  const runtime = options || {};
+  const fallbackEligible = sourceError &&
+    (sourceError.retryable === true || sourceError.fallbackEligible === true);
+  if (!fallbackEligible || !fallbackModel || fallbackModel === primaryModel) throw sourceError;
+  try {
+    recordAiUsageMetrics_({groq_fallback_calls: 1}, runtime.metrics);
+    return callGroq_(apiKey, fallbackModel, messages, Object.assign({}, runtime, {
+      completion_budget: CONFIG.MAX_OUTPUT_TOKENS,
+      attempt_type: "fallback"
+    }));
+  } catch (fallbackError) {
+    const combined = new Error(
+      "Groq primary failed: " + errorText_(sourceError) +
+      "; fallback failed: " + errorText_(fallbackError)
+    );
+    combined.code = fallbackError && fallbackError.code ? fallbackError.code : "GROQ_FALLBACK_FAILED";
+    throw combined;
   }
 }
 
@@ -378,6 +404,10 @@ function recordAiUsageMetrics_(increments, options) {
 
 function callGroq_(apiKey, model, messages, options) {
   const runtime = options || {};
+  const requestedBudget = Math.floor(Number(runtime.completion_budget) || CONFIG.MAX_OUTPUT_TOKENS);
+  const completionBudget = Math.min(CONFIG.MAX_RECOVERY_OUTPUT_TOKENS,
+    Math.max(1, requestedBudget));
+  const attemptType = String(runtime.attempt_type || "primary");
   recordAiUsageMetrics_({groq_calls: 1}, runtime.metrics);
   let response;
   try {
@@ -396,7 +426,7 @@ function callGroq_(apiKey, model, messages, options) {
           model: model,
           messages: messages,
           temperature: 0.35,
-          max_completion_tokens: Math.min(CONFIG.MAX_OUTPUT_TOKENS, 300),
+          max_completion_tokens: completionBudget,
           top_p: 0.9,
           stream: false
         }),
@@ -436,29 +466,60 @@ function callGroq_(apiKey, model, messages, options) {
     throw httpError;
   }
 
-  const text = data && data.choices && data.choices[0] &&
-    data.choices[0].message && data.choices[0].message.content;
+  const choice = data && data.choices && data.choices[0] ? data.choices[0] : {};
+  const text = choice.message && choice.message.content;
+  const usage = data && data.usage ? data.usage : {};
+  const finishReason = choice.finish_reason == null ? "" : String(choice.finish_reason).trim().toLowerCase();
+  const completionTokens = Number.isFinite(Number(usage.completion_tokens))
+    ? Math.max(0, Math.floor(Number(usage.completion_tokens))) : null;
+  const totalTokens = Number.isFinite(Number(usage.total_tokens))
+    ? Math.max(0, Math.floor(Number(usage.total_tokens))) : null;
+  const assistantCharacterCount = text == null ? 0 : String(text).length;
 
   if (!text || !String(text).trim()) {
-    const choice = data && data.choices && data.choices[0] ? data.choices[0] : {};
-    const usage = data && data.usage ? data.usage : {};
-    const finishReason = choice.finish_reason == null ? "unavailable" : String(choice.finish_reason);
-    const totalTokens = Number.isFinite(Number(usage.total_tokens))
-      ? Math.max(0, Math.floor(Number(usage.total_tokens)))
-      : "unavailable";
-    const completionTokens = Number.isFinite(Number(usage.completion_tokens))
-      ? Math.max(0, Math.floor(Number(usage.completion_tokens)))
-      : "unavailable";
+    recordGroqCompletionDiagnostic_(runtime, model, attemptType, finishReason || "unavailable",
+      completionTokens, totalTokens, assistantCharacterCount, "EMPTY_COMPLETION");
     const emptyCompletionError = new Error(
       "Groq returned an empty completion" +
-      "; finish_reason=" + limitText_(finishReason, 80) +
-      "; usage.total_tokens=" + totalTokens +
-      "; usage.completion_tokens=" + completionTokens
+      "; finish_reason=" + limitText_(finishReason || "unavailable", 80) +
+      "; usage.total_tokens=" + (totalTokens == null ? "unavailable" : totalTokens) +
+      "; usage.completion_tokens=" + (completionTokens == null ? "unavailable" : completionTokens)
     );
+    emptyCompletionError.code = finishReason === "length" && attemptType !== "primary"
+      ? "GROQ_COMPLETION_INCOMPLETE" : "GROQ_EMPTY_COMPLETION";
+    emptyCompletionError.finishReason = finishReason;
+    emptyCompletionError.nonEmpty = false;
     emptyCompletionError.retryable = false;
-    emptyCompletionError.fallbackEligible = true;
+    emptyCompletionError.fallbackEligible = emptyCompletionError.code === "GROQ_EMPTY_COMPLETION";
     throw emptyCompletionError;
   }
+
+  if (finishReason === "length") {
+    recordGroqCompletionDiagnostic_(runtime, model, attemptType, finishReason,
+      completionTokens, totalTokens, assistantCharacterCount, "INCOMPLETE_LENGTH");
+    const incompleteError = new Error("GROQ_COMPLETION_INCOMPLETE");
+    incompleteError.code = "GROQ_COMPLETION_INCOMPLETE";
+    incompleteError.finishReason = finishReason;
+    incompleteError.nonEmpty = true;
+    incompleteError.retryable = false;
+    incompleteError.fallbackEligible = false;
+    throw incompleteError;
+  }
+
+  if (finishReason && finishReason !== "stop") {
+    recordGroqCompletionDiagnostic_(runtime, model, attemptType, finishReason,
+      completionTokens, totalTokens, assistantCharacterCount, "NON_NORMAL_FINISH");
+    const finishError = new Error("GROQ_COMPLETION_NON_NORMAL");
+    finishError.code = "GROQ_COMPLETION_NON_NORMAL";
+    finishError.finishReason = finishReason;
+    finishError.nonEmpty = true;
+    finishError.retryable = false;
+    finishError.fallbackEligible = true;
+    throw finishError;
+  }
+
+  recordGroqCompletionDiagnostic_(runtime, model, attemptType, finishReason || "unavailable",
+    completionTokens, totalTokens, assistantCharacterCount, "COMPLETE");
 
   if (typeof runtime.record_usage === "function") {
     runtime.record_usage(model, data.usage || {});
@@ -466,6 +527,26 @@ function callGroq_(apiKey, model, messages, options) {
     recordGroqUsage_(model, data.usage || {});
   }
   return { text: String(text).trim(), model: model };
+}
+
+function recordGroqCompletionDiagnostic_(runtime, model, attemptType, finishReason,
+    completionTokens, totalTokens, assistantCharacterCount, outcomeCode) {
+  const diagnostic = {
+    model: String(model || ""),
+    attempt_type: String(attemptType || ""),
+    finish_reason: String(finishReason || "unavailable"),
+    completion_tokens: completionTokens == null ? "unavailable" : completionTokens,
+    total_tokens: totalTokens == null ? "unavailable" : totalTokens,
+    assistant_character_count: Math.max(0, Math.floor(Number(assistantCharacterCount) || 0)),
+    recovery_used: String(attemptType || "") === "primary_recovery",
+    outcome_code: String(outcomeCode || "UNKNOWN")
+  };
+  if (runtime && typeof runtime.completion_diagnostic === "function") {
+    runtime.completion_diagnostic(diagnostic);
+  } else {
+    console.log("Groq completion diagnostic: " + JSON.stringify(diagnostic));
+  }
+  return diagnostic;
 }
 
 function buildGroqMessages_(context, userText, nutritionTodayBlock) {

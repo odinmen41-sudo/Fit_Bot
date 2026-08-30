@@ -128,6 +128,14 @@ function doPost(e) {
       return httpOk_("OK");
     }
 
+    const nutritionReplace = routeNutritionMealReplace_(update);
+    if (nutritionReplace.handled) {
+      sendTelegramMessage_(chatId, nutritionReplace.message);
+      logAiReply_(messageText, nutritionReplace.message, "nutrition_meal_replace");
+      markBotInputProcessed_(inputRow, nutritionReplace.ok ? "Да" : "Ошибка nutrition replace");
+      return httpOk_("OK");
+    }
+
     const nutritionVoid = routeNutritionMealVoid_(update);
     if (nutritionVoid.handled) {
       sendTelegramMessage_(chatId, nutritionVoid.message);
@@ -3425,6 +3433,197 @@ function resolveNutritionTarget_(userId, textOrQuerySpec, options) {
   }
   return resolved;
 }
+
+const C232D4_REPLACE_CAPTURE_SOURCE = "C232D4_NUTRITION_REPLACE";
+
+function nutritionReplaceResult_(ok, code, meal, extra) {
+  return Object.assign({ok:ok === true, code:String(code || ""), meal:meal || null, written:false,
+    rows_written:0, idempotent_replay:false, nutrition_log_writes:0, groq_calls:0, production_writes:false}, extra || {});
+}
+
+function nutritionReplaceFlowResult_(handled, ok, code, extra) {
+  return Object.assign({handled:handled === true, ok:ok === true, code:String(code || ""),
+    nutrition_log_writes:0, pending_capture_writes:0, groq_calls:0, production_writes:false}, extra || {});
+}
+
+function normalizeNutritionReplacementItems_(items) {
+  return (items || []).map(function(item, index) { const copy=JSON.parse(JSON.stringify(item)); copy.item_index=index; return copy; });
+}
+
+function nutritionReplacementTotals_(items) {
+  const totals={calories:0,protein:0,fat:0,carbs:0};
+  (items || []).forEach(function(item) { Object.keys(totals).forEach(function(key) {
+    totals[key]=nutritionRoundInternal_(totals[key]+Number(item["calculated_"+key])); }); });
+  return totals;
+}
+
+function nutritionReplacementSemantic_(items) {
+  return JSON.stringify((items || []).map(function(item) { return {
+    item_index:Number(item.item_index),food_id:String(item.food_id),preparation_state:String(item.preparation_state),
+    nutrition_reference_id:String(item.nutrition_reference_id),quantity_value:Number(item.quantity_value),
+    quantity_unit:String(item.quantity_unit),calculated_calories:Number(item.calculated_calories),
+    calculated_protein:Number(item.calculated_protein),calculated_fat:Number(item.calculated_fat),
+    calculated_carbs:Number(item.calculated_carbs)}; }));
+}
+
+function recalculateFrozenNutritionItem_(item, quantity) {
+  const value=Number(quantity), basis=Number(item && item.reference_basis_quantity);
+  if (!isFinite(value) || value <= 0 || !isFinite(basis) || basis <= 0) return {ok:false,code:"INVALID_QUANTITY"};
+  if (["g","ml","count"].indexOf(String(item.quantity_unit || "")) < 0) return {ok:false,code:"UNSUPPORTED_NUTRITION_UNIT"};
+  const copy=JSON.parse(JSON.stringify(item)), factor=value/basis;
+  copy.quantity_value=value;
+  ["calories","protein","fat","carbs"].forEach(function(key) {
+    copy["calculated_"+key]=nutritionRoundInternal_(Number(copy["reference_"+key])*factor); });
+  return {ok:true,item:copy};
+}
+
+function buildQuantityNutritionReplacement_(resolution, quantity, requestedUnit) {
+  if (!resolution || resolution.status !== "RESOLVED_ITEM") return {ok:false,code:"ITEM_TARGET_REQUIRED"};
+  const target=resolution.resolved_target, meal=target.meal_target, selector=target.item_selector;
+  const matches=meal.items.filter(function(item) { return Number(item.item_index)===Number(selector.item_index) &&
+    nutritionItemFingerprint_(item)===String(selector.item_fingerprint); });
+  if (matches.length !== 1) return {ok:false,code:"ITEM_IDENTITY_INVALID"};
+  const normalizedUnit={"г":"g","гр":"g","мл":"ml","шт":"count"}[String(requestedUnit || "").toLowerCase()];
+  if (requestedUnit && normalizedUnit !== String(matches[0].quantity_unit)) return {ok:false,code:"NUTRITION_UNIT_MISMATCH"};
+  const rebuilt=recalculateFrozenNutritionItem_(matches[0],quantity); if(!rebuilt.ok)return rebuilt;
+  const items=normalizeNutritionReplacementItems_(meal.items.map(function(item) {
+    return Number(item.item_index)===Number(selector.item_index)?rebuilt.item:JSON.parse(JSON.stringify(item)); }));
+  return {ok:true,code:"REPLACEMENT_BUILT",old_target:meal,new_snapshot:{meal_at:meal.meal_at,items:items,totals:nutritionReplacementTotals_(items)}};
+}
+
+function buildSubstitutionNutritionReplacement_(resolution, replacementCapture) {
+  if (!resolution || resolution.status !== "RESOLVED_ITEM") return {ok:false,code:"ITEM_TARGET_REQUIRED"};
+  if (!replacementCapture || !Array.isArray(replacementCapture.items) || replacementCapture.items.length !== 1 ||
+      !replacementCapture.nutrition_calculation) return {ok:false,code:"INVALID_REPLACEMENT"};
+  const newItems=buildNutritionPersistenceItems_(replacementCapture);
+  const target=resolution.resolved_target, meal=target.meal_target, selector=target.item_selector;
+  const matches=meal.items.filter(function(item){return Number(item.item_index)===Number(selector.item_index)&&
+    nutritionItemFingerprint_(item)===String(selector.item_fingerprint);});
+  if(matches.length!==1)return {ok:false,code:"ITEM_IDENTITY_INVALID"};
+  const items=normalizeNutritionReplacementItems_(meal.items.map(function(item){return Number(item.item_index)===Number(selector.item_index)?newItems[0]:JSON.parse(JSON.stringify(item));}));
+  return {ok:true,code:"REPLACEMENT_BUILT",old_target:meal,new_snapshot:{meal_at:meal.meal_at,items:items,totals:nutritionReplacementTotals_(items)}};
+}
+
+function buildWholeNutritionReplacement_(resolution, replacementCapture) {
+  if (!resolution || resolution.status !== "RESOLVED_MEAL") return {ok:false,code:"MEAL_TARGET_REQUIRED"};
+  if (!replacementCapture || !Array.isArray(replacementCapture.items) || !replacementCapture.items.length ||
+      !replacementCapture.nutrition_calculation) return {ok:false,code:"INVALID_REPLACEMENT"};
+  const items=normalizeNutritionReplacementItems_(buildNutritionPersistenceItems_(replacementCapture));
+  return {ok:true,code:"REPLACEMENT_BUILT",old_target:resolution.resolved_target,
+    new_snapshot:{meal_at:resolution.resolved_target.meal_at,items:items,totals:nutritionReplacementTotals_(items)}};
+}
+
+function validateFrozenNutritionReplacement_(proposal) {
+  if(!proposal||!validateNutritionFrozenMeal_(proposal.old_target).ok||!proposal.new_snapshot||
+      !Array.isArray(proposal.new_snapshot.items)||!proposal.new_snapshot.items.length)return {ok:false,code:"INVALID_REPLACEMENT"};
+  if(!validateNutritionTargetableMeals_([{items:proposal.new_snapshot.items}]).ok)return {ok:false,code:"INVALID_REPLACEMENT"};
+  const totals=nutritionReplacementTotals_(proposal.new_snapshot.items);
+  if(JSON.stringify(totals)!==JSON.stringify(proposal.new_snapshot.totals))return {ok:false,code:"INVALID_REPLACEMENT_TOTALS"};
+  return {ok:true};
+}
+
+function buildNutritionReplaceRecord_(proposal, captureId, confirmedAt, options) {
+  const old=proposal.old_target, items=normalizeNutritionReplacementItems_(proposal.new_snapshot.items),
+    totals=nutritionReplacementTotals_(items), timestamp=(confirmedAt instanceof Date?confirmedAt:new Date(confirmedAt)).toISOString();
+  const canonical={capture_id:String(captureId),user_id:String(old.user_id),operation_type:"REPLACE",
+    logical_meal_id:String(old.logical_meal_id),replaces_meal_id:String(old.effective_meal_id),revision:Number(old.revision)+1,items:items,totals:totals};
+  return {schema_version:C232D1_NUTRITION_LIFECYCLE_SCHEMA_VERSION,meal_id:nutritionMealId_(captureId),capture_id:String(captureId),
+    user_id:String(old.user_id),meal_at:new Date(old.meal_at).toISOString(),confirmed_at:timestamp,items_count:items.length,
+    calories_total:totals.calories,protein_total:totals.protein,fat_total:totals.fat,carbs_total:totals.carbs,
+    items_json:JSON.stringify(items),snapshot_hash:nutritionSnapshotHash_(canonical,options||{}),transaction_status:"PREPARING",
+    source:"C232D4_NUTRITION_REPLACE",created_at:timestamp,updated_at:timestamp,operation_type:"REPLACE",
+    logical_meal_id:String(old.logical_meal_id),replaces_meal_id:String(old.effective_meal_id),revision:Number(old.revision)+1};
+}
+
+function replaceNutritionMeal_(userId, proposal, options) {
+  const runtime=options||{}, checked=validateFrozenNutritionReplacement_(proposal);
+  if(!checked.ok)return nutritionReplaceResult_(false,checked.code,null);
+  const old=proposal.old_target,captureId=String(runtime.capture_id||runtime.action_id||"");
+  if(String(old.user_id)!==String(userId))return nutritionReplaceResult_(false,"OWNER_MISMATCH",null);
+  if(!captureId)return nutritionReplaceResult_(false,"ACTION_ID_REQUIRED",null);
+  if(nutritionReplacementSemantic_(old.items)===nutritionReplacementSemantic_(proposal.new_snapshot.items))return nutritionReplaceResult_(false,"NO_CHANGE",null);
+  if(runtime.persistence_enabled!==true&&!nutritionPersistenceEnabled_(runtime))return nutritionReplaceResult_(false,"PERSISTENCE_DISABLED",null);
+  const now=runtime.now instanceof Date?runtime.now:new Date(),io=runtime.io||nutritionVoidRealIo_(),lock=runtime.lock||LockService.getScriptLock();
+  if(!lock.tryLock(5000))return nutritionReplaceResult_(false,"LOCK_TIMEOUT",null);
+  let meal=null;
+  try {
+    const matches=io.find_meals(captureId); if(matches.length>1)return nutritionReplaceResult_(false,"REPLACE_PERSISTENCE_CONFLICT",null);
+    let row=matches.length?matches[0].row_number:null,existing=matches.length?matches[0].record:null;
+    meal=buildNutritionReplaceRecord_(proposal,captureId,now,runtime);
+    if(existing){meal.created_at=existing.created_at;meal.updated_at=existing.updated_at;
+      if(String(existing.snapshot_hash)!==meal.snapshot_hash||String(existing.meal_id)!==meal.meal_id||String(existing.operation_type)!=="REPLACE")return nutritionReplaceResult_(false,"REPLACE_PERSISTENCE_CONFLICT",meal);
+      if(String(existing.transaction_status)==="COMMITTED"){meal.transaction_status="COMMITTED";return nutritionPersistenceRecordsEqual_(existing,meal,"COMMITTED")?
+        nutritionReplaceResult_(true,"REPLACE_ALREADY_COMMITTED",meal,{idempotent_replay:true}):nutritionReplaceResult_(false,"REPLACE_PERSISTENCE_CONFLICT",meal);}}
+    const current=nutritionVoidCurrentState_(userId,old.logical_meal_id,io);
+    if(!current.ok)return nutritionReplaceResult_(false,current.code,meal);
+    if(current.status==="VOIDED")return nutritionReplaceResult_(false,"MEAL_ALREADY_VOIDED",meal);
+    if(current.status!=="ACTIVE")return nutritionReplaceResult_(false,"MEAL_NOT_FOUND",meal);
+    if(!nutritionVoidTargetMatches_(old,current.meal))return nutritionReplaceResult_(false,"STALE_TARGET_CONFLICT",meal);
+    if(!row)row=io.append_meal(meal);else io.write_meal(row,meal);
+    const preparing=io.read_meal(row);if(!nutritionPersistenceRecordsEqual_(preparing,meal,"PREPARING"))return nutritionReplaceResult_(false,"REPLACE_PREPARING_VERIFY_FAILED",meal);
+    meal.transaction_status="COMMITTED";meal.updated_at=now.toISOString();io.write_meal(row,meal);
+    const committed=io.read_meal(row);if(!nutritionPersistenceRecordsEqual_(committed,meal,"COMMITTED"))return nutritionReplaceResult_(false,"REPLACE_COMMIT_VERIFY_FAILED",meal);
+    return nutritionReplaceResult_(true,"MEAL_REPLACED",meal,{written:true,rows_written:1,nutrition_log_writes:1});
+  }catch(error){return nutritionReplaceResult_(false,"REPLACE_PERSISTENCE_FAILED",meal,{error:String(error)});}finally{try{lock.releaseLock();}catch(ignored){}}
+}
+
+function detectNutritionMealReplaceIntent_(text) {
+  const normalized=String(text||"").toLowerCase().replace(/ё/g,"е").replace(/\s+/g," ").trim();let match;
+  match=normalized.match(/^замени\s+последний\s+прием\s+пищи\s+на\s+(.+)$/);
+  if(match)return {kind:"WHOLE",target_text:"последний прием пищи",replacement_text:match[1]};
+  match=normalized.match(/^замени\s+(.+?)\s+на\s+(.+)$/);
+  if(match)return {kind:"SUBSTITUTE",target_text:match[1].replace(/\s+\d+(?:[.,]\d+)?\s*(?:г|гр|мл|шт)\s*$/,""),replacement_text:match[2]};
+  match=normalized.match(/^исправь\s+(.+?)\s+на\s+(\d+(?:[.,]\d+)?)\s*(г|гр|мл|шт)$/);
+  if(match)return {kind:"QUANTITY",target_text:match[1],quantity:Number(match[2].replace(",",".")),unit:match[3]};
+  match=normalized.match(/^в\s+(.+?)\s+было\s+(\d+(?:[.,]\d+)?)\s*(г|гр|мл|шт),?\s+а\s+не\s+\d+(?:[.,]\d+)?(?:\s*(?:г|гр|мл|шт))?$/);
+  if(match)return {kind:"QUANTITY",target_text:match[1],quantity:Number(match[2].replace(",",".")),unit:match[3]};
+  match=normalized.match(/^(.+?)\s+был(?:о|а)?\s+(\d+(?:[.,]\d+)?)\s*(г|гр|мл|шт)$/);
+  return match?{kind:"QUANTITY",target_text:match[1],quantity:Number(match[2].replace(",",".")),unit:match[3]}:null;
+}
+
+function nutritionReplacementCaptureFromText_(text, options) {
+  const detection=detectDomainFactCandidate_(text,options||{});
+  return detection&&detection.domain==="NUTRITION"&&detection.calculation_status==="CALCULATED"?
+    buildDomainFactCandidate_(detection,{now:new Date(),user_id:"replace",uuid:"replace-builder"}):null;
+}
+
+function formatNutritionReplacePrompt_(proposal) {
+  const old=proposal.old_target,newSnapshot=proposal.new_snapshot;
+  const oldNames=old.items.map(function(i){return i.food_display+" "+i.quantity_value+" "+({g:"г",ml:"мл",count:"шт"}[i.quantity_unit]||i.quantity_unit);}).join(", ");
+  const newNames=newSnapshot.items.map(function(i){return i.food_display+" "+i.quantity_value+" "+({g:"г",ml:"мл",count:"шт"}[i.quantity_unit]||i.quantity_unit);}).join(", ");
+  return "Исправить:\n"+oldNames+" → "+newNames+"\n"+dailyNutritionNumber_(old.totals.calories,1)+" ккал → "+dailyNutritionNumber_(newSnapshot.totals.calories,1)+" ккал\nСохранить? Да / Нет";
+}
+
+function nutritionReplaceDependencies_(injected){return injected||{detect_confirmation:detectConfirmationIntent_,find_capture:findNutritionReplaceCapture_,
+  find_conflict:getPendingCapture_,resolve_target:resolveNutritionTarget_,build_capture:nutritionReplacementCaptureFromText_,create_capture:createPendingCapture_,
+  cancel_capture:cancelPendingCapture_,execute_replace:replaceNutritionMeal_,finalize_capture:finalizeNutritionReplaceCapture_,load_summary:loadDailyNutritionSummary_,uuid:function(){return Utilities.getUuid();}};}
+
+function routeNutritionMealReplace_(update,options){
+  const runtime=options||{},message=update&&(update.message||update.edited_message);if(!message||typeof message.text!=="string")return nutritionReplaceFlowResult_(false,true,"NOT_REPLACE");
+  const userId=String(message.from&&message.from.id||""),chatId=String(message.chat&&message.chat.id||"");if(!userId||!chatId)return nutritionReplaceFlowResult_(false,true,"NOT_REPLACE");
+  const deps=nutritionReplaceDependencies_(runtime.dependencies),now=runtime.now instanceof Date?runtime.now:new Date(),confirmation=deps.detect_confirmation(message.text);
+  if(confirmation&&["CONFIRM","CANCEL"].indexOf(confirmation.intent)>=0){const selected=deps.find_capture(userId,chatId,{now:now,include_saved:confirmation.intent==="CONFIRM"});
+    if(!selected||selected.ok!==true)return nutritionReplaceFlowResult_(false,true,"NO_REPLACE_CAPTURE");
+    if(String(selected.capture.user_id)!==userId||String(selected.capture.chat_id)!==chatId)return nutritionReplaceFlowResult_(true,false,"OWNER_MISMATCH",{message:"Это подтверждение принадлежит другому пользователю или чату."});
+    if(confirmation.intent==="CANCEL"){const cancelled=deps.cancel_capture(userId,chatId,{now:now});return nutritionReplaceFlowResult_(true,!!(cancelled&&cancelled.ok),String(cancelled&&cancelled.code||"CANCEL_FAILED"),{message:cancelled&&cancelled.ok?"Исправление отменено.":"Не удалось отменить исправление."});}
+    const mutation=deps.execute_replace(userId,selected.payload.proposal,{now:now,capture_id:selected.capture.capture_id});
+    if(!mutation||mutation.ok!==true)return nutritionReplaceFlowResult_(true,false,String(mutation&&mutation.code||"REPLACE_FAILED"),{message:mutation&&mutation.code==="NO_CHANGE"?"Изменений нет.":(["STALE_TARGET_CONFLICT","MEAL_ALREADY_VOIDED","MEAL_NOT_FOUND"].indexOf(mutation&&mutation.code)>=0?"Приём пищи изменился. Повторите исправление.":"Не удалось сохранить исправление. Ничего не изменено.")});
+    deps.finalize_capture(selected.capture,mutation,now);const summary=deps.load_summary(userId,{now:now});
+    return nutritionReplaceFlowResult_(true,true,mutation.code,{nutrition_log_writes:Number(mutation.nutrition_log_writes||0),message:"Исправлено.\n"+(summary&&summary.ok?(summary.meals_count?"Сегодня съедено: "+dailyNutritionNumber_(summary.consumed.calories,1)+" ккал | Б "+dailyNutritionNumber_(summary.consumed.protein,1)+" г | Ж "+dailyNutritionNumber_(summary.consumed.fat,1)+" г | У "+dailyNutritionNumber_(summary.consumed.carbs,1)+" г.":"Сегодня пока нет сохранённых записей о питании."):"Не удалось прочитать итог питания за сегодня.")});}
+  const intent=detectNutritionMealReplaceIntent_(message.text);if(!intent)return nutritionReplaceFlowResult_(false,true,"NOT_REPLACE");
+  const conflict=deps.find_conflict(userId,chatId,{now:now});if(conflict&&conflict.ok===true)return nutritionReplaceFlowResult_(true,false,"ACTIVE_CAPTURE_EXISTS",{message:"Сначала завершите или отмените текущее подтверждение данных."});
+  const resolution=deps.resolve_target(userId,intent.target_text,runtime.target_options||{});if(!resolution||resolution.ok!==true)return nutritionReplaceFlowResult_(true,false,String(resolution&&resolution.status||"TARGET_FAILED"),{message:nutritionVoidFailureMessage_(resolution&&resolution.status)});
+  let proposal;if(intent.kind==="QUANTITY")proposal=buildQuantityNutritionReplacement_(resolution,intent.quantity,intent.unit);else{const capture=deps.build_capture(intent.replacement_text,runtime.reference_options||{});proposal=intent.kind==="WHOLE"?buildWholeNutritionReplacement_(resolution,capture):buildSubstitutionNutritionReplacement_(resolution,capture);}
+  if(!proposal||proposal.ok!==true)return nutritionReplaceFlowResult_(true,false,String(proposal&&proposal.code||"INVALID_REPLACEMENT"),{message:"Уточните продукт, способ приготовления и количество."});
+  if(nutritionReplacementSemantic_(proposal.old_target.items)===nutritionReplacementSemantic_(proposal.new_snapshot.items))return nutritionReplaceFlowResult_(true,true,"NO_CHANGE",{message:"Изменений нет."});
+  const actionId="replace-"+String(update&&update.update_id||deps.uuid()),payload={schema_version:"c232d4-telegram-replace-v1",source:C232D4_REPLACE_CAPTURE_SOURCE,capture_id:actionId,user_id:userId,chat_id:chatId,raw_message:"",proposal:proposal,items:[{category:"NUTRITION_REPLACE",fields:{action:{value:"REPLACE"}}}]};
+  const created=deps.create_capture(payload,{now:now,ttl_minutes:30,capture_id:actionId,user_id:userId,chat_id:chatId,source_update_id:update&&update.update_id,validation:{ready_for_confirmation:true,errors:[]}});
+  if(!created||created.ok!==true)return nutritionReplaceFlowResult_(true,false,String(created&&created.code||"CAPTURE_CREATE_FAILED"),{message:"Не удалось подготовить исправление."});
+  return nutritionReplaceFlowResult_(true,true,"REPLACE_CONFIRMATION_REQUESTED",{pending_capture_writes:created.created===false?0:1,message:formatNutritionReplacePrompt_(proposal)});
+}
+
+function findNutritionReplaceCapture_(userId,chatId,options){const runtime=options||{},now=runtime.now instanceof Date?runtime.now:new Date();try{const rows=smartConfirmationReadRows_(smartConfirmationSheet_()).filter(function(row){const payload=smartConfirmationParseJson_(row.payload_json,{});return String(row.user_id)===String(userId)&&String(row.chat_id)===String(chatId)&&payload.source===C232D4_REPLACE_CAPTURE_SOURCE;}).sort(smartConfirmationNewestFirst_);const pending=rows.filter(function(row){return row.status===SMART_CONFIRMATION_CONFIG.STATUSES.PENDING;})[0];if(pending)return smartConfirmationDate_(pending.expires_at).getTime()<=now.getTime()?{ok:false,code:"CAPTURE_EXPIRED"}:{ok:true,capture:pending,payload:smartConfirmationParseJson_(pending.payload_json,{})};if(runtime.include_saved){const saved=rows.filter(function(row){return row.status===SMART_CONFIRMATION_CONFIG.STATUSES.SAVED;})[0];if(saved)return {ok:true,capture:saved,payload:smartConfirmationParseJson_(saved.payload_json,{})};}return {ok:false,code:"NO_REPLACE_CAPTURE"};}catch(error){return {ok:false,code:"CAPTURE_LOOKUP_FAILED"};}}
+function finalizeNutritionReplaceCapture_(capture,mutation,now){smartConfirmationUpdateState_(smartConfirmationSheet_(),capture.row_number,SMART_CONFIRMATION_CONFIG.STATUSES.SAVED,JSON.stringify({operation:"REPLACE",result:mutation.code}),now,"");SpreadsheetApp.flush();return true;}
 
 const C232D31_VOID_CAPTURE_SOURCE = "C232D31_NUTRITION_VOID";
 

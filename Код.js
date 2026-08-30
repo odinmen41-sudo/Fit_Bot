@@ -128,6 +128,14 @@ function doPost(e) {
       return httpOk_("OK");
     }
 
+    const nutritionVoid = routeNutritionMealVoid_(update);
+    if (nutritionVoid.handled) {
+      sendTelegramMessage_(chatId, nutritionVoid.message);
+      logAiReply_(messageText, nutritionVoid.message, "nutrition_meal_void");
+      markBotInputProcessed_(inputRow, nutritionVoid.ok ? "Да" : "Ошибка nutrition void");
+      return httpOk_("OK");
+    }
+
     const weightFact = routeWeightFactConfirmation_(update);
     if (weightFact.handled) {
       sendTelegramMessage_(chatId, weightFact.message);
@@ -3416,6 +3424,154 @@ function resolveNutritionTarget_(userId, textOrQuerySpec, options) {
       runtime.candidate_format_options || {});
   }
   return resolved;
+}
+
+const C232D31_VOID_CAPTURE_SOURCE = "C232D31_NUTRITION_VOID";
+
+function detectNutritionMealVoidIntent_(text) {
+  const normalized = String(text || "").toLowerCase().replace(/ё/g, "е")
+    .replace(/[!?.,;:]+$/g, "").replace(/\s+/g, " ").trim();
+  const matched = normalized.match(/^(?:удали|удалить|отмени|отменить)\s+(.+)$/);
+  if (!matched) return null;
+  return {target_text: matched[1].trim(), normalized: normalized};
+}
+
+function nutritionVoidFlowResult_(handled, ok, code, extra) {
+  return Object.assign({handled: handled === true, ok: ok === true, code: String(code || ""),
+    nutrition_log_writes: 0, pending_capture_writes: 0, groq_calls: 0, production_writes: false}, extra || {});
+}
+
+function nutritionVoidFlowDependencies_(injected) {
+  if (injected) return injected;
+  return {
+    detect_confirmation: detectConfirmationIntent_, resolve_target: resolveNutritionTarget_,
+    find_capture: findNutritionVoidCapture_, find_conflict: getPendingCapture_,
+    create_capture: createNutritionVoidCapture_, cancel_capture: cancelPendingCapture_,
+    execute_void: voidNutritionMeal_, finalize_capture: finalizeNutritionVoidCapture_,
+    load_summary: loadDailyNutritionSummary_, uuid: function() { return Utilities.getUuid(); }
+  };
+}
+
+function nutritionVoidMealTarget_(resolution) {
+  const target = resolution && resolution.resolved_target;
+  return target && target.target_scope === "ITEM" ? target.meal_target : target;
+}
+
+function formatNutritionVoidMeal_(resolution, options) {
+  const meal = nutritionVoidMealTarget_(resolution);
+  if (!meal) return "приём пищи";
+  const descriptors = formatNutritionTargetCandidates_([{meal: meal}], options || {});
+  const descriptor = descriptors[0] || {};
+  return String(descriptor.date_label || "") + " " + String(descriptor.local_time || "") + " — " +
+    String(descriptor.items_summary || "приём пищи") + " — " +
+    dailyNutritionNumber_(meal.totals && meal.totals.calories || 0, 0) + " ккал";
+}
+
+function nutritionVoidFailureMessage_(status) {
+  if (status === "NOT_FOUND") return "Не нашёл подходящий приём пищи.";
+  if (status === "UNSUPPORTED_QUERY") return "Не могу однозначно определить, какой приём пищи нужно удалить.";
+  if (status === "DATA_INTEGRITY_ERROR") return "Не удалось безопасно определить запись. Ничего не удалено.";
+  if (status === "AMBIGUOUS_MEAL" || status === "AMBIGUOUS_ITEM") {
+    return "Нашлось несколько подходящих записей. Уточните продукт или время и повторите команду.";
+  }
+  return "Не удалось безопасно определить запись. Ничего не удалено.";
+}
+
+function buildNutritionVoidCapture_(userId, chatId, resolution, updateId, now, actionId, display) {
+  return {schema_version:"c232d31-telegram-void-v1", source:C232D31_VOID_CAPTURE_SOURCE,
+    capture_id:String(actionId), created_at:now.toISOString(), raw_message:"", user_id:String(userId),
+    chat_id:String(chatId), source_update_id:String(updateId || ""), display_summary:String(display || ""),
+    resolved_target:JSON.parse(JSON.stringify(resolution.resolved_target)),
+    items:[{category:"NUTRITION_VOID", fields:{action:{value:"VOID", source:"EXPLICIT_USER_INPUT"}}}]};
+}
+
+function routeNutritionMealVoid_(update, options) {
+  const runtime = options || {};
+  const message = update && (update.message || update.edited_message);
+  if (!message || typeof message.text !== "string") return nutritionVoidFlowResult_(false, true, "NOT_VOID");
+  const userId = String(message.from && message.from.id || "");
+  const chatId = String(message.chat && message.chat.id || "");
+  if (!userId || !chatId) return nutritionVoidFlowResult_(false, true, "NOT_VOID");
+  const dependencies = nutritionVoidFlowDependencies_(runtime.dependencies);
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  const confirmation = dependencies.detect_confirmation(message.text);
+  if (confirmation && ["CONFIRM", "CANCEL"].indexOf(confirmation.intent) >= 0) {
+    const selected = dependencies.find_capture(userId, chatId, {now:now, include_saved:confirmation.intent === "CONFIRM"});
+    if (selected && selected.ok === true) {
+      if (String(selected.capture.user_id) !== userId || String(selected.capture.chat_id) !== chatId) {
+        return nutritionVoidFlowResult_(true, false, "OWNER_MISMATCH", {message:"Это подтверждение принадлежит другому пользователю или чату."});
+      }
+      if (confirmation.intent === "CANCEL") {
+        const cancelled = dependencies.cancel_capture(userId, chatId, {now:now});
+        return nutritionVoidFlowResult_(true, !!(cancelled && cancelled.ok), String(cancelled && cancelled.code || "CANCEL_FAILED"),
+          {message:cancelled && cancelled.ok ? "Удаление отменено." : "Не удалось отменить удаление."});
+      }
+      const payload = selected.payload;
+      const mutation = dependencies.execute_void(userId, {ok:true, status:payload.resolved_target.target_scope === "ITEM" ? "RESOLVED_ITEM" : "RESOLVED_MEAL",
+        resolved_target:payload.resolved_target}, {now:now, capture_id:selected.capture.capture_id});
+      if (!mutation || mutation.ok !== true) {
+        const stale = mutation && ["STALE_TARGET_CONFLICT", "MEAL_ALREADY_VOIDED", "MEAL_NOT_FOUND"].indexOf(mutation.code) >= 0;
+        return nutritionVoidFlowResult_(true, false, String(mutation && mutation.code || "VOID_FAILED"), {
+          message:stale ? "Приём пищи изменился. Повторите команду удаления." : "Не удалось удалить запись. Ничего не изменено."});
+      }
+      dependencies.finalize_capture(selected.capture, mutation, now);
+      const summary = dependencies.load_summary(userId, {now:now});
+      const summaryText = summary && summary.ok ? (summary.meals_count ?
+        "Сегодня съедено: " + dailyNutritionNumber_(summary.consumed.calories, 1) + " ккал | Б " +
+        dailyNutritionNumber_(summary.consumed.protein, 1) + " г | Ж " + dailyNutritionNumber_(summary.consumed.fat, 1) +
+        " г | У " + dailyNutritionNumber_(summary.consumed.carbs, 1) + " г." : "Сегодня пока нет сохранённых записей о питании.") :
+        "Не удалось прочитать итог питания за сегодня.";
+      return nutritionVoidFlowResult_(true, true, mutation.code, {nutrition_log_writes:Number(mutation.nutrition_log_writes || 0),
+        message:"Удалено.\n" + summaryText, mutation:mutation, summary:summary});
+    }
+    return nutritionVoidFlowResult_(false, true, "NO_VOID_CAPTURE");
+  }
+  const intent = detectNutritionMealVoidIntent_(message.text);
+  if (!intent) return nutritionVoidFlowResult_(false, true, "NOT_VOID");
+  const conflict = dependencies.find_conflict(userId, chatId, {now:now});
+  if (conflict && conflict.ok === true) return nutritionVoidFlowResult_(true, false, "ACTIVE_CAPTURE_EXISTS", {
+    message:"Сначала завершите или отмените текущее подтверждение данных."});
+  const resolution = dependencies.resolve_target(userId, intent.target_text, runtime.target_options || {});
+  if (!resolution || resolution.ok !== true) return nutritionVoidFlowResult_(true, false,
+    String(resolution && resolution.status || "DATA_INTEGRITY_ERROR"), {message:nutritionVoidFailureMessage_(resolution && resolution.status)});
+  const actionId = "void-" + String(update && update.update_id || dependencies.uuid());
+  const display = formatNutritionVoidMeal_(resolution, runtime.candidate_format_options || {});
+  const capture = buildNutritionVoidCapture_(userId, chatId, resolution, update && update.update_id, now, actionId, display);
+  const created = dependencies.create_capture(capture, {now:now, ttl_minutes:30, capture_id:actionId,
+    user_id:userId, chat_id:chatId, source_update_id:update && update.update_id,
+    validation:{ready_for_confirmation:true, errors:[]}});
+  if (!created || created.ok !== true) return nutritionVoidFlowResult_(true, false, String(created && created.code || "CAPTURE_CREATE_FAILED"),
+    {message:"Не удалось безопасно подготовить удаление. Попробуйте позже."});
+  return nutritionVoidFlowResult_(true, true, "VOID_CONFIRMATION_REQUESTED", {capture_id:actionId,
+    pending_capture_writes:created.created === false ? 0 : 1, message:"Удалить приём пищи:\n" + display + "?\nПодтвердите: Да / Нет"});
+}
+
+function findNutritionVoidCapture_(userId, chatId, options) {
+  const runtime = options || {}, now = runtime.now instanceof Date ? runtime.now : new Date();
+  try {
+    const rows = smartConfirmationReadRows_(smartConfirmationSheet_()).filter(function(row) {
+      const payload = smartConfirmationParseJson_(row.payload_json, {});
+      return String(row.user_id) === String(userId) && String(row.chat_id) === String(chatId) &&
+        payload.source === C232D31_VOID_CAPTURE_SOURCE;
+    }).sort(smartConfirmationNewestFirst_);
+    const pending = rows.filter(function(row) { return row.status === SMART_CONFIRMATION_CONFIG.STATUSES.PENDING; })[0];
+    if (pending) return smartConfirmationDate_(pending.expires_at).getTime() <= now.getTime() ?
+      {ok:false, code:"CAPTURE_EXPIRED"} : {ok:true, capture:pending, payload:smartConfirmationParseJson_(pending.payload_json,{})};
+    if (runtime.include_saved) {
+      const saved = rows.filter(function(row) { return row.status === SMART_CONFIRMATION_CONFIG.STATUSES.SAVED; })[0];
+      if (saved) return {ok:true, capture:saved, payload:smartConfirmationParseJson_(saved.payload_json,{})};
+    }
+    return {ok:false, code:"NO_VOID_CAPTURE"};
+  } catch (error) { return {ok:false, code:"CAPTURE_LOOKUP_FAILED"}; }
+}
+
+function createNutritionVoidCapture_(capture, metadata) { return createPendingCapture_(capture, metadata); }
+
+function finalizeNutritionVoidCapture_(capture, mutation, now) {
+  smartConfirmationUpdateState_(smartConfirmationSheet_(), capture.row_number,
+    SMART_CONFIRMATION_CONFIG.STATUSES.SAVED, JSON.stringify({operation:"VOID", result:mutation.code}), now, "");
+  SpreadsheetApp.flush();
+  return true;
 }
 
 function formatDailyNutritionSummary_(summary) {

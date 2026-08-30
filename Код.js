@@ -2712,14 +2712,6 @@ function findLatestDomainCapture_(userId, chatId, options) {
     })[0];
     if (recovery) return {ok: true, code: "NUTRITION_RECOVERY_CAPTURE", capture: recovery,
       payload: smartConfirmationParseJson_(recovery.payload_json, {})};
-    if (runtime.include_saved === true) {
-      const saved = rows.filter(function(row) {
-        return row.status === SMART_CONFIRMATION_CONFIG.STATUSES.SAVED &&
-          smartConfirmationDate_(row.expires_at).getTime() > now.getTime();
-      })[0];
-      if (saved) return {ok: true, code: "SAVED_CAPTURE", capture: saved,
-        payload: smartConfirmationParseJson_(saved.payload_json, {})};
-    }
     return {ok: false, code: "NO_DOMAIN_CAPTURE"};
   } catch (error) {
     return {ok: false, code: "CAPTURE_LOOKUP_FAILED", error: errorText_(error)};
@@ -3622,7 +3614,7 @@ function routeNutritionMealReplace_(update,options){
   return nutritionReplaceFlowResult_(true,true,"REPLACE_CONFIRMATION_REQUESTED",{pending_capture_writes:created.created===false?0:1,message:formatNutritionReplacePrompt_(proposal)});
 }
 
-function findNutritionReplaceCapture_(userId,chatId,options){const runtime=options||{},now=runtime.now instanceof Date?runtime.now:new Date();try{const rows=smartConfirmationReadRows_(smartConfirmationSheet_()).filter(function(row){const payload=smartConfirmationParseJson_(row.payload_json,{});return String(row.user_id)===String(userId)&&String(row.chat_id)===String(chatId)&&payload.source===C232D4_REPLACE_CAPTURE_SOURCE;}).sort(smartConfirmationNewestFirst_);const pending=rows.filter(function(row){return row.status===SMART_CONFIRMATION_CONFIG.STATUSES.PENDING;})[0];if(pending)return smartConfirmationDate_(pending.expires_at).getTime()<=now.getTime()?{ok:false,code:"CAPTURE_EXPIRED"}:{ok:true,capture:pending,payload:smartConfirmationParseJson_(pending.payload_json,{})};if(runtime.include_saved){const saved=rows.filter(function(row){return row.status===SMART_CONFIRMATION_CONFIG.STATUSES.SAVED;})[0];if(saved)return {ok:true,capture:saved,payload:smartConfirmationParseJson_(saved.payload_json,{})};}return {ok:false,code:"NO_REPLACE_CAPTURE"};}catch(error){return {ok:false,code:"CAPTURE_LOOKUP_FAILED"};}}
+function findNutritionReplaceCapture_(userId,chatId,options){const runtime=options||{},now=runtime.now instanceof Date?runtime.now:new Date();try{const rows=smartConfirmationReadRows_(smartConfirmationSheet_()).filter(function(row){const payload=smartConfirmationParseJson_(row.payload_json,{});return payload.source===C232D4_REPLACE_CAPTURE_SOURCE;});return selectActiveConfirmationCapture_(rows,userId,chatId,now,"NO_REPLACE_CAPTURE");}catch(error){return {ok:false,code:"CAPTURE_LOOKUP_FAILED"};}}
 function finalizeNutritionReplaceCapture_(capture,mutation,now){smartConfirmationUpdateState_(smartConfirmationSheet_(),capture.row_number,SMART_CONFIRMATION_CONFIG.STATUSES.SAVED,JSON.stringify({operation:"REPLACE",result:mutation.code}),now,"");SpreadsheetApp.flush();return true;}
 
 const C232D31_VOID_CAPTURE_SOURCE = "C232D31_NUTRITION_VOID";
@@ -3750,18 +3742,28 @@ function findNutritionVoidCapture_(userId, chatId, options) {
   try {
     const rows = smartConfirmationReadRows_(smartConfirmationSheet_()).filter(function(row) {
       const payload = smartConfirmationParseJson_(row.payload_json, {});
-      return String(row.user_id) === String(userId) && String(row.chat_id) === String(chatId) &&
-        payload.source === C232D31_VOID_CAPTURE_SOURCE;
-    }).sort(smartConfirmationNewestFirst_);
-    const pending = rows.filter(function(row) { return row.status === SMART_CONFIRMATION_CONFIG.STATUSES.PENDING; })[0];
-    if (pending) return smartConfirmationDate_(pending.expires_at).getTime() <= now.getTime() ?
-      {ok:false, code:"CAPTURE_EXPIRED"} : {ok:true, capture:pending, payload:smartConfirmationParseJson_(pending.payload_json,{})};
-    if (runtime.include_saved) {
-      const saved = rows.filter(function(row) { return row.status === SMART_CONFIRMATION_CONFIG.STATUSES.SAVED; })[0];
-      if (saved) return {ok:true, capture:saved, payload:smartConfirmationParseJson_(saved.payload_json,{})};
-    }
-    return {ok:false, code:"NO_VOID_CAPTURE"};
+      return payload.source === C232D31_VOID_CAPTURE_SOURCE;
+    });
+    return selectActiveConfirmationCapture_(rows, userId, chatId, now, "NO_VOID_CAPTURE");
   } catch (error) { return {ok:false, code:"CAPTURE_LOOKUP_FAILED"}; }
+}
+
+function selectActiveConfirmationCapture_(rows, userId, chatId, now, noCaptureCode) {
+  const scoped = (rows || []).filter(function(row) {
+    return String(row.user_id) === String(userId) && String(row.chat_id) === String(chatId);
+  }).sort(smartConfirmationNewestFirst_);
+  const active = scoped.filter(function(row) {
+    return row.status === SMART_CONFIRMATION_CONFIG.STATUSES.PENDING &&
+      smartConfirmationDate_(row.expires_at).getTime() > now.getTime();
+  })[0];
+  if (active) return {ok:true, code:"PENDING_CAPTURE", capture:active,
+    payload:smartConfirmationParseJson_(active.payload_json,{})};
+  const expired = scoped.filter(function(row) {
+    return row.status === SMART_CONFIRMATION_CONFIG.STATUSES.PENDING &&
+      smartConfirmationDate_(row.expires_at).getTime() <= now.getTime();
+  })[0];
+  return expired ? {ok:false, code:"CAPTURE_EXPIRED", capture:expired} :
+    {ok:false, code:String(noCaptureCode || "NO_ACTIVE_CAPTURE")};
 }
 
 function createNutritionVoidCapture_(capture, metadata) { return createPendingCapture_(capture, metadata); }

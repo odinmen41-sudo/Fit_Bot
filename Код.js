@@ -168,6 +168,14 @@ function doPost(e) {
       return httpOk_("OK");
     }
 
+    const workoutPlan = routeWorkoutPlan_(update);
+    if (workoutPlan.handled) {
+      sendTelegramMessage_(chatId, workoutPlan.message);
+      logAiReply_(messageText, workoutPlan.message, "workout_plan");
+      markBotInputProcessed_(inputRow, workoutPlan.ok ? "Да" : "Ошибка workout plan");
+      return httpOk_("OK");
+    }
+
     const nutritionHistory = routeNutritionHistory_(update);
     if (nutritionHistory.handled) {
       sendTelegramMessage_(chatId, nutritionHistory.message);
@@ -3823,6 +3831,131 @@ function nutritionDailyReadDependencies_(overrides) {
       return {headers: values[0] || [], rows: values.slice(1)};
     }
   };
+}
+
+const WORKOUT_PLAN_SCHEMA = Object.freeze([
+  "USER_ID", "TELEGRAM_ID", "WEEKDAY", "SESSION_KEY", "SESSION_NAME", "EXERCISE_KEY",
+  "EXERCISE_NAME", "EXERCISE_ORDER", "PLANNED_SETS", "PLANNED_REPS", "PLANNED_LOAD",
+  "LOAD_UNIT", "NOTES", "ACTIVE"
+]);
+const WORKOUT_PLAN_WEEKDAYS = Object.freeze({
+  MONDAY:1, TUESDAY:2, WEDNESDAY:3, THURSDAY:4, FRIDAY:5, SATURDAY:6, SUNDAY:7
+});
+const WORKOUT_PLAN_WEEKDAY_NAMES = Object.freeze({
+  MONDAY:"понедельник", TUESDAY:"вторник", WEDNESDAY:"среда", THURSDAY:"четверг",
+  FRIDAY:"пятница", SATURDAY:"суббота", SUNDAY:"воскресенье"
+});
+
+function workoutPlanResult_(handled, ok, code, extra) {
+  return Object.assign({handled:handled===true,ok:ok===true,code:String(code||""),groq_calls:0,
+    workout_log_reads:0,ai_memory_reads:0,coach_state_reads:0,sheet_writes:0,production_writes:false},extra||{});
+}
+
+function detectWorkoutPlanIntent_(text) {
+  const normalized=String(text||"").toLowerCase().replace(/ё/g,"е").replace(/[!?.,;:]+/g," ").replace(/\s+/g," ").trim();
+  if(!normalized)return null;
+  if(/^(?:какая|когда)\s+следующая\s+тренировка$/.test(normalized))return {intent:"NEXT_WORKOUT"};
+  if(/^(?:что\s+у\s+меня\s+сегодня\s+по\s+тренировке|какая\s+сегодня\s+тренировка|что\s+сегодня\s+делать\s+в\s+зале|покажи\s+тренировку\s+на\s+сегодня|какие\s+сегодня\s+упражнения|есть\s+ли\s+сегодня\s+тренировка)$/.test(normalized))return {intent:"WORKOUT_TODAY"};
+  return null;
+}
+
+function workoutPlanDependencies_(overrides) {
+  const supplied=overrides||{},daily=nutritionDailyReadDependencies_(supplied);
+  return {time_zone:daily.time_zone,format_date:daily.format_date,read_plan:supplied.read_plan||function(){
+    const sheet=getSpreadsheet_().getSheetByName("Workout_Plan");
+    if(!sheet)return null;
+    const lastRow=sheet.getLastRow();
+    if(lastRow<1)return {headers:[],rows:[]};
+    const values=sheet.getRange(1,1,Math.min(lastRow,500),WORKOUT_PLAN_SCHEMA.length).getDisplayValues();
+    return {headers:values[0]||[],rows:values.slice(1)};
+  }};
+}
+
+function workoutPlanSchema_(headers) {
+  const actual=(headers||[]).map(function(value){return String(value||"").trim();}),seen={};
+  if(actual.length!==WORKOUT_PLAN_SCHEMA.length)return {ok:false,code:"DATA_INTEGRITY_ERROR"};
+  for(let index=0;index<actual.length;index+=1){if(actual[index]!==WORKOUT_PLAN_SCHEMA[index]||seen[actual[index]])return {ok:false,code:"DATA_INTEGRITY_ERROR"};seen[actual[index]]=true;}
+  const indexes={};actual.forEach(function(header,index){indexes[header]=index;});return {ok:true,indexes:indexes};
+}
+
+function workoutPlanBoolean_(value) {
+  if(value===true||value===1)return true;if(value===false||value===0)return false;
+  const text=String(value==null?"":value).trim().toUpperCase();
+  if(["TRUE","YES","ДА","1"].indexOf(text)>=0)return true;if(["FALSE","NO","НЕТ","0"].indexOf(text)>=0)return false;
+  return null;
+}
+
+function workoutPlanPositiveInteger_(value,optional) {
+  if(value==null||String(value).trim()==="")return optional?null:false;
+  const number=Number(value);return isFinite(number)&&number>0&&Math.floor(number)===number?number:false;
+}
+
+function workoutPlanReps_(value) {
+  if(value==null||String(value).trim()==="")return null;
+  const text=String(value).trim().replace(/\s+/g,"");
+  const match=text.match(/^(\d{1,3})(?:[-–](\d{1,3}))?$/);if(!match)return false;
+  const low=Number(match[1]),high=match[2]==null?low:Number(match[2]);
+  return low>0&&high>=low?String(low)+(high===low?"":"–"+high):false;
+}
+
+function loadAuthoritativeWorkoutPlan_(telegramUserId, options) {
+  const runtime=options||{},deps=workoutPlanDependencies_(runtime.dependencies),table=deps.read_plan();
+  if(table==null)return workoutPlanResult_(false,true,"PLAN_NOT_CONFIGURED",{configured:false,sessions_by_weekday:{}});
+  const schema=workoutPlanSchema_(table.headers);if(!schema.ok)return workoutPlanResult_(false,false,schema.code);
+  const i=schema.indexes,expected=String(telegramUserId==null?"":telegramUserId).trim();
+  let rows=(table.rows||[]).filter(function(row){return String(row[i.TELEGRAM_ID]==null?"":row[i.TELEGRAM_ID]).trim()===expected;});
+  if(!rows.length)rows=(table.rows||[]).filter(function(row){return String(row[i.USER_ID]==null?"":row[i.USER_ID]).trim()===expected;});
+  if(!rows.length)return workoutPlanResult_(false,true,"PLAN_NOT_CONFIGURED",{configured:false,sessions_by_weekday:{}});
+  const sessions={},exerciseKeys={};
+  for(let index=0;index<rows.length;index+=1){const row=rows[index],active=workoutPlanBoolean_(row[i.ACTIVE]);
+    if(active===null)return workoutPlanResult_(false,false,"DATA_INTEGRITY_ERROR");if(!active)continue;
+    const weekday=String(row[i.WEEKDAY]||"").trim().toUpperCase(),sessionKey=String(row[i.SESSION_KEY]||"").trim(),sessionName=String(row[i.SESSION_NAME]||"").trim();
+    const exerciseKey=String(row[i.EXERCISE_KEY]||"").trim(),exerciseName=String(row[i.EXERCISE_NAME]||"").trim();
+    const order=workoutPlanPositiveInteger_(row[i.EXERCISE_ORDER],false),sets=workoutPlanPositiveInteger_(row[i.PLANNED_SETS],true),reps=workoutPlanReps_(row[i.PLANNED_REPS]);
+    const loadRaw=row[i.PLANNED_LOAD],loadBlank=loadRaw==null||String(loadRaw).trim()==="",load=loadBlank?null:Number(String(loadRaw).replace(",",".")),unit=String(row[i.LOAD_UNIT]||"").trim().toLowerCase();
+    if(!WORKOUT_PLAN_WEEKDAYS[weekday]||!sessionKey||!sessionName||!exerciseKey||!exerciseName||order===false||sets===false||reps===false||(!loadBlank&&(!isFinite(load)||load<=0))||(load!==null&&unit!=="kg")||(load===null&&unit))return workoutPlanResult_(false,false,"DATA_INTEGRITY_ERROR");
+    if(!sessions[weekday])sessions[weekday]={stable_session_identity:sessionKey,display_name:sessionName,exercises:[]};
+    if(sessions[weekday].stable_session_identity!==sessionKey||sessions[weekday].display_name!==sessionName)return workoutPlanResult_(false,false,"DATA_INTEGRITY_ERROR");
+    const unique=weekday+"|"+exerciseKey;if(exerciseKeys[unique]||sessions[weekday].exercises.some(function(item){return item.order===order;}))return workoutPlanResult_(false,false,"DATA_INTEGRITY_ERROR");exerciseKeys[unique]=true;
+    sessions[weekday].exercises.push({stable_exercise_identity:exerciseKey,display_name:exerciseName,order:order,planned_sets:sets,planned_reps:reps,planned_load:load,load_unit:load===null?null:unit,notes:String(row[i.NOTES]||"").trim()});
+  }
+  const weekdays=Object.keys(sessions);if(!weekdays.length)return workoutPlanResult_(false,true,"PLAN_NOT_CONFIGURED",{configured:false,sessions_by_weekday:{}});
+  for(let s=0;s<weekdays.length;s+=1){sessions[weekdays[s]].exercises.sort(function(a,b){return a.order-b.order;});if(!sessions[weekdays[s]].exercises.length)return workoutPlanResult_(false,false,"DATA_INTEGRITY_ERROR");}
+  return workoutPlanResult_(false,true,"WORKOUT_PLAN_LOADED",{configured:true,sessions_by_weekday:sessions});
+}
+
+function workoutLocalDateMetadata_(now, offset, dependencies) {
+  const zone=dependencies.time_zone(),date=nutritionCalendarDate_(now,zone,offset,dependencies.format_date),parts=date.split("-").map(Number),day=new Date(Date.UTC(parts[0],parts[1]-1,parts[2])).getUTCDay();
+  const weekday=Object.keys(WORKOUT_PLAN_WEEKDAYS).filter(function(key){return WORKOUT_PLAN_WEEKDAYS[key]===(day===0?7:day);})[0];
+  return {local_date:date,local_weekday:weekday,time_zone:zone};
+}
+
+function resolveWorkoutPlan_(telegramUserId, intent, options) {
+  const runtime=options||{},deps=workoutPlanDependencies_(runtime.dependencies),loaded=loadAuthoritativeWorkoutPlan_(telegramUserId,runtime);
+  if(!loaded.ok)return workoutPlanResult_(true,false,loaded.code,{status:"DATA_INTEGRITY_ERROR"});
+  if(!loaded.configured)return workoutPlanResult_(true,true,"PLAN_NOT_CONFIGURED",{status:"PLAN_NOT_CONFIGURED",workout:null,next_workout:null});
+  const now=runtime.now instanceof Date?runtime.now:new Date(),today=workoutLocalDateMetadata_(now,0,deps),todayWorkout=loaded.sessions_by_weekday[today.local_weekday]||null;
+  let next=null;for(let offset=1;offset<=7;offset+=1){const meta=workoutLocalDateMetadata_(now,offset,deps),session=loaded.sessions_by_weekday[meta.local_weekday];if(session){next={local_date:meta.local_date,local_weekday:meta.local_weekday,workout:session};break;}}
+  if(intent.intent==="NEXT_WORKOUT")return next?workoutPlanResult_(true,true,"NEXT_WORKOUT",{status:"TRAINING_DAY",local_date:next.local_date,local_weekday:next.local_weekday,workout:next.workout,next_workout:next}):workoutPlanResult_(true,true,"NO_NEXT_WORKOUT",{status:"NO_NEXT_WORKOUT",workout:null,next_workout:null});
+  return workoutPlanResult_(true,true,todayWorkout?"TRAINING_DAY":"REST_DAY",{status:todayWorkout?"TRAINING_DAY":"REST_DAY",local_date:today.local_date,local_weekday:today.local_weekday,workout:todayWorkout,next_workout:next});
+}
+
+function workoutPlanNumber_(value) {return String(Number(value)).replace(".",",");}
+function formatWorkoutPlan_(result) {
+  if(!result||result.ok!==true)return "Не удалось надёжно прочитать план тренировок из-за ошибки данных.";
+  if(result.status==="PLAN_NOT_CONFIGURED")return "План тренировок пока не настроен.";
+  if(result.status==="NO_NEXT_WORKOUT")return "Следующая тренировка в текущем плане не найдена.";
+  if(result.status==="REST_DAY")return "Сегодня по плану отдых."+(result.next_workout?"\nСледующая тренировка: "+result.next_workout.local_date+" — "+result.next_workout.workout.display_name+".":"");
+  const prefix=result.code==="NEXT_WORKOUT"?"Следующая тренировка — "+result.local_date+": ":"Сегодня — ",lines=[prefix+result.workout.display_name+"."];
+  result.workout.exercises.forEach(function(exercise,index){lines.push("",(index+1)+". "+exercise.display_name);if(exercise.planned_sets!==null&&exercise.planned_reps!==null)lines.push("   "+exercise.planned_sets+" × "+exercise.planned_reps);else if(exercise.planned_sets!==null)lines.push("   "+exercise.planned_sets+" подхода");else if(exercise.planned_reps!==null)lines.push("   "+exercise.planned_reps+" повторений");if(exercise.planned_load!==null)lines.push("   "+workoutPlanNumber_(exercise.planned_load)+" кг");else lines.push("   вес не задан");if(exercise.notes)lines.push("   "+exercise.notes);});
+  return lines.join("\n");
+}
+
+function routeWorkoutPlan_(update, options) {
+  const message=update&&(update.message||update.edited_message),intent=message&&typeof message.text==="string"?detectWorkoutPlanIntent_(message.text):null;
+  if(!intent)return workoutPlanResult_(false,true,"NOT_WORKOUT_PLAN_QUERY");
+  const userId=String(message.from&&message.from.id||"").trim();if(!userId)return workoutPlanResult_(true,false,"INVALID_QUERY",{message:"Не удалось определить пользователя."});
+  try{const result=resolveWorkoutPlan_(userId,intent,options||{});result.message=formatWorkoutPlan_(result);return result;}catch(error){return workoutPlanResult_(true,false,"DATA_INTEGRITY_ERROR",{status:"DATA_INTEGRITY_ERROR",message:"Не удалось надёжно прочитать план тренировок из-за ошибки данных."});}
 }
 
 const C232E_HISTORY_SCOPES = Object.freeze({TODAY:true, YESTERDAY:true, LAST_7_DAYS:true, CURRENT_WEEK:true});

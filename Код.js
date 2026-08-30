@@ -128,6 +128,14 @@ function doPost(e) {
       return httpOk_("OK");
     }
 
+    const workoutMutation = routeExplicitWorkoutMutationOwnership_(update);
+    if (workoutMutation.handled) {
+      sendTelegramMessage_(chatId, workoutMutation.message);
+      logAiReply_(messageText, workoutMutation.message, "workout_logging_history");
+      markBotInputProcessed_(inputRow, workoutMutation.ok ? "Да" : "Ошибка workout logging");
+      return httpOk_("OK");
+    }
+
     const nutritionReplace = routeNutritionMealReplace_(update);
     if (nutritionReplace.handled) {
       sendTelegramMessage_(chatId, nutritionReplace.message);
@@ -3997,6 +4005,19 @@ function detectWorkoutLoggingHistoryIntent_(text){
   m=n.match(/^(?:еще\s+)?(?:(.+?)\s+)?(\d+(?:[.,]\d+)?)\s*(кг)?\s*(?:на|x|×)\s*(\d+)$/);if(m)return {intent:"SETS",exercise_text:m[1]||"",count:1,load:m[2],unit:"kg",reps:m[4]};
   if(/(?:подход|\d+\s*[x×]|\d+\s*кг)/.test(n)&&/(?:на|по|x|×)/.test(n))return {intent:"INVALID_SET"};
   return null;
+}
+
+function routeExplicitWorkoutMutationOwnership_(update,options){
+  const message=update&&(update.message||update.edited_message),intent=message&&typeof message.text==="string"?detectWorkoutLoggingHistoryIntent_(message.text):null;
+  if(!intent||["DELETE","CORRECT","SKIP"].indexOf(intent.intent)<0||!intent.exercise_text)return workoutActualResult_(false,true,"NOT_EXPLICIT_WORKOUT_MUTATION");
+  const userId=String(message.from&&message.from.id||"").trim(),runtime=options||{},now=runtime.now instanceof Date?runtime.now:new Date(),deps=workoutActualDependencies_(runtime.dependencies);
+  if(!userId)return workoutActualResult_(false,true,"NOT_EXPLICIT_WORKOUT_MUTATION");
+  const history=loadEffectiveWorkoutHistory_(userId,{dependencies:deps}),open=history&&history.ok?workoutFindOpen_(history):[];
+  if(open.length!==1)return workoutActualResult_(false,true,"NOT_EXPLICIT_WORKOUT_MUTATION");
+  const planned=workoutPlanForToday_(userId,now,deps),identity=resolveWorkoutExerciseIdentity_(intent.exercise_text,planned&&planned.session,workoutLatestExercise_(open[0]));
+  if(!identity||identity.ok!==true)return workoutActualResult_(false,true,"NOT_EXPLICIT_WORKOUT_MUTATION");
+  if((intent.intent==="DELETE"||intent.intent==="CORRECT")&&!open[0].sets.some(function(set){return set.exercise_key===identity.key;}))return workoutActualResult_(false,true,"NOT_EXPLICIT_WORKOUT_MUTATION");
+  return routeWorkoutLoggingHistory_(update,options);
 }
 
 function workoutLogIndexes_(headers){const indexes={};(headers||[]).forEach(function(h,i){indexes[String(h||"").trim()]=i;});return indexes;}

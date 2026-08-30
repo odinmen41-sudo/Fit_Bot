@@ -168,6 +168,14 @@ function doPost(e) {
       return httpOk_("OK");
     }
 
+    const nutritionHistory = routeNutritionHistory_(update);
+    if (nutritionHistory.handled) {
+      sendTelegramMessage_(chatId, nutritionHistory.message);
+      logAiReply_(messageText, nutritionHistory.message, "nutrition_history");
+      markBotInputProcessed_(inputRow, nutritionHistory.ok ? "Да" : "Ошибка nutrition history");
+      return httpOk_("OK");
+    }
+
     const remainingNutrition = routeRemainingNutritionTargets_(update);
     if (remainingNutrition.handled) {
       sendTelegramMessage_(chatId, remainingNutrition.message);
@@ -3815,6 +3823,160 @@ function nutritionDailyReadDependencies_(overrides) {
       return {headers: values[0] || [], rows: values.slice(1)};
     }
   };
+}
+
+const C232E_HISTORY_SCOPES = Object.freeze({TODAY:true, YESTERDAY:true, LAST_7_DAYS:true, CURRENT_WEEK:true});
+
+function nutritionHistoryResult_(handled, ok, code, extra) {
+  return Object.assign({handled:handled === true, ok:ok === true, code:String(code || ""), groq_calls:0,
+    nutrition_log_writes:0, production_writes:false}, extra || {});
+}
+
+function detectNutritionHistoryIntent_(text) {
+  const normalized = normalizeNutritionTargetQueryText_(text);
+  if (!normalized || /^(?:исправь|замени|удали|отмени)\b/.test(normalized) ||
+      /(?:сколько|что)\s+остал/.test(normalized)) return null;
+  const historyWords = /(?:что\s+я\s+ел\S*|покажи\s+питание|питание\s+за|сколько(?:\s+\S+){0,3}\s+(?:съел\S*|калори\S*)|средн(?:ий|ее)\s+(?:калораж|белок)|соблюдал\s+калори|дней\s+(?:я\s+)?(?:превышал|добирал)|в\s+какие\s+дни)/.test(normalized);
+  if (!historyWords) return null;
+  let scope = null;
+  if (/(?:последн\S*\s+7\s+дн|за\s+последние\s+7\s+дн)/.test(normalized)) scope = "LAST_7_DAYS";
+  else if (/(?:на\s+этой\s+неделе|за\s+эту\s+неделю)/.test(normalized)) scope = "CURRENT_WEEK";
+  else if (/(?:^|\s)вчера(?:\s|$)|за\s+вчера/.test(normalized)) scope = "YESTERDAY";
+  else if (/(?:^|\s)сегодня(?:\s|$)/.test(normalized)) scope = "TODAY";
+  const comparison = /(?:соблюдал|превышал|перебор|добирал|не\s+добрал|текущ\S*\s+цел)/.test(normalized);
+  if (!scope && comparison && /(?:сколько\s+дней|в\s+какие\s+дни)/.test(normalized)) scope = "LAST_7_DAYS";
+  else if (!scope && /(?:^|\s)(?:дн|недел|месяц|год)\S*(?:\s|$)/.test(normalized)) return {ok:false, code:"UNSUPPORTED_TEMPORAL_QUERY"};
+  else if (!scope) return null;
+  return {ok:true, code:"NUTRITION_HISTORY_QUERY", scope:scope,
+    mode:comparison ? "CURRENT_GOAL_COMPARISON" : "HISTORY"};
+}
+
+function resolveNutritionHistoryWindow_(scope, now, dependencies) {
+  if (!C232E_HISTORY_SCOPES[scope]) return nutritionHistoryResult_(false, false, "UNSUPPORTED_TEMPORAL_QUERY");
+  const deps = dependencies || {}, zone = deps.time_zone(), today = nutritionCalendarDate_(now, zone, 0, deps.format_date);
+  let offsets;
+  if (scope === "TODAY") offsets = [0];
+  else if (scope === "YESTERDAY") offsets = [-1];
+  else if (scope === "LAST_7_DAYS") offsets = [-6,-5,-4,-3,-2,-1,0];
+  else {
+    const parts = today.split("-").map(Number), day = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2])).getUTCDay();
+    const sinceMonday = (day + 6) % 7;
+    offsets = []; for (let offset = -sinceMonday; offset <= 0; offset += 1) offsets.push(offset);
+  }
+  return {ok:true, code:"HISTORY_WINDOW", scope:scope, time_zone:zone, today:today,
+    dates:offsets.map(function(offset) { return nutritionCalendarDate_(now, zone, offset, deps.format_date); })};
+}
+
+function loadNutritionHistory_(userId, window, options) {
+  const runtime = options || {}, deps = nutritionDailyReadDependencies_(runtime.dependencies);
+  try {
+    const table = deps.read_table(), effective = loadEffectiveNutritionMeals_(String(userId), table, null, deps.format_date);
+    if (!effective.ok) return nutritionHistoryResult_(false, false, "DATA_INTEGRITY_ERROR");
+    const allowed = {}; window.dates.forEach(function(date) { allowed[date] = true; });
+    return {ok:true, code:"NUTRITION_HISTORY_LOADED", effective_meals:effective.effective_meals.filter(function(meal) {
+      return allowed[deps.format_date(new Date(meal.meal_at), window.time_zone)] === true;
+    })};
+  } catch (error) { return nutritionHistoryResult_(false, false, "DATA_INTEGRITY_ERROR"); }
+}
+
+function nutritionHistoryTotals_() { return {calories:0, protein:0, fat:0, carbs:0, meal_count:0, item_count:0}; }
+
+function buildNutritionDailyHistory_(effectiveMeals, window, options) {
+  const runtime = options || {}, format = runtime.format_date_time || function(date, zone, pattern) {
+    return Utilities.formatDate(date, zone, pattern);
+  }, byDate = {};
+  window.dates.forEach(function(date) { byDate[date] = {local_date:date, meals:[], totals:nutritionHistoryTotals_(), record_status:"NO_RECORDS"}; });
+  (effectiveMeals || []).forEach(function(meal) {
+    const date = format(new Date(meal.meal_at), window.time_zone, "yyyy-MM-dd"), day = byDate[date];
+    if (!day) return;
+    const safeItems = meal.items.map(function(item) { return {food_display:String(item.food_display || ""),
+      quantity_value:Number(item.quantity_value), quantity_unit:String(item.quantity_unit), calories:Number(item.calculated_calories),
+      protein:Number(item.calculated_protein), fat:Number(item.calculated_fat), carbs:Number(item.calculated_carbs)}; });
+    day.meals.push({local_time:format(new Date(meal.meal_at), window.time_zone, "HH:mm"), items:safeItems,
+      totals:{calories:Number(meal.totals.calories), protein:Number(meal.totals.protein), fat:Number(meal.totals.fat), carbs:Number(meal.totals.carbs)}});
+    day.totals.calories += Number(meal.totals.calories); day.totals.protein += Number(meal.totals.protein);
+    day.totals.fat += Number(meal.totals.fat); day.totals.carbs += Number(meal.totals.carbs);
+    day.totals.meal_count += 1; day.totals.item_count += safeItems.length; day.record_status = "LOGGED";
+  });
+  return window.dates.map(function(date) { const day = byDate[date]; day.meals.sort(function(a,b){return a.local_time.localeCompare(b.local_time);}); return day; });
+}
+
+function buildNutritionPeriodSummary_(daily, window) {
+  const totals = {calories:0, protein:0, fat:0, carbs:0}, logged = daily.filter(function(day){return day.record_status === "LOGGED";});
+  logged.forEach(function(day) { Object.keys(totals).forEach(function(key) { totals[key] += day.totals[key]; }); });
+  const averages = {}; Object.keys(totals).forEach(function(key) { averages[key] = logged.length ? totals[key] / logged.length : null; });
+  return {ok:true, code:logged.length ? "NUTRITION_HISTORY" : "NO_RECORDS", window:window, daily:daily,
+    calendar_days:daily.length, logged_days:logged.length, no_record_days:daily.length-logged.length,
+    totals:totals, logged_day_averages:averages};
+}
+
+function compareNutritionToCurrentTargets_(summary, targetRead) {
+  if (!targetRead || targetRead.ok !== true || targetRead.status === "NOT_CONFIGURED") {
+    return {ok:false, code:"TARGET_NOT_AVAILABLE", target_basis:"CURRENT_TARGET", targets:targetRead && targetRead.targets || null};
+  }
+  const targets = targetRead.targets, logged = summary.daily.filter(function(day){return day.record_status === "LOGGED";});
+  const result = {ok:true, code:"CURRENT_GOAL_COMPARISON", target_basis:"CURRENT_TARGET", targets:targets,
+    evaluated_logged_days:targets.calories == null ? 0 : logged.length,
+    days_at_or_below_current_calorie_target:0, days_over_current_calorie_target:0,
+    protein_evaluated_logged_days:targets.protein == null ? 0 : logged.length,
+    days_protein_met_or_exceeded_current_target:0, days_protein_below_current_target:0,
+    daily:[]};
+  logged.forEach(function(day) {
+    const entry = {local_date:day.local_date};
+    ["calories","protein","fat","carbs"].forEach(function(key) {
+      entry[key] = targets[key] == null ? null : {consumed:day.totals[key], target:targets[key], delta:day.totals[key]-targets[key]};
+    });
+    if (entry.calories) { entry.calories.classification=entry.calories.delta<=0?"AT_OR_BELOW_TARGET":"OVER_TARGET";
+      if(entry.calories.delta<=0)result.days_at_or_below_current_calorie_target++;else result.days_over_current_calorie_target++; }
+    if (entry.protein) { entry.protein.classification=entry.protein.delta>=0?"MET_OR_EXCEEDED":"BELOW_TARGET";
+      if(entry.protein.delta>=0)result.days_protein_met_or_exceeded_current_target++;else result.days_protein_below_current_target++; }
+    result.daily.push(entry);
+  });
+  result.average_logged_day_calories=summary.logged_day_averages.calories;
+  result.average_calorie_delta_vs_current_target=targets.calories==null?null:result.average_logged_day_calories-targets.calories;
+  result.average_logged_day_protein=summary.logged_day_averages.protein;
+  result.average_protein_delta_vs_current_target=targets.protein==null?null:result.average_logged_day_protein-targets.protein;
+  return result;
+}
+
+function nutritionHistoryUnit_(unit) { return {g:"г",ml:"мл",count:"шт"}[unit] || unit; }
+function formatNutritionHistory_(summary, intent, comparison) {
+  if (!summary || summary.ok !== true) return "Не удалось надёжно прочитать историю питания.";
+  const n=function(value){return dailyNutritionNumber_(value,2);}, lines=[];
+  if (summary.code === "NO_RECORDS") return intent.scope === "YESTERDAY" ? "Вчера записей о питании нет." : "За выбранный период записей о питании нет.";
+  if (intent.scope === "TODAY" || intent.scope === "YESTERDAY") {
+    const day=summary.daily[0]; lines.push((intent.scope === "TODAY" ? "Сегодня" : "Вчера") + ", " + day.local_date + ":");
+    day.meals.forEach(function(meal){lines.push("",meal.local_time);meal.items.forEach(function(item){lines.push("• "+item.food_display+" — "+n(item.quantity_value)+" "+nutritionHistoryUnit_(item.quantity_unit),"  "+n(item.calories)+" ккал | Б "+n(item.protein)+" | Ж "+n(item.fat)+" | У "+n(item.carbs));});});
+    lines.push("","Итого:",n(day.totals.calories)+" ккал | Б "+n(day.totals.protein)+" | Ж "+n(day.totals.fat)+" | У "+n(day.totals.carbs));
+  } else {
+    lines.push(intent.scope === "LAST_7_DAYS" ? "Последние 7 дней:" : "Текущая неделя:","");
+    summary.daily.slice().reverse().forEach(function(day){lines.push(day.local_date+" — "+(day.record_status==="LOGGED"?n(day.totals.calories)+" ккал | Б "+n(day.totals.protein)+" | Ж "+n(day.totals.fat)+" | У "+n(day.totals.carbs):"записей нет"));});
+    lines.push("","Записи есть за "+summary.logged_days+" из "+summary.calendar_days+" дней.");
+    if(summary.logged_days)lines.push("Среднее по дням с записями:",n(summary.logged_day_averages.calories)+" ккал | Б "+n(summary.logged_day_averages.protein)+" | Ж "+n(summary.logged_day_averages.fat)+" | У "+n(summary.logged_day_averages.carbs));
+  }
+  if (intent.mode === "CURRENT_GOAL_COMPARISON") {
+    if (!comparison || comparison.ok !== true) lines.push("","Текущие цели для сравнения не заданы.");
+    else { const t=comparison.targets, targetParts=[];
+      if(t.calories!=null)targetParts.push(n(t.calories)+" ккал");if(t.protein!=null)targetParts.push("Б "+n(t.protein));
+      if(t.fat!=null)targetParts.push("Ж "+n(t.fat));if(t.carbs!=null)targetParts.push("У "+n(t.carbs));
+      lines.push("","Относительно ваших текущих целей"+(targetParts.length?" "+targetParts.join(" | "):"")+":");
+      if(t.calories!=null)lines.push("• выше текущей цели по калориям: "+comparison.days_over_current_calorie_target,"• на уровне или ниже текущей цели: "+comparison.days_at_or_below_current_calorie_target);
+      if(t.protein!=null)lines.push("• цель по белку достигнута: "+comparison.days_protein_met_or_exceeded_current_target+" дн.","• ниже текущей цели по белку: "+comparison.days_protein_below_current_target+" дн."); }
+  }
+  return lines.join("\n");
+}
+
+function routeNutritionHistory_(update, options) {
+  const runtime=options||{}, message=update&&(update.message||update.edited_message), intent=message&&typeof message.text==="string"?detectNutritionHistoryIntent_(message.text):null;
+  if(!intent)return nutritionHistoryResult_(false,true,"NOT_NUTRITION_HISTORY");
+  if(intent.ok!==true)return nutritionHistoryResult_(true,false,intent.code,{message:"Не поддерживаю такой период истории питания."});
+  const userId=String(message.from&&message.from.id||"").trim();if(!userId)return nutritionHistoryResult_(true,false,"INVALID_QUERY",{message:"Не удалось определить пользователя."});
+  const deps=nutritionDailyReadDependencies_(runtime.dependencies),now=runtime.now instanceof Date?runtime.now:new Date();let window,loaded;
+  try{window=resolveNutritionHistoryWindow_(intent.scope,now,deps);loaded=loadNutritionHistory_(userId,window,runtime);}catch(error){return nutritionHistoryResult_(true,false,"DATA_INTEGRITY_ERROR",{message:"Не удалось надёжно прочитать историю питания."});}
+  if(!loaded.ok)return nutritionHistoryResult_(true,false,loaded.code,{message:"Не удалось надёжно прочитать историю питания."});
+  const daily=buildNutritionDailyHistory_(loaded.effective_meals,window,runtime.format_options||{}),summary=buildNutritionPeriodSummary_(daily,window);
+  let comparison=null;if(intent.mode==="CURRENT_GOAL_COMPARISON"){const targetLoader=runtime.dependencies&&runtime.dependencies.load_targets||loadAuthoritativeNutritionTargets_;comparison=compareNutritionToCurrentTargets_(summary,targetLoader(userId));}
+  return nutritionHistoryResult_(true,true,summary.code,{intent:intent,summary:summary,comparison:comparison,message:formatNutritionHistory_(summary,intent,comparison)});
 }
 
 const C232C3_REMAINING_EPSILON = 1e-9;

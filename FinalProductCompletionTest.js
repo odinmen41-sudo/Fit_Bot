@@ -44,5 +44,10 @@ function runFinalProductCompletionTests(){
   record("FINAL-24_PROGRESSION_ACTUAL",/100 кг/.test(progression.message)&&/7\/7\/7/.test(progression.message),progression.message);
   record("FINAL-25_PROGRESSION_CONSERVATIVE",/оставить 100 кг/.test(progression.message)&&/не форсируй/.test(progression.message),progression.message);
 
+  record("FINAL-26_TARGET_READ_PARSE",detectNutritionTargetReadIntent_("Какие у меня цели по КБЖУ?")==="NUTRITION_TARGET_READ",{});
+  const targetRead=routeNutritionTargetRead_({message:{text:"Какие у меня цели по КБЖУ?",from:{id:"u1"},chat:{id:"u1"}}},{dependencies:{load_targets:function(){return {ok:true,status:"TARGETS_AVAILABLE",targets:{calories:2300,protein:195,fat:70,carbs:225}};}}});
+  record("FINAL-27_TARGET_READ_DETERMINISTIC",targetRead.handled&&targetRead.ok&&targetRead.code==="TARGETS_AVAILABLE"&&targetRead.message==="Ваши цели: 2300 ккал | Б 195 г | Ж 70 г | У 225 г.",targetRead);
+  record("FINAL-28_TARGET_READ_NO_UPDATE_CAPTURE",detectExplicitNutritionTargetUpdate_("Какие у меня цели по КБЖУ?")===null,{});
+
   const passed=tests.filter(function(test){return test.status==="PASS";}).length;return {suite:"FINAL_PRODUCT_COMPLETION",status:passed===tests.length?"PASS":"FAIL",total:tests.length,passed:passed,failed:tests.length-passed,tests:tests,safety:{sheet_writes:0,telegram_calls:0,groq_calls:0,production_writes:0}};
 }

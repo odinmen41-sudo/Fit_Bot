@@ -168,6 +168,14 @@ function doPost(e) {
       return httpOk_("OK");
     }
 
+    const nutritionTargetRead = routeNutritionTargetRead_(update);
+    if (nutritionTargetRead.handled) {
+      sendTelegramMessage_(chatId, nutritionTargetRead.message);
+      logAiReply_(messageText, nutritionTargetRead.message, "nutrition_target_read");
+      markBotInputProcessed_(inputRow, nutritionTargetRead.ok ? "Да" : "Ошибка nutrition target read");
+      return httpOk_("OK");
+    }
+
     const workoutHistory = routeWorkoutLoggingHistory_(update);
     if (workoutHistory.handled) {
       sendTelegramMessage_(chatId, workoutHistory.message);
@@ -1472,6 +1480,43 @@ const C232C2_TARGET_FIELDS = Object.freeze({
   fat: Object.freeze({header: "Жиры цель", min: 1, max: 1000, decimals: 1, unit: "г", label: "Жиры"}),
   carbs: Object.freeze({header: "Углеводы цель", min: 1, max: 1500, decimals: 1, unit: "г", label: "Углеводы"})
 });
+
+function routeNutritionTargetRead_(update, options) {
+  const message = update && (update.message || update.edited_message);
+  const intent = message && typeof message.text === "string"
+    ? detectNutritionTargetReadIntent_(message.text) : null;
+  if (!intent) return nutritionTargetResult_(false, true, "NOT_TARGET_READ");
+  const userId = String(message.from && message.from.id || "").trim();
+  if (!userId) return nutritionTargetResult_(true, false, "INVALID_USER", {
+    message: "Не удалось надёжно прочитать цели по питанию из профиля."
+  });
+  const dependencies = options && options.dependencies || {};
+  const loadTargets = dependencies.load_targets || loadAuthoritativeNutritionTargets_;
+  const result = loadTargets(userId);
+  if (!result || result.ok !== true) return nutritionTargetResult_(true, false,
+    String(result && result.code || "TARGET_READ_FAILED"), {
+      message: "Не удалось надёжно прочитать цели по питанию из профиля."
+    });
+  if (result.status !== "TARGETS_AVAILABLE") return nutritionTargetResult_(true, true,
+    String(result.status || "TARGETS_NOT_CONFIGURED"), {
+      message: "Цели по питанию пока настроены не полностью."
+    });
+  const targets = result.targets;
+  return nutritionTargetResult_(true, true, "TARGETS_AVAILABLE", {
+    targets: targets,
+    message: "Ваши цели: " + nutritionTargetNumber_(targets.calories) + " ккал | Б " +
+      nutritionTargetNumber_(targets.protein) + " г | Ж " + nutritionTargetNumber_(targets.fat) +
+      " г | У " + nutritionTargetNumber_(targets.carbs) + " г."
+  });
+}
+
+function detectNutritionTargetReadIntent_(text) {
+  const normalized = String(text || "").toLowerCase().replace(/ё/g, "е")
+    .replace(/[!?.,;:]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!normalized || /^\//.test(normalized)) return null;
+  return /^(?:какие|каковы)\s+(?:у\s+меня\s+)?(?:текущие\s+)?цели\s+(?:по\s+)?(?:кбжу|бжу|питанию)$/.test(normalized)
+    ? "NUTRITION_TARGET_READ" : null;
+}
 
 function routeNutritionTargetConfirmation_(update, options) {
   const runtime = options || {};

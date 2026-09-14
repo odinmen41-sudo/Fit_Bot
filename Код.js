@@ -4189,6 +4189,50 @@ function dailyDashboardDateTitle_(date){const p=String(date||"").split("-").map(
 function formatDailyDashboard_(facts){const lines=["Сегодня, "+dailyDashboardDateTitle_(facts.local_date),""];const training=facts.training;if(training.status==="TRAINING_DAY")lines.push("Тренировка: "+training.today_session_name+".");else if(training.status==="REST_DAY")lines.push("Тренировка: сегодня по плану день отдыха.");else if(training.status==="PLAN_NOT_CONFIGURED")lines.push("Тренировка: план пока не настроен.");else lines.push("Тренировка: сейчас не удалось получить корректные данные.");if(training.next_workout&&training.status!=="TRAINING_DAY")lines.push("Следующая: "+training.next_workout.session_name+" — через "+training.next_workout.days_away+" дн.");lines.push("");const nutrition=facts.nutrition;if(nutrition.status==="UNAVAILABLE")lines.push("Питание: сейчас не удалось получить корректные данные.");else if(nutrition.status==="NO_RECORDS")lines.push("Питание: сегодня записей пока нет.");else{const c=nutrition.consumed,t=nutrition.targets,r=nutrition.remaining,cal=t.calories==null?dailyDashboardNumber_(c.calories,1)+" ккал":dailyDashboardNumber_(c.calories,1)+" из "+dailyDashboardNumber_(t.calories,1)+" ккал";lines.push("Питание: "+cal+".");if(r.calories!=null)lines.push((r.calories>=0?"Осталось: ":"Превышение: ")+dailyDashboardNumber_(Math.abs(r.calories),1)+" ккал.");const labels={protein:"Б",fat:"Ж",carbs:"У"},macros=["protein","fat","carbs"].map(function(key){return labels[key]+" "+dailyDashboardNumber_(c[key],1)+(t[key]==null?"":"/"+dailyDashboardNumber_(t[key],1));});lines.push(macros.join(" · "));if(nutrition.target_status==="UNAVAILABLE")lines.push("Цели по питанию: сейчас не удалось получить корректные данные.");}lines.push("");const weight=facts.weight;if(weight.data_status==="UNAVAILABLE"||weight.data_status==="DATA_INTEGRITY_ERROR")lines.push("Вес: сейчас не удалось получить корректные данные.");else if(weight.data_status==="NO_DATA")lines.push("Вес: подтверждённых измерений пока нет.");else{let line="Вес: "+dailyDashboardNumber_(weight.current_weight,2)+" кг";if(weight.measurement_age_days===0)line+=" — измерение сегодня";else line+=" — измерение "+weight.measurement_age_days+" дн. назад";if(weight.freshness==="FRESH"&&weight.trend_status==="AVAILABLE"&&weight.week_delta!=null)line+=". Тренд недели: "+(weight.week_delta>0?"+":"")+dailyDashboardNumber_(weight.week_delta,2)+" кг";lines.push(line+".");}lines.push("");const recovery=facts.recovery;if(recovery.history_status==="UNAVAILABLE"||recovery.history_status==="DATA_INTEGRITY_ERROR")lines.push("История тренировок: сейчас не удалось получить корректные данные.");else if(recovery.history_status==="NO_DATA")lines.push("История тренировок: завершённых тренировок пока нет.");else{const last=recovery.last_completed_workout;lines.push("Последняя тренировка: "+(last.days_ago===0?"сегодня":last.days_ago===1?"вчера":last.days_ago+" дн. назад")+".");lines.push("За 7 дней: "+recovery.sessions_7d+" тренировок.");}return lines.join("\n").replace(/\n{3,}/g,"\n\n");}
 function routeDailyDashboard_(update,options){const message=update&&(update.message||update.edited_message),intent=message&&typeof message.text==="string"?detectDailyDashboardIntent_(message.text):null;if(!intent)return dailyDashboardResult_(false,true,"NOT_DAILY_DASHBOARD");const userId=String(message.from&&message.from.id||"").trim();if(!userId)return dailyDashboardResult_(true,false,"INVALID_USER",{message:"Не удалось сформировать сводку на сегодня."});const facts=buildDailyDashboardFacts_(userId,options||{});return dailyDashboardResult_(true,true,"DAILY_DASHBOARD",{facts:facts,message:formatDailyDashboard_(facts)});}
 
+/* PC-1 — pure, read-only opportunity detection over authoritative Dashboard facts. */
+const PROACTIVE_COACHING_PRIORITIES = Object.freeze({
+  CALORIES_EXCEEDED:1,
+  CALORIES_NEAR_LIMIT:2,
+  NO_NUTRITION_LOGGED_LATE_DAY:3,
+  PROTEIN_FAR_BELOW_TARGET_LATE_DAY:5,
+  WEIGHT_MEASUREMENT_STALE:7,
+  MEANINGFUL_WEIGHT_TREND:8
+});
+
+function proactiveCoachingNumber_(value,digits){return dailyDashboardNumber_(value,digits==null?1:digits);}
+function proactiveCoachingFinite_(value){return value!==null&&value!==""&&isFinite(Number(value));}
+function proactiveCoachingLocalHour_(now,options){const runtime=options||{};if(runtime.local_hour!=null){const injected=Number(runtime.local_hour);return isFinite(injected)&&injected>=0&&injected<24?injected:null;}const deps=runtime.dependencies||{},zone=deps.time_zone?deps.time_zone():Session.getScriptTimeZone(),format=deps.format_hour||function(date,timeZone){return Utilities.formatDate(date,timeZone,"H");},hour=Number(format(now,zone));return isFinite(hour)&&hour>=0&&hour<24?hour:null;}
+function proactiveCoachingSignal_(key,evidence){return {key:key,priority:PROACTIVE_COACHING_PRIORITIES[key],evidence:Object.assign({},evidence||{})};}
+
+function detectProactiveCoachingSignals_(facts,now,options){
+  const result=[],source=facts||{},hour=proactiveCoachingLocalHour_(now instanceof Date?now:new Date(),options);
+  try{
+    const nutrition=source.nutrition||{},usable=nutrition.available===true&&["AVAILABLE","NO_RECORDS"].indexOf(nutrition.status)>=0;
+    if(usable&&nutrition.status==="NO_RECORDS"&&nutrition.has_records===false&&hour!==null&&hour>=18){result.push(proactiveCoachingSignal_("NO_NUTRITION_LOGGED_LATE_DAY"));}
+    if(usable&&nutrition.status==="AVAILABLE"&&nutrition.has_records===true&&nutrition.consumed){
+      const consumed=nutrition.consumed,targets=nutrition.targets||{},calories=Number(consumed.calories),calorieTarget=Number(targets.calories);
+      if(proactiveCoachingFinite_(consumed.calories)&&proactiveCoachingFinite_(targets.calories)&&calorieTarget>0){
+        if(calories>calorieTarget)result.push(proactiveCoachingSignal_("CALORIES_EXCEEDED",{consumed_calories:calories,target_calories:calorieTarget}));
+        else if(calories>=calorieTarget*0.9)result.push(proactiveCoachingSignal_("CALORIES_NEAR_LIMIT",{remaining_calories:Math.max(0,calorieTarget-calories),consumed_calories:calories,target_calories:calorieTarget}));
+      }
+      const protein=Number(consumed.protein),proteinTarget=Number(targets.protein);
+      if(hour!==null&&hour>=18&&proactiveCoachingFinite_(consumed.protein)&&proactiveCoachingFinite_(targets.protein)&&proteinTarget>0&&protein<proteinTarget*0.6){result.push(proactiveCoachingSignal_("PROTEIN_FAR_BELOW_TARGET_LATE_DAY",{consumed_protein:protein,target_protein:proteinTarget}));}
+    }
+  }catch(ignoredNutrition){}
+  try{
+    const weight=source.weight||{},usable=weight.available===true&&weight.data_status==="NORMAL"&&proactiveCoachingFinite_(weight.current_weight);
+    if(usable&&proactiveCoachingFinite_(weight.measurement_age_days)&&Number(weight.measurement_age_days)>7)result.push(proactiveCoachingSignal_("WEIGHT_MEASUREMENT_STALE",{measurement_age_days:Number(weight.measurement_age_days)}));
+    if(usable&&weight.freshness==="FRESH"&&weight.trend_status==="AVAILABLE"&&["UP","DOWN"].indexOf(weight.trend)>=0&&proactiveCoachingFinite_(weight.week_delta)){result.push(proactiveCoachingSignal_("MEANINGFUL_WEIGHT_TREND",{trend:weight.trend,week_delta:Number(weight.week_delta)}));}
+  }catch(ignoredWeight){}
+  return result;
+}
+
+function applyProactiveCoachingPolicy_(signals){const allowed=PROACTIVE_COACHING_PRIORITIES;return (signals||[]).filter(function(signal){return signal&&Object.prototype.hasOwnProperty.call(allowed,signal.key)&&Number(signal.priority)===allowed[signal.key];}).sort(function(a,b){return a.priority-b.priority||a.key.localeCompare(b.key);});}
+function selectProactiveCoachingSignal_(eligibleSignals){const ordered=applyProactiveCoachingPolicy_(eligibleSignals);return ordered.length?ordered[0]:null;}
+function formatProactiveCoachingHint_(signal){if(!signal)return null;const e=signal.evidence||{};switch(signal.key){case "CALORIES_EXCEEDED":return "По записям на сегодня уже "+proactiveCoachingNumber_(e.consumed_calories,1)+" ккал при цели "+proactiveCoachingNumber_(e.target_calories,1)+" ккал.";case "CALORIES_NEAR_LIMIT":return "По записям осталось около "+proactiveCoachingNumber_(e.remaining_calories,1)+" ккал до цели.";case "NO_NUTRITION_LOGGED_LATE_DAY":return "По записям сегодня пока ничего нет. Если уже ел, можно добавить.";case "PROTEIN_FAR_BELOW_TARGET_LATE_DAY":return "По записям белка пока "+proactiveCoachingNumber_(e.consumed_protein,1)+" г из "+proactiveCoachingNumber_(e.target_protein,1)+" г. Если сегодня ещё будешь есть, можно сделать акцент на белке.";case "WEIGHT_MEASUREMENT_STALE":return "Последнее подтверждённое измерение веса было "+Number(e.measurement_age_days)+" дн. назад.";case "MEANINGFUL_WEIGHT_TREND":return "По текущим измерениям недельный тренд: "+(Number(e.week_delta)>0?"+":"")+proactiveCoachingNumber_(e.week_delta,2)+" кг.";default:return null;}}
+function evaluateProactiveCoaching_(facts,now,options){const detected=detectProactiveCoachingSignals_(facts,now,options),eligible=applyProactiveCoachingPolicy_(detected),selected=selectProactiveCoachingSignal_(eligible);return {signals:detected,eligible_signals:eligible,selected_signal:selected,message:formatProactiveCoachingHint_(selected),groq_calls:0,telegram_calls:0,sheet_writes:0,domain_writes:0,pending_capture_writes:0,property_writes:0,production_writes:false};}
+function buildProactiveCoachingFacts_(userId,now,options){const runtime=options||{},build=runtime.build_dashboard||buildDailyDashboardFacts_;return build(String(userId),{now:now instanceof Date?now:new Date(),dependencies:runtime.dashboard_dependencies});}
+
 const C232E_HISTORY_SCOPES = Object.freeze({TODAY:true, YESTERDAY:true, LAST_7_DAYS:true, CURRENT_WEEK:true});
 
 function nutritionHistoryResult_(handled, ok, code, extra) {

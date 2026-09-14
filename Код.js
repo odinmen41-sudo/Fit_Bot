@@ -1497,7 +1497,7 @@ function routeNutritionTargetRead_(update, options) {
     String(result && result.code || "TARGET_READ_FAILED"), {
       message: "Не удалось надёжно прочитать цели по питанию из профиля."
     });
-  if (result.status !== "TARGETS_AVAILABLE") return nutritionTargetResult_(true, true,
+  if (result.status !== "AVAILABLE") return nutritionTargetResult_(true, true,
     String(result.status || "TARGETS_NOT_CONFIGURED"), {
       message: "Цели по питанию пока настроены не полностью."
     });

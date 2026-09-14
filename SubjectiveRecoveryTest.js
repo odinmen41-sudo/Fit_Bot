@@ -68,9 +68,9 @@ function runSubjectiveRecoveryTests(){
   rec("SR1-50_NO_SOURCE",json.indexOf(SUBJECTIVE_RECOVERY_SOURCE)<0,json);
   rec("SR1-51_NO_SCHEMA_METADATA",json.indexOf(SUBJECTIVE_RECOVERY_SCHEMA_VERSION)<0,json);
   rec("SR1-52_ZERO_SIDE_EFFECTS",projection.groq_calls===undefined&&projection.telegram_calls===undefined,projection);
-  rec("SR1-53_CLOSED_RECOVERY",String(buildRecoveryFacts_).indexOf("SubjectiveRecovery")<0,{});
-  rec("SR1-54_CLOSED_DASHBOARD",String(buildDailyDashboardFacts_).indexOf("SubjectiveRecovery")<0,{});
-  rec("SR1-55_CLOSED_PROACTIVE",String(detectProactiveCoachingSignals_).indexOf("SubjectiveRecovery")<0,{});
+  rec("SR1-53_RECOVERY_INTEGRATED",typeof buildRecoveryContext_==="function",{});
+  rec("SR1-54_DASHBOARD_INTEGRATED",String(buildDailyDashboardFacts_).indexOf("load_subjective")>=0,{});
+  rec("SR1-55_PROACTIVE_INTEGRATED",String(detectProactiveCoachingSignals_).indexOf("subjective_status")>=0,{});
   rec("SR1-56_SR2_ROUTE_ADDED",typeof routeSubjectiveRecovery_==="function",{});
   rec("SR1-57_SHEET_NAME",SUBJECTIVE_RECOVERY_SHEET==="Recovery_Checkin",{});
   rec("SR1-58_PARTIAL_CHECKIN",read([event("e1","k1",null,{stress:7})]).metrics.fatigue.status==="MISSING",{});

@@ -71,7 +71,7 @@ function runSubjectiveRecoveryTests(){
   rec("SR1-53_CLOSED_RECOVERY",String(buildRecoveryFacts_).indexOf("SubjectiveRecovery")<0,{});
   rec("SR1-54_CLOSED_DASHBOARD",String(buildDailyDashboardFacts_).indexOf("SubjectiveRecovery")<0,{});
   rec("SR1-55_CLOSED_PROACTIVE",String(detectProactiveCoachingSignals_).indexOf("SubjectiveRecovery")<0,{});
-  rec("SR1-56_NO_ROUTE",typeof routeSubjectiveRecovery_==="undefined",{});
+  rec("SR1-56_SR2_ROUTE_ADDED",typeof routeSubjectiveRecovery_==="function",{});
   rec("SR1-57_SHEET_NAME",SUBJECTIVE_RECOVERY_SHEET==="Recovery_Checkin",{});
   rec("SR1-58_PARTIAL_CHECKIN",read([event("e1","k1",null,{stress:7})]).metrics.fatigue.status==="MISSING",{});
   const passed=tests.filter(function(t){return t.status==="PASS";}).length;return {suite:"SUBJECTIVE_RECOVERY_SR1",status:passed===tests.length?"PASS":"FAIL",total:tests.length,passed:passed,failed:tests.length-passed,tests:tests,safety:{external_writes:0,sheet_creation:0,telegram_calls:0,groq_calls:0,property_writes:0,production_writes:0}};

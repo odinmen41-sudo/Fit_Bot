@@ -54,6 +54,14 @@ function runWeightTrendsTests() {
   record("WT-44_LOGGING_NOT_STOLEN",detectWeightTrendIntent_("\u043c\u043e\u0439 \u0432\u0435\u0441 116 \u043a\u0433")===null,{});
   record("WT-45_GOAL_INTENT",detectWeightTrendIntent_("\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u043e\u0441\u0442\u0430\u043b\u043e\u0441\u044c \u0434\u043e \u0446\u0435\u043b\u0438 \u043f\u043e \u0432\u0435\u0441\u0443?").intent==="WEIGHT_GOAL",{});
   record("WT-46_PERIOD_INTENT",detectWeightTrendIntent_("\u0447\u0442\u043e \u0441 \u0432\u0435\u0441\u043e\u043c \u0437\u0430 14 \u0434\u043d\u0435\u0439?").days===14,{});
+  record("WT-47_COMPARE_LAST_WEEK",detectWeightTrendIntent_("сравни вес с прошлой неделей").intent==="WEIGHT_WEEK_COMPARE",{});
+  record("WT-48_COMPARE_PREVIOUS_WEEK",detectWeightTrendIntent_("сравни вес с предыдущей неделей").intent==="WEIGHT_WEEK_COMPARE",{});
+  record("WT-49_COMPARE_MY_WEIGHT",detectWeightTrendIntent_("сравни мой вес с прошлой неделей").intent==="WEIGHT_WEEK_COMPARE",{});
+  record("WT-50_COMPARE_WHAT_ABOUT",detectWeightTrendIntent_("что по весу по сравнению с прошлой неделей").intent==="WEIGHT_WEEK_COMPARE",{});
+  record("WT-51_LOGGING_OWNERSHIP",detectWeightTrendIntent_("мой вес 116")===null&&detectExplicitWeightUpdate_("мой вес 116")!==null,{});
+  record("WT-52_CURRENT_OWNERSHIP",detectWeightTrendIntent_("какой у меня сейчас вес?").intent==="WEIGHT_CURRENT",{});
+  record("WT-53_PERIOD_OWNERSHIP",detectWeightTrendIntent_("что с весом за 7 дней?").intent==="WEIGHT_PERIOD",{});
+  record("WT-54_UNKNOWN_FALLBACK",detectWeightTrendIntent_("неизвестная фраза")===null,{});
   const passed=tests.filter(function(t){return t.status==="PASS";}).length;
   return {suite:"WEIGHT_TRENDS_V1",status:passed===tests.length?"PASS":"FAIL",total:tests.length,passed:passed,failed:tests.length-passed,tests:tests,safety:{sheet_writes:0,telegram_calls:0,groq_calls:0,production_writes:0}};
 }

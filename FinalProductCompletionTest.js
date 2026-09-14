@@ -48,6 +48,7 @@ function runFinalProductCompletionTests(){
   const targetRead=routeNutritionTargetRead_({message:{text:"Какие у меня цели по КБЖУ?",from:{id:"u1"},chat:{id:"u1"}}},{dependencies:{load_targets:function(){return {ok:true,code:"TARGETS_AVAILABLE",status:"AVAILABLE",targets:{calories:2300,protein:195,fat:70,carbs:225}};}}});
   record("FINAL-27_TARGET_READ_DETERMINISTIC",targetRead.handled&&targetRead.ok&&targetRead.code==="TARGETS_AVAILABLE"&&targetRead.message==="Ваши цели: 2300 ккал | Б 195 г | Ж 70 г | У 225 г.",targetRead);
   record("FINAL-28_TARGET_READ_NO_UPDATE_CAPTURE",detectExplicitNutritionTargetUpdate_("Какие у меня цели по КБЖУ?")===null,{});
+  record("FINAL-29_NUTRITION_WEEK_ALIAS",detectNutritionHistoryIntent_("Что я ел за неделю?").scope==="LAST_7_DAYS",{});
 
   const passed=tests.filter(function(test){return test.status==="PASS";}).length;return {suite:"FINAL_PRODUCT_COMPLETION",status:passed===tests.length?"PASS":"FAIL",total:tests.length,passed:passed,failed:tests.length-passed,tests:tests,safety:{sheet_writes:0,telegram_calls:0,groq_calls:0,production_writes:0}};
 }

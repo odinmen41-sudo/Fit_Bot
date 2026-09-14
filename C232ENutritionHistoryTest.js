@@ -68,6 +68,7 @@ function runC232ENutritionHistoryTests() {
 
   function intent(text){return detectNutritionHistoryIntent_(text);}rec("E-41_ROUTE_YESTERDAY",intent("что я ел вчера").scope==="YESTERDAY",{});
   rec("E-42_ROUTE_LAST7",intent("сколько калорий за последние 7 дней").scope==="LAST_7_DAYS",{});rec("E-43_ROUTE_COMPARE",intent("как я соблюдал калории за последние 7 дней").mode==="CURRENT_GOAL_COMPARISON",{});
+  rec("E-42A_ROUTE_WEEK_ALIAS",intent("что я ел за неделю").scope==="LAST_7_DAYS",{});
   rec("E-44_REMAINING_UNTOUCHED",intent("сколько осталось калорий")===null,{});rec("E-45_CREATE_UNTOUCHED",intent("банан 200 г")===null,{});
   rec("E-46_VOID_UNTOUCHED",intent("удали последний банан")===null,{});rec("E-47_REPLACE_UNTOUCHED",intent("исправь последний банан на 200 г")===null,{});
   rec("E-48_TARGET_UNTOUCHED",intent("установи цель 2300 ккал")===null,{});rec("E-49_CONFIRM_UNTOUCHED",intent("Да")===null,{});rec("E-50_GREETING_UNTOUCHED",intent("Привет")===null,{});

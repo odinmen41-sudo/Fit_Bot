@@ -4415,7 +4415,7 @@ function detectNutritionHistoryIntent_(text) {
   const historyWords = /(?:что\s+я\s+ел\S*|покажи\s+питание|питание\s+за|сколько(?:\s+\S+){0,3}\s+(?:съел\S*|калори\S*)|средн(?:ий|ее)\s+(?:калораж|белок)|соблюдал\s+калори|дней\s+(?:я\s+)?(?:превышал|добирал)|в\s+какие\s+дни)/.test(normalized);
   if (!historyWords) return null;
   let scope = null;
-  if (/(?:последн\S*\s+7\s+дн|за\s+последние\s+7\s+дн)/.test(normalized)) scope = "LAST_7_DAYS";
+  if (/(?:последн\S*\s+7\s+дн|за\s+последние\s+7\s+дн|за\s+неделю)/.test(normalized)) scope = "LAST_7_DAYS";
   else if (/(?:на\s+этой\s+неделе|за\s+эту\s+неделю)/.test(normalized)) scope = "CURRENT_WEEK";
   else if (/(?:^|\s)вчера(?:\s|$)|за\s+вчера/.test(normalized)) scope = "YESTERDAY";
   else if (/(?:^|\s)сегодня(?:\s|$)/.test(normalized)) scope = "TODAY";

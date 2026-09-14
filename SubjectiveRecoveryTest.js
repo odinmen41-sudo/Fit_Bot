@@ -74,5 +74,28 @@ function runSubjectiveRecoveryTests(){
   rec("SR1-56_SR2_ROUTE_ADDED",typeof routeSubjectiveRecovery_==="function",{});
   rec("SR1-57_SHEET_NAME",SUBJECTIVE_RECOVERY_SHEET==="Recovery_Checkin",{});
   rec("SR1-58_PARTIAL_CHECKIN",read([event("e1","k1",null,{stress:7})]).metrics.fatigue.status==="MISSING",{});
+  function sheetDateSerial(dateText){const parts=dateText.split("-").map(Number);return Math.floor((Date.UTC(parts[0],parts[1]-1,parts[2])-Date.UTC(1899,11,30))/86400000);}
+  const compareDeps=deps(),expectedDateEvent=event("date-e","date-k",null,{stress:0}),dateSerial=sheetDateSerial("2026-09-14");
+  let storedDateEvent=Object.assign({},expectedDateEvent);
+  rec("SR1-59_LOCAL_DATE_STRING_EQUAL",subjectiveRecoveryRecordsEqual_(storedDateEvent,expectedDateEvent,compareDeps),{});
+  storedDateEvent=Object.assign({},expectedDateEvent,{local_date:dateSerial});
+  rec("SR1-60_LOCAL_DATE_SERIAL_EQUAL",subjectiveRecoveryRecordsEqual_(storedDateEvent,expectedDateEvent,compareDeps),{serial:dateSerial});
+  storedDateEvent=Object.assign({},expectedDateEvent,{local_date:new Date("2026-09-13T21:00:00.000Z")});
+  rec("SR1-61_LOCAL_DATE_DATE_EQUAL",subjectiveRecoveryRecordsEqual_(storedDateEvent,expectedDateEvent,compareDeps),{});
+  storedDateEvent=Object.assign({},expectedDateEvent,{local_date:sheetDateSerial("2026-09-13")});
+  rec("SR1-62_DIFFERENT_SERIAL_REJECTED",!subjectiveRecoveryRecordsEqual_(storedDateEvent,expectedDateEvent,compareDeps),{});
+  rec("SR1-63_MALFORMED_SERIAL_REJECTED",subjectiveRecoveryCanonicalLocalDate_(NaN,compareDeps)===null&&subjectiveRecoveryCanonicalLocalDate_(dateSerial+0.5,compareDeps)===null,{});
+  rec("SR1-64_MALFORMED_DATE_REJECTED",subjectiveRecoveryCanonicalLocalDate_("2026-02-30",compareDeps)===null&&subjectiveRecoveryCanonicalLocalDate_("nonsense",compareDeps)===null,{});
+  const serialEnv=memory();serialEnv.dependencies.append_row=function(values){serialEnv.writes++;const stored=values.slice();stored[5]=dateSerial;serialEnv.rows.push(stored);return serialEnv.rows.length+1;};
+  write=appendSubjectiveRecoveryCheckin_("u1",payload("serial-e","serial-k",{fatigue:8}),{now:now,dependencies:serialEnv.dependencies});
+  replay=appendSubjectiveRecoveryCheckin_("u1",payload("serial-e","serial-k",{fatigue:8}),{now:now,dependencies:serialEnv.dependencies});
+  rec("SR1-65_SERIAL_RETRY_IDEMPOTENT",write.ok&&write.verified&&replay.ok&&replay.code==="IDEMPOTENT_REPLAY"&&serialEnv.rows.length===1,{write:write,replay:replay,rows:serialEnv.rows});
+  const numericRow=subjectiveRecoveryRecordValues_(event("numeric-e","numeric-k",null,{stress:0}));numericRow[5]=dateSerial;
+  r=loadAuthoritativeSubjectiveRecovery_("u1",{now:now,table:{headers:SUBJECTIVE_RECOVERY_SCHEMA.slice(),rows:[numericRow]},dependencies:compareDeps});
+  rec("SR1-66_READER_ACCEPTS_SERIAL",r.data_status==="NORMAL"&&r.metrics.stress.status==="FRESH"&&r.metrics.stress.value===0,r);
+  rec("SR1-67_ZERO_UNAFFECTED",r.metrics.stress.value===0&&!subjectiveRecoveryBlank_(r.metrics.stress.value),r);
+  const strictEnv=memory();strictEnv.dependencies.read_row=function(row){strictEnv.reads++;const stored=strictEnv.rows[row-2].slice();stored[1]="different-event";return stored;};
+  write=appendSubjectiveRecoveryCheckin_("u1",payload("strict-e","strict-k",{fatigue:5}),{now:now,dependencies:strictEnv.dependencies});
+  rec("SR1-68_OTHER_FIELDS_STRICT",!write.ok&&write.code==="PERSISTENCE_READBACK_FAILED"&&strictEnv.rows.length===1,write);
   const passed=tests.filter(function(t){return t.status==="PASS";}).length;return {suite:"SUBJECTIVE_RECOVERY_SR1",status:passed===tests.length?"PASS":"FAIL",total:tests.length,passed:passed,failed:tests.length-passed,tests:tests,safety:{external_writes:0,sheet_creation:0,telegram_calls:0,groq_calls:0,property_writes:0,production_writes:0}};
 }

@@ -263,12 +263,12 @@ function buildDialog02AuthoritativeContext_(userId, userText, options) {
 function compactDialog02LegacyContext_(context, requestProfile) {
   const lines = String(context || "").split("\n"), kept = [];
   const explicitDomainRequest = !!(requestProfile && requestProfile.domains && requestProfile.domains.length);
+  if (explicitDomainRequest) return "";
   let keep = false;
   lines.forEach(function(line) {
     const trimmed = String(line || "").trim();
     if (/^[^:]+:\s*$/.test(trimmed)) {
-      keep = /^HEALTH:$/i.test(trimmed) ||
-        (!explicitDomainRequest && /^(?:MEMORY|RECENT HISTORY — DIALOG):$/i.test(trimmed));
+      keep = /^(?:HEALTH|MEMORY|RECENT HISTORY — DIALOG):$/i.test(trimmed);
       if (keep) kept.push(trimmed);
       return;
     }

@@ -260,13 +260,15 @@ function buildDialog02AuthoritativeContext_(userId, userText, options) {
   }
 }
 
-function compactDialog02LegacyContext_(context) {
+function compactDialog02LegacyContext_(context, requestProfile) {
   const lines = String(context || "").split("\n"), kept = [];
+  const explicitDomainRequest = !!(requestProfile && requestProfile.domains && requestProfile.domains.length);
   let keep = false;
   lines.forEach(function(line) {
     const trimmed = String(line || "").trim();
     if (/^[^:]+:\s*$/.test(trimmed)) {
-      keep = /^(?:HEALTH|MEMORY|RECENT HISTORY — DIALOG):$/i.test(trimmed);
+      keep = /^(?:HEALTH|MEMORY):$/i.test(trimmed) ||
+        (!explicitDomainRequest && /^RECENT HISTORY — DIALOG:$/i.test(trimmed));
       if (keep) kept.push(trimmed);
       return;
     }
@@ -609,7 +611,7 @@ function generateCoachReply_(userId, chatId, userText, options) {
   } catch (dialogContextError) {
     dialog02Context = null;
   }
-  if (dialog02Context && dialog02Context.block) context = compactDialog02LegacyContext_(context);
+  if (dialog02Context && dialog02Context.block) context = compactDialog02LegacyContext_(context, dialog02Context.profile);
   const messages = buildGroqMessages_(context, userText, nutritionTodayContext && nutritionTodayContext.block,
     dialog02Context && dialog02Context.block, dialog02Context && dialog02Context.profile);
 

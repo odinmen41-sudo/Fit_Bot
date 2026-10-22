@@ -102,6 +102,8 @@ function runDialog02FreeDialogueTests() {
 
   const compact=compactDialog02LegacyContext_(["USER PROFILE:","Имя: Тест","HEALTH:","Плечо: без жалоб","RECENT HISTORY — DIALOG:","Пользователь: а почему?","NUTRITION:","Калории: 1"].join("\n"));
   rec("D02-CONTEXT-COMPACT",compact.indexOf("Имя: Тест")<0&&compact.indexOf("Калории: 1")<0&&compact.indexOf("Плечо: без жалоб")>=0&&compact.indexOf("Пользователь: а почему?")>=0,{compact:compact});
+  const scopedCompact=compactDialog02LegacyContext_(["HEALTH:","Плечо: без жалоб","RECENT HISTORY — DIALOG:","Ассистент: сегодня 14 г белка"].join("\n"),workoutContext.profile);
+  rec("D02-DOMAIN-SCOPED-HISTORY-NUMBERS-REMOVED",scopedCompact.indexOf("14 г белка")<0&&scopedCompact.indexOf("Плечо: без жалоб")>=0,{compact:scopedCompact});
 
   const weightDecision=naturalDialogDecision_("А что с моим весом?");
   rec("D02-NATURAL-WEIGHT-PARAPHRASE",weightDecision&&weightDecision.domain==="WEIGHT"&&weightDecision.action==="CURRENT",weightDecision);
@@ -123,7 +125,7 @@ function runDialog02FreeDialogueTests() {
   const reply=generateCoachReply_("u1","c1","Почему вес стоит, хотя калории держу?",{properties:props(),build_context:function(){return "USER PROFILE:\nИмя: Тест\nHEALTH:\nПлечо: без жалоб\nRECENT HISTORY — DIALOG:\nПользователь: почему?";},build_dialog02_context:function(){return built;},fetch:function(url,options){calls++;payload=JSON.parse(options.payload);return response();},record_usage:function(){}});
   rec("D02-ONE-GROQ-CALL",calls===1&&reply.text.indexOf("Факт:")===0,{calls:calls,reply:reply});
   rec("D02-GROQ-RECEIVES-TRUSTED-CONTEXT",payload&&payload.messages.length===3&&payload.messages[1].content.indexOf("weight_current_kg=118")>=0,payload);
-  rec("D02-GROQ-COMPACTS-LEGACY",payload&&payload.messages[2].content.indexOf("Имя: Тест")<0&&payload.messages[2].content.indexOf("Плечо: без жалоб")>=0&&payload.messages[2].content.indexOf("Пользователь: почему?")>=0,payload);
+  rec("D02-GROQ-COMPACTS-LEGACY",payload&&payload.messages[2].content.indexOf("Имя: Тест")<0&&payload.messages[2].content.indexOf("Плечо: без жалоб")>=0&&payload.messages[2].content.indexOf("Пользователь: почему?")<0,payload);
   rec("D02-GROQ-PRIMARY-BUDGET",payload&&payload.max_completion_tokens===CONFIG.MAX_OUTPUT_TOKENS,payload);
 
   let recoveryCalls=0,recoveryBudgets=[];

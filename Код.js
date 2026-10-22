@@ -866,8 +866,11 @@ function recordGroqCompletionDiagnostic_(runtime, model, attemptType, finishReas
 
 function buildGroqMessages_(context, userText, nutritionTodayBlock, dialog02Block, dialog02Profile) {
   const systemPrompt = [
-    "Ты Pavel AI Fitness Coach. Отвечай по-русски, спокойно и конкретно: 2–5 коротких предложений, до 140 токенов.",
-    "Опирайся только на контекст; не выдумывай. Дай один следующий шаг или, если данных мало, один вопрос.",
+    "Ты Pavel AI Fitness Coach. Общайся по-русски как дружелюбный компетентный тренер, на «ты», спокойно и без канцелярита.",
+    "Сначала дай результат или главный вывод, затем — одно полезное замечание или следующий шаг, если он уместен. Длину подбирай по задаче; избегай повторов и пустой мотивации.",
+    "Опирайся только на контекст; не выдумывай. Если данных мало, задай один ясный вопрос.",
+    "Для телефона используй короткие абзацы. Важные короткие заголовки и метки можно выделять как **текст**. Эмодзи — не более одного и только когда он помогает быстро прочитать ответ.",
+    "Хвали только за конкретный подтверждённый результат. Не стыди за еду, вес, ошибки учёта или пропуск тренировки.",
     "Разделяй смысл явно: подтверждённое называй фактом, причинное объяснение — выводом, гипотезой или предположением, неизвестное — неопределённостью.",
     "Любые числа бери только из доверенных системных блоков; не пересчитывай и не восстанавливай пропущенные значения.",
     "Не приводи числовые физиологические диапазоны, если их нет в доверенном контексте. Разница между текущим и целевым весом сама по себе не доказывает, что план не работает; для оценки нужен тренд.",
@@ -6611,7 +6614,8 @@ function sendTelegramMessage_(chatId, text, options) {
 
   if (!token) throw new Error("TELEGRAM_TOKEN is not configured in Script Properties");
 
-  const payload = {chat_id: chatId, text: text};
+  const rendered = renderTelegramMessage_(text);
+  const payload = {chat_id: chatId, text: rendered.text, parse_mode: rendered.parse_mode};
   if (options && options.reply_markup) payload.reply_markup = options.reply_markup;
 
   const response = UrlFetchApp.fetch(
@@ -6633,6 +6637,35 @@ function sendTelegramMessage_(chatId, text, options) {
 
   const result = JSON.parse(body);
   if (!result.ok) throw new Error("Telegram sendMessage failed: " + body);
+}
+
+/**
+ * Central, data-neutral Telegram presentation layer.
+ * It escapes all untrusted/model text first and only then adds a small safe
+ * subset of HTML styling. Domain calculations and persisted strings stay
+ * untouched; free-text replies can use **bold** without exposing raw HTML.
+ */
+function renderTelegramMessage_(text) {
+  const source = String(text == null ? "" : text)
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  const escaped = source
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  const lines = escaped.split("\n").map(function(line) {
+    let styled = line.replace(/\*\*([^*\n]{1,120})\*\*/g, "<b>$1</b>");
+    if (/^(?:Сегодня|Итого|План|Фактически выполнено|Факт|Вывод|Предположение|Тренировка|Питание|Вес|Восстановление|Съедено|Цель|Осталось|Превышение|Следующий шаг):/.test(styled) && styled.indexOf("<b>") !== 0) {
+      styled = styled.replace(/^([^:]{1,40}:)/, "<b>$1</b>");
+    }
+    if (/^(?:Сохранить|Подтвердить)\?\s*Да\s*\/\s*Нет\.?$/i.test(styled)) {
+      styled = styled.replace(/^(.*?\?)[\s]*Да\s*\/\s*Нет\.?$/i, "<b>$1</b>\nОтветь: Да или Нет.");
+    }
+    return styled;
+  });
+  return {text: lines.join("\n"), parse_mode: "HTML"};
 }
 
 function answerTelegramCallbackQuery_(callbackQueryId) {

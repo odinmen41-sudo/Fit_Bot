@@ -77,6 +77,8 @@ function runDialog02FreeDialogueTests() {
   const mutationProfile=dialog02RequestProfile_("Исправь это");
   const mutationMessages=buildGroqMessages_("safe","Исправь это",null,built.block,mutationProfile);
   rec("D02-MUTATION-CLARIFICATION-POLICY",mutationMessages[1].content.indexOf("не утверждай, что действие выполнено")>=0,mutationMessages[1]);
+  const blindMutationProfile=dialog02RequestProfile_("Подправь сегодняшний рацион"),blindMutationReply=matchDeterministicCoachIntent_("Подправь сегодняшний рацион");
+  rec("D02-BLIND-MUTATION-SAFE-CLARIFICATION",blindMutationProfile.mutation_requested===true&&blindMutationReply&&blindMutationReply.model==="deterministic_intent"&&/ничего не меняю/.test(blindMutationReply.text),{profile:blindMutationProfile,reply:blindMutationReply});
   rec("D02-PROMPT-NO-PREMATURE-DEFICIT",/Не называй разницу между дневной целью/.test(messages[0].content),messages[0]);
   rec("D02-PROMPT-NO-MANDATORY-WINDOW",/Не навязывай обязательное пищевое окно/.test(messages[0].content),messages[0]);
   rec("D02-PROMPT-NO-UNSOURCED-PHYSIOLOGY-NUMBERS",/Не приводи числовые физиологические диапазоны/.test(messages[0].content),messages[0]);

@@ -32,6 +32,122 @@ const CONTEXT_STAGING_USER_ALIASES = Object.freeze({
   "132976932": "staging-user-001"
 });
 
+/* DIALOG-E2E-01 — thin natural-language orchestration over proven domain routes. */
+const DIALOG_CLARIFICATION_SOURCE = "DIALOG_E2E_01_CLARIFICATION";
+
+function dialogNormalize_(text) {
+  return String(text || "").toLowerCase().replace(/ё/g, "е").replace(/[!?.,]+/g, " ")
+    .replace(/\s+/g, " ").trim();
+}
+
+function naturalDialogDecision_(text) {
+  const value = dialogNormalize_(text);
+  if (!value || /^(?:да|нет|отмена|отменить|воде|на воде|молоке|на молоке|\d+)$/.test(value)) return null;
+  const rules = [
+    {domain:"NUTRITION",action:"HISTORY_TODAY",canonical:"Что я ел сегодня?",pattern:/^(?:покажи что я сегодня ел|что было из еды сегодня|покажи питание за сегодня|напомни что я ел сегодня)$/},
+    {domain:"NUTRITION",action:"DAILY_TOTAL",canonical:"Сколько калорий я съел сегодня?",pattern:/^(?:сколько я сегодня съел|сколько калорий уже набрал|какой итог по еде сегодня|подведи итог питания за сегодня)$/},
+    {domain:"NUTRITION",action:"REMAINING",canonical:"Что осталось по КБЖУ?",pattern:/^(?:сколько еще могу съесть|какой остаток по калориям|сколько осталось на сегодня|что еще можно съесть сегодня)$/},
+    {domain:"WEIGHT",action:"CURRENT",canonical:"Какой у меня сейчас вес?",pattern:/^(?:мой вес сейчас|сколько я сейчас вешу|покажи последний вес|какой мой последний вес)$/},
+    {domain:"WEIGHT",action:"TREND",canonical:"Покажи динамику веса",pattern:/^(?:как меняется мой вес|что с весом за последнее время|покажи изменение веса|есть ли прогресс по весу)$/},
+    {domain:"WORKOUT",action:"TODAY",canonical:"Какая сегодня тренировка?",pattern:/^(?:какой план на сегодня|что тренируем сегодня|покажи план тренировки|какая тренировка по плану)$/},
+    {domain:"WORKOUT",action:"START",canonical:"Начинаем тренировку",mutation_policy:"SESSION_MUTATION",pattern:/^(?:давай тренироваться|начать занятие|поехали тренироваться|запусти тренировку)$/},
+    {domain:"WORKOUT",action:"NEXT",canonical:"Что у меня дальше?",pattern:/^(?:следующее упражнение|что теперь делать в тренировке|покажи следующее упражнение|куда дальше по тренировке)$/},
+    {domain:"WORKOUT",action:"DONE",canonical:"Что я уже сделал?",pattern:/^(?:что уже успел сделать|покажи выполненные упражнения|что выполнено в тренировке|сколько уже сделал в зале)$/},
+    {domain:"WORKOUT",action:"OVERVIEW",canonical:"Покажи мою тренировку",pattern:/^(?:покажи план и факт|как идет моя тренировка|покажи текущую тренировку целиком|сверь план и выполнение)$/},
+    {domain:"DASHBOARD",action:"TODAY",canonical:"Сводка на сегодня",pattern:/^(?:как у меня дела сегодня|дай сводку за сегодня|покажи мой день|что у меня сегодня по всем показателям)$/},
+    {domain:"RECOVERY",action:"STATUS",canonical:"Как я восстановился",pattern:/^(?:как я восстановился|что с восстановлением|оцени мое восстановление|как у меня с восстановлением)$/}
+  ];
+  for (let index = 0; index < rules.length; index += 1) {
+    if (rules[index].pattern.test(value)) return Object.assign({confidence:1,source:"DETERMINISTIC_NATURAL_DIALOG",mutation_policy:"READ_ONLY"}, rules[index]);
+  }
+  if (/^(?:удали|убери|отмени) последн(?:ее|юю|ий)$/.test(value)) {
+    return {domain:"AMBIGUOUS",action:"DELETE_LAST",confidence:0,source:"DETERMINISTIC_AMBIGUITY",
+      mutation_policy:"CLARIFICATION_REQUIRED",message:"Что удалить: последний приём пищи или последний подход? Напишите полную команду, например «удали последний приём пищи» или «удали последний подход жим лёжа»."};
+  }
+  return null;
+}
+
+function naturalDialogRouteResult_(handled, ok, code, extra) {
+  return Object.assign({handled:handled === true,ok:ok === true,code:String(code || ""),groq_calls:0,
+    sheet_writes:0,production_writes:false}, extra || {});
+}
+
+function findDialogClarificationCapture_(userId, chatId, options) {
+  const now = options && options.now instanceof Date ? options.now : new Date();
+  try {
+    const rows = smartConfirmationReadRows_(smartConfirmationSheet_()).filter(function(row) {
+      const payload = smartConfirmationParseJson_(row.payload_json, {});
+      return payload.source === DIALOG_CLARIFICATION_SOURCE;
+    });
+    return selectActiveConfirmationCapture_(rows, userId, chatId, now, "NO_DIALOG_CLARIFICATION");
+  } catch (error) { return {ok:false,code:"CAPTURE_LOOKUP_FAILED"}; }
+}
+
+function dialogOrchestrationDependencies_(overrides) {
+  const supplied = overrides || {};
+  return {find_dialog:supplied.find_dialog || findDialogClarificationCapture_,
+    get_pending:supplied.get_pending || (typeof getPendingCapture_ === "function" ? getPendingCapture_ : function(){return {ok:false,code:"NO_ACTIVE_CAPTURE"};}),
+    create_capture:supplied.create_capture || (typeof createPendingCapture_ === "function" ? createPendingCapture_ : function(){return {ok:false,code:"CAPTURE_RUNTIME_UNAVAILABLE"};}),
+    cancel_capture:supplied.cancel_capture || (typeof cancelPendingCapture_ === "function" ? cancelPendingCapture_ : function(){return {ok:false,code:"CAPTURE_RUNTIME_UNAVAILABLE"};})};
+}
+
+function continueDialogClarification_(selected, update, options, dependencies) {
+  const message = update && (update.message || update.edited_message), text = dialogNormalize_(message && message.text);
+  const userId = String(message && message.from && message.from.id || "").trim(), chatId = String(message && message.chat && message.chat.id || "").trim();
+  if (/^(?:отмена|отменить|нет)$/.test(text)) {
+    const cancelled = dependencies.cancel_capture(userId, chatId, {now:options.now});
+    return naturalDialogRouteResult_(true, !!(cancelled && cancelled.ok), cancelled && cancelled.code || "CANCEL_FAILED",
+      {message:cancelled && cancelled.ok ? "Действие отменено." : "Не удалось отменить уточнение."});
+  }
+  let canonical = "", route = null;
+  if (/^(?:прием пищи|еду|питание|последний прием пищи)$/.test(text)) { canonical = "удали последний приём пищи"; route = routeNutritionMealVoid_; }
+  if (/^(?:подход|последний подход|подход в тренировке)$/.test(text)) { canonical = "удали последний подход"; route = routeWorkoutLoggingHistory_; }
+  if (!route) return naturalDialogRouteResult_(true, true, "DIALOG_CLARIFICATION_REQUIRED", {message:"Уточните: «приём пищи» или «подход»."});
+  const cancelled = dependencies.cancel_capture(userId, chatId, {now:options.now});
+  if (!cancelled || !cancelled.ok) return naturalDialogRouteResult_(true, false, "CLARIFICATION_RELEASE_FAILED", {message:"Не удалось продолжить действие. Попробуйте ещё раз."});
+  const canonicalUpdate = Object.assign({}, update, {message:Object.assign({}, message, {text:canonical})});
+  const result = route(canonicalUpdate, options.route_options || {});
+  return result && result.handled ? Object.assign({}, result, {orchestrated:true,dialog_continuation:true}) :
+    naturalDialogRouteResult_(true, false, "DIALOG_ACTION_UNAVAILABLE", {message:"Не удалось безопасно выполнить выбранное действие."});
+}
+
+function routeNaturalDialogAction_(update, options) {
+  const message = update && (update.message || update.edited_message);
+  const runtime = options || {}, now = runtime.now instanceof Date ? runtime.now : new Date(), deps = dialogOrchestrationDependencies_(runtime.dependencies);
+  const normalized = dialogNormalize_(message && message.text), userId = String(message && message.from && message.from.id || "").trim(), chatId = String(message && message.chat && message.chat.id || "").trim();
+  if (/^(?:прием пищи|еду|питание|последний прием пищи|подход|последний подход|подход в тренировке|отмена|отменить|нет)$/.test(normalized) && userId && chatId) {
+    const selected = deps.find_dialog(userId, chatId, {now:now});
+    if (selected && selected.ok) return continueDialogClarification_(selected, update, {now:now,route_options:runtime}, deps);
+    if (selected && selected.code === "CAPTURE_EXPIRED") return naturalDialogRouteResult_(true, false, "CAPTURE_EXPIRED", {message:"Срок уточнения истёк. Повторите команду."});
+  }
+  const decision = message && typeof message.text === "string" ? naturalDialogDecision_(message.text) : null;
+  if (!decision) return naturalDialogRouteResult_(false, true, "NOT_NATURAL_DIALOG_ACTION");
+  if (decision.mutation_policy === "CLARIFICATION_REQUIRED") {
+    if (!userId || !chatId) return naturalDialogRouteResult_(true, false, "INVALID_USER", {message:"Не удалось определить пользователя."});
+    const conflict = deps.get_pending(userId, chatId, {now:now});
+    if (conflict && conflict.ok) return naturalDialogRouteResult_(true, false, "ACTIVE_CONFIRMATION_CONFLICT", {message:"Сначала завершите или отмените текущее подтверждение данных."});
+    const captureId = "dialog-clarification-" + String(update.update_id || Utilities.getUuid()), payload = {schema_version:"dialog-e2e-01-v1",source:DIALOG_CLARIFICATION_SOURCE,
+      capture_id:captureId,user_id:userId,chat_id:chatId,action:decision.action,items:[{category:"DIALOG_ACTION",fields:{action:{value:decision.action,source:"EXPLICIT_USER_INPUT"}}}]};
+    const created = deps.create_capture(payload, {now:now,ttl_minutes:30,capture_id:captureId,user_id:userId,chat_id:chatId,source_update_id:update.update_id,validation:{ready_for_confirmation:true,errors:[]}});
+    return naturalDialogRouteResult_(true, !!(created && created.ok), created && created.ok ? "DIALOG_CLARIFICATION_REQUIRED" : created && created.code || "CAPTURE_CREATE_FAILED",
+      {message:created && created.ok ? decision.message : "Не удалось сохранить уточнение. Попробуйте ещё раз.",decision:decision,pending_capture_writes:created && created.created === false ? 0 : created && created.ok ? 1 : 0});
+  }
+  const canonical = Object.assign({}, update, {message:Object.assign({}, message, {text:decision.canonical})});
+  const routes = Object.assign({
+    "NUTRITION:HISTORY_TODAY":routeNutritionHistory_, "NUTRITION:DAILY_TOTAL":routeDailyNutritionSummary_,
+    "NUTRITION:REMAINING":routeRemainingNutritionTargets_, "WEIGHT:CURRENT":routeWeightTrends_,
+    "WEIGHT:TREND":routeWeightTrends_, "WORKOUT:TODAY":routeWorkoutPlan_,
+    "WORKOUT:START":routeWorkoutLoggingHistory_, "WORKOUT:NEXT":routeWorkoutLoggingHistory_,
+    "WORKOUT:DONE":routeWorkoutLoggingHistory_, "WORKOUT:OVERVIEW":routeWorkoutLoggingHistory_,
+    "DASHBOARD:TODAY":routeDailyDashboard_, "RECOVERY:STATUS":routeRecoveryFacts_
+  }, options && options.routes || {});
+  const route = routes[decision.domain + ":" + decision.action];
+  if (typeof route !== "function") return naturalDialogRouteResult_(true, false, "DIALOG_ACTION_UNAVAILABLE", {message:"Не удалось безопасно выбрать действие.",decision:decision});
+  const result = route(canonical, options || {});
+  if (!result || result.handled !== true) return naturalDialogRouteResult_(true, false, "DIALOG_ACTION_UNAVAILABLE", {message:"Не удалось безопасно выполнить выбранное действие.",decision:decision});
+  return Object.assign({}, result, {decision:decision,orchestrated:true,groq_calls:0,production_writes:false});
+}
+
 function doGet() {
   return httpOk_("Pavel AI Fitness Coach webhook with Groq AI is running");
 }
@@ -125,6 +241,14 @@ function doPost(e) {
     const messageCollection = routeCollectionProductionBridge_(update);
     if (messageCollection.handled) {
       markBotInputProcessed_(inputRow, messageCollection.ok ? "Да" : "Ошибка collection");
+      return httpOk_("OK");
+    }
+
+    const naturalDialog = routeNaturalDialogAction_(update);
+    if (naturalDialog.handled) {
+      sendTelegramMessage_(chatId, naturalDialog.message);
+      logAiReply_(messageText, naturalDialog.message, "natural_dialog_orchestrator");
+      markBotInputProcessed_(inputRow, naturalDialog.ok ? "Да" : "Ошибка dialog orchestration");
       return httpOk_("OK");
     }
 

@@ -267,8 +267,8 @@ function compactDialog02LegacyContext_(context, requestProfile) {
   lines.forEach(function(line) {
     const trimmed = String(line || "").trim();
     if (/^[^:]+:\s*$/.test(trimmed)) {
-      keep = /^(?:HEALTH|MEMORY):$/i.test(trimmed) ||
-        (!explicitDomainRequest && /^RECENT HISTORY — DIALOG:$/i.test(trimmed));
+      keep = /^HEALTH:$/i.test(trimmed) ||
+        (!explicitDomainRequest && /^(?:MEMORY|RECENT HISTORY — DIALOG):$/i.test(trimmed));
       if (keep) kept.push(trimmed);
       return;
     }
@@ -945,6 +945,7 @@ function buildGroqMessages_(context, userText, nutritionTodayBlock, dialog02Bloc
       "Не повторяй служебные маркеры MISSING, UNAVAILABLE, DATA_INTEGRITY_ERROR или NORMAL пользователю; объясняй их обычным языком. NORMAL — статус чтения данных, а не оценка здоровья, веса или формы.",
       "Используй значения как факты, но формулируй причинные связи только как вывод или гипотезу.",
       "Если вопрос касается действующего тренировочного плана, используй только training_plan_* из этого блока. Не придумывай упражнения, подходы, повторения или вес и не подменяй подтверждённую версию примерной программой.",
+      "Если у упражнения отсутствует только один параметр, например load, остальные подтверждённые параметры остаются фактами; не называй всё упражнение неизвестным.",
       dialog02Profile && dialog02Profile.mutation_requested ?
         "Запрос похож на изменение данных: не утверждай, что действие выполнено, и запроси безопасное уточнение/подтверждение." :
         "Этот запрос не даёт права изменять данные.",

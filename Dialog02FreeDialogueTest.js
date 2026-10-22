@@ -99,11 +99,12 @@ function runDialog02FreeDialogueTests() {
   rec("D02-PROMPT-NORMAL-IS-NOT-HEALTH",/NORMAL — статус чтения данных/.test(messages[1].content),messages[1]);
   const workoutMessages=buildGroqMessages_("safe","Оцени мой план на сегодня",null,workoutContext.block,workoutContext.profile);
   rec("D02-PROMPT-AUTHORITATIVE-PLAN-ONLY",/используй только training_plan_/.test(workoutMessages[1].content)&&/не подменяй подтверждённую версию/.test(workoutMessages[1].content),workoutMessages[1]);
+  rec("D02-PROMPT-PARTIAL-PLAN-MISSING-IS-NARROW",/отсутствует только один параметр/.test(workoutMessages[1].content)&&/остальные подтверждённые параметры/.test(workoutMessages[1].content),workoutMessages[1]);
 
   const compact=compactDialog02LegacyContext_(["USER PROFILE:","Имя: Тест","HEALTH:","Плечо: без жалоб","RECENT HISTORY — DIALOG:","Пользователь: а почему?","NUTRITION:","Калории: 1"].join("\n"));
   rec("D02-CONTEXT-COMPACT",compact.indexOf("Имя: Тест")<0&&compact.indexOf("Калории: 1")<0&&compact.indexOf("Плечо: без жалоб")>=0&&compact.indexOf("Пользователь: а почему?")>=0,{compact:compact});
-  const scopedCompact=compactDialog02LegacyContext_(["HEALTH:","Плечо: без жалоб","RECENT HISTORY — DIALOG:","Ассистент: сегодня 14 г белка"].join("\n"),workoutContext.profile);
-  rec("D02-DOMAIN-SCOPED-HISTORY-NUMBERS-REMOVED",scopedCompact.indexOf("14 г белка")<0&&scopedCompact.indexOf("Плечо: без жалоб")>=0,{compact:scopedCompact});
+  const scopedCompact=compactDialog02LegacyContext_(["HEALTH:","Плечо: без жалоб","MEMORY:","Белок: 14 г","RECENT HISTORY — DIALOG:","Ассистент: сегодня 14 г белка"].join("\n"),workoutContext.profile);
+  rec("D02-DOMAIN-SCOPED-HISTORY-NUMBERS-REMOVED",scopedCompact.indexOf("14 г белка")<0&&scopedCompact.indexOf("Белок:")<0&&scopedCompact.indexOf("Плечо: без жалоб")>=0,{compact:scopedCompact});
 
   const weightDecision=naturalDialogDecision_("А что с моим весом?");
   rec("D02-NATURAL-WEIGHT-PARAPHRASE",weightDecision&&weightDecision.domain==="WEIGHT"&&weightDecision.action==="CURRENT",weightDecision);

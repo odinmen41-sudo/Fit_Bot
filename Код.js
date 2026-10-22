@@ -307,11 +307,18 @@ function auditAdviceEvidence_(text, contract) {
   return {ok:violations.length===0,violations:violations};
 }
 
-function evidenceSafeCoachFallback_(dialogProfile) {
+function evidenceBlockValue_(blocks,key) {
+  const match=new RegExp("(?:^|\\n)"+String(key).replace(/[.*+?^${}()|[\]\\]/g,"\\$&")+"=([^\\n]+)").exec(String(blocks||""));
+  return match?String(match[1]).trim():null;
+}
+
+function evidenceSafeCoachFallback_(dialogProfile, dialogBlock, nutritionBlock) {
   const domains = dialogProfile && dialogProfile.domains || [];
-  return {text:domains.indexOf("WORKOUT")>=0 ?
-    "Подтверждённый план прочитан корректно. Качественно он содержит силовую основу, но персональный числовой шаг прогрессии нельзя надёжно назначить без динамики фактических подходов и восстановления. Зафиксируй выполнение текущего плана — после этого можно обосновать следующую корректировку." :
-    "Подтверждённые данные прочитаны, но для персональной числовой рекомендации пока недостаточно оснований. Уточни желаемое изменение или добавь фактическую динамику — тогда я отделю факт от оценки и предложу проверяемый следующий шаг.",model:"deterministic_evidence_fallback",evidence_fallback:true};
+  const blocks=[dialogBlock||"",nutritionBlock||""].join("\n"), lines=[];
+  if(domains.indexOf("WORKOUT")>=0){const session=evidenceBlockValue_(blocks,"training_plan_session");lines.push("Факт: действующий план"+(session?" — "+session:" прочитан")+". Он содержит силовую основу. Персональный шаг прогрессии стоит обосновыват по фактическому выполнению и восстановлению, а не по универсальному шаблону.");}
+  if(domains.indexOf("NUTRITION")>=0){const c=evidenceBlockValue_(blocks,"nutrition_consumed_calories")||evidenceBlockValue_(blocks,"logged_kcal"),t=evidenceBlockValue_(blocks,"nutrition_target_calories")||evidenceBlockValue_(blocks,"target_kcal"),r=evidenceBlockValue_(blocks,"nutrition_remaining_calories")||evidenceBlockValue_(blocks,"remaining_based_on_logged_kcal");lines.push("Факт по записям: "+(c||"данные о калориях недоступны")+(t?" ккал из цели "+t:"")+(r?"; по записям остаётся "+r+" ккал":"")+". Это не доказывает, что незаписанной еды не было. Общий принцип: выбор следующей еды можно соотнести с настроенными остатками, но порцию надо уточнить по продукту и аппетиту.");}
+  if(!lines.length)lines.push("Подтверждённые данные прочитаны, но для персональной рекомендации пока недостаточно оснований. Уточни желаемое изменение или добавь фактическую динамику.");
+  return {text:lines.join("\n\n"),model:"deterministic_evidence_fallback",evidence_fallback:true};
 }
 
 function finalizeEvidenceBoundReply_(reply, apiKey, model, messages, evidence, profile, options) {
@@ -324,7 +331,7 @@ function finalizeEvidenceBoundReply_(reply, apiKey, model, messages, evidence, p
     const secondAudit = auditAdviceEvidence_(repaired.text,evidence);
     if (secondAudit.ok) return Object.assign({},repaired,{evidence_audit:"REPAIRED"});
   } catch (ignored) {}
-  return evidenceSafeCoachFallback_(profile);
+  return evidenceSafeCoachFallback_(profile, messages.map(function(m){return m.content;}).join("\n"), "");
 }
 
 function doGet() {

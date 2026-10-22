@@ -579,12 +579,7 @@ function generateCoachReply_(userId, chatId, userText, options) {
           attempt_type: "primary_recovery"
         }));
       } catch (recoveryError) {
-        if (recoveryError && (recoveryError.code === "GROQ_COMPLETION_INCOMPLETE" ||
-            recoveryError.code === "GROQ_COMPLETION_NON_NORMAL")) {
-          if (!(recoveryError.code === "GROQ_COMPLETION_INCOMPLETE" && recoveryError.nonEmpty === false)) {
-            throw recoveryError;
-          }
-        }
+        if (recoveryError && recoveryError.code === "GROQ_COMPLETION_NON_NORMAL") throw recoveryError;
         return callGroqFallback_(apiKey, fallbackModel, primaryModel, messages, recoveryError, runtime);
       }
     }
@@ -597,7 +592,7 @@ function callGroqFallback_(apiKey, fallbackModel, primaryModel, messages, source
   const runtime = options || {};
   const fallbackEligible = sourceError &&
     (sourceError.retryable === true || sourceError.fallbackEligible === true ||
-      (sourceError.code === "GROQ_COMPLETION_INCOMPLETE" && sourceError.nonEmpty === false));
+      sourceError.code === "GROQ_COMPLETION_INCOMPLETE");
   if (!fallbackEligible || !fallbackModel || fallbackModel === primaryModel) throw sourceError;
   try {
     recordAiUsageMetrics_({groq_fallback_calls: 1}, runtime.metrics);
@@ -887,6 +882,7 @@ function buildGroqMessages_(context, userText, nutritionTodayBlock, dialog02Bloc
     messages.push({role:"system",content:[
       "Следующий блок создан сервером из authoritative readers и относится только к текущему пользователю.",
       "Значение MISSING означает отсутствие подтверждённого факта, а UNAVAILABLE или DATA_INTEGRITY_ERROR — невозможность надёжного чтения.",
+      "Не повторяй служебные маркеры MISSING, UNAVAILABLE или DATA_INTEGRITY_ERROR пользователю; объясняй их обычным языком.",
       "Используй значения как факты, но формулируй причинные связи только как вывод или гипотезу.",
       dialog02Profile && dialog02Profile.mutation_requested ?
         "Запрос похож на изменение данных: не утверждай, что действие выполнено, и запроси безопасное уточнение/подтверждение." :

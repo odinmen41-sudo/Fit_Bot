@@ -67,11 +67,13 @@ function runC17J2GroqLengthTerminationTests() {
   diagnostics = [];
   run = runWith([
     {content:"partial one",finish_reason:"length",completion_tokens:300},
-    {content:"partial two",finish_reason:"length",completion_tokens:600}
+    {content:"partial two",finish_reason:"length",completion_tokens:600},
+    {content:"complete fallback",finish_reason:"stop",completion_tokens:80}
   ], diagnostics);
-  record("C17J2-C_PRIMARY_LENGTH_TWICE", !run.result && run.error &&
-    run.error.code === "GROQ_COMPLETION_INCOMPLETE" && run.requests.length === 2,
-    {error:run.error && run.error.message,requests:run.requests});
+  record("C17J2-C_PRIMARY_LENGTH_TWICE_FALLBACK", run.result &&
+    run.result.text === "complete fallback" && run.result.model === "openai/gpt-oss-20b" &&
+    run.requests.length === 3 && run.requests[2].max_completion_tokens === 600,
+    run);
 
   diagnostics = [];
   run = runWith([
@@ -97,16 +99,17 @@ function runC17J2GroqLengthTerminationTests() {
   diagnostics = [];
   run = runWith([
     {content:"",finish_reason:"length",completion_tokens:300},
+    {content:"recovery partial",finish_reason:"length",completion_tokens:600},
     {content:"fallback partial",finish_reason:"length",completion_tokens:300}
   ], diagnostics);
   record("C17J2-F_FALLBACK_LENGTH_REJECTED", !run.result && run.error &&
-    run.error.code === "GROQ_COMPLETION_INCOMPLETE" && run.requests.length === 2,
+    run.error.code === "GROQ_COMPLETION_INCOMPLETE" && run.requests.length === 3,
     {error:run.error && run.error.message,requests:run.requests});
 
   const serializedDiagnostics = JSON.stringify(diagnostics);
-  record("C17J2-G_SAFE_TOKEN_DIAGNOSTICS", diagnostics.length === 2 &&
-    diagnostics[1].finish_reason === "length" && diagnostics[1].completion_tokens === 300 &&
-    diagnostics[1].assistant_character_count === "fallback partial".length &&
+  record("C17J2-G_SAFE_TOKEN_DIAGNOSTICS", diagnostics.length === 3 &&
+    diagnostics[2].finish_reason === "length" && diagnostics[2].completion_tokens === 300 &&
+    diagnostics[2].assistant_character_count === "fallback partial".length &&
     serializedDiagnostics.indexOf("fallback partial") < 0 && serializedDiagnostics.indexOf("secret prompt") < 0,
     {diagnostics:diagnostics});
 
@@ -114,7 +117,8 @@ function runC17J2GroqLengthTerminationTests() {
   diagnostics = [];
   run = runWith([
     {content:"never send one",finish_reason:"length",completion_tokens:300},
-    {content:"never send two",finish_reason:"length",completion_tokens:600}
+    {content:"never send two",finish_reason:"length",completion_tokens:600},
+    {content:"never send three",finish_reason:"length",completion_tokens:600}
   ], diagnostics);
   if (run.result) telegramCalls += 1;
   record("C17J2-H_INCOMPLETE_NEVER_REACHES_DELIVERY", telegramCalls === 0 && !run.result &&

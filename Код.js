@@ -883,7 +883,7 @@ function buildGroqMessages_(context, userText, nutritionTodayBlock, dialog02Bloc
     messages.push({role:"system",content:[
       "Следующий блок создан сервером из authoritative readers и относится только к текущему пользователю.",
       "Значение MISSING означает отсутствие подтверждённого факта, а UNAVAILABLE или DATA_INTEGRITY_ERROR — невозможность надёжного чтения.",
-      "Не повторяй служебные маркеры MISSING, UNAVAILABLE или DATA_INTEGRITY_ERROR пользователю; объясняй их обычным языком.",
+      "Не повторяй служебные маркеры MISSING, UNAVAILABLE, DATA_INTEGRITY_ERROR или NORMAL пользователю; объясняй их обычным языком. NORMAL — статус чтения данных, а не оценка здоровья, веса или формы.",
       "Используй значения как факты, но формулируй причинные связи только как вывод или гипотезу.",
       dialog02Profile && dialog02Profile.mutation_requested ?
         "Запрос похож на изменение данных: не утверждай, что действие выполнено, и запроси безопасное уточнение/подтверждение." :

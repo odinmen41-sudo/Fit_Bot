@@ -82,6 +82,7 @@ function runDialog02FreeDialogueTests() {
   rec("D02-PROMPT-NO-UNSOURCED-PHYSIOLOGY-NUMBERS",/Не приводи числовые физиологические диапазоны/.test(messages[0].content),messages[0]);
   rec("D02-PROMPT-WEIGHT-TREND-REQUIRED",/для оценки нужен тренд/.test(messages[0].content),messages[0]);
   rec("D02-PROMPT-HIDES-INTERNAL-MISSING",/Не повторяй служебные маркеры/.test(messages[1].content),messages[1]);
+  rec("D02-PROMPT-NORMAL-IS-NOT-HEALTH",/NORMAL — статус чтения данных/.test(messages[1].content),messages[1]);
 
   const compact=compactDialog02LegacyContext_(["USER PROFILE:","Имя: Тест","HEALTH:","Плечо: без жалоб","RECENT HISTORY — DIALOG:","Пользователь: а почему?","NUTRITION:","Калории: 1"].join("\n"));
   rec("D02-CONTEXT-COMPACT",compact.indexOf("Имя: Тест")<0&&compact.indexOf("Калории: 1")<0&&compact.indexOf("Плечо: без жалоб")>=0&&compact.indexOf("Пользователь: а почему?")>=0,{compact:compact});

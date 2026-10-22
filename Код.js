@@ -2501,6 +2501,7 @@ function normalizeFoodAlias_(value) {
 function resolvePreparationState_(foodText) {
   let normalized = normalizeFoodAlias_(foodText);
   const definitions = [
+    {state: "COOKED_WATER", pattern: /(?:^|\s)(?:на\s+воде)(?=\s|$)/g},
     {state: "BOILED", pattern: /(?:^|\s)(?:вареный|вареная|вареное|вареную|вареного|отварной|отварная|отварную)(?=\s|$)/g},
     {state: "DRY", pattern: /(?:^|\s)(?:сухой|сухая|сухую|сухого)(?=\s|$)/g},
     {state: "FRIED", pattern: /(?:^|\s)(?:жареный|жареная|жареное|жареную|жареного)(?=\s|$)/g},
@@ -2565,6 +2566,9 @@ function validateFoodReferenceRecord_(reference) {
 function selectNutritionReference_(identity, detectedPreparation, quantityUnit, references) {
   const preparation = detectedPreparation !== "UNKNOWN"
     ? detectedPreparation : String(identity.preparation_hint || "UNKNOWN");
+  if (identity.food_id === "oatmeal" && preparation === "UNKNOWN") {
+    return {status: "CLARIFICATION_REQUIRED", reference: null};
+  }
   let candidates = (references || []).filter(function(reference) {
     if (!validateFoodReferenceRecord_(reference) || reference.FOOD_ID !== identity.food_id) return false;
     return identity.variant ? reference.VARIANT === identity.variant : !reference.VARIANT;
@@ -2603,6 +2607,9 @@ function nutritionReferenceClarification_(resolution) {
   }
   if (foodId === "chicken_breast") {
     return "Как была приготовлена куриная грудка? Отправьте полную запись, например: «куриная грудка варёная 200 г».";
+  }
+  if (foodId === "oatmeal") {
+    return "Овсяная каша была на воде или на молоке? Отправьте полную запись, например: «овсяная каша на воде 250 г».";
   }
   return "Продукт отсутствует в проверенном справочнике. Уточните продукт и способ приготовления полной записью.";
 }

@@ -60,6 +60,11 @@ function naturalDialogDecision_(text) {
   for (let index = 0; index < rules.length; index += 1) {
     if (rules[index].pattern.test(value)) return Object.assign({confidence:1,source:"DETERMINISTIC_NATURAL_DIALOG",mutation_policy:"READ_ONLY"}, rules[index]);
   }
+  const workoutPlanIntent = typeof detectWorkoutPlanIntent_ === "function" ? detectWorkoutPlanIntent_(text) : null;
+  if (workoutPlanIntent && workoutPlanIntent.intent === "WORKOUT_TODAY") {
+    return {domain:"WORKOUT",action:"TODAY",canonical:"Какая сегодня тренировка?",confidence:1,
+      source:"DETERMINISTIC_AUTHORITATIVE_WORKOUT_PLAN",mutation_policy:"READ_ONLY"};
+  }
   if (/^(?:удали|убери|отмени) последн(?:ее|юю|ий)$/.test(value)) {
     return {domain:"AMBIGUOUS",action:"DELETE_LAST",confidence:0,source:"DETERMINISTIC_AMBIGUITY",
       mutation_policy:"CLARIFICATION_REQUIRED",message:"Что удалить: последний приём пищи или последний подход? Напишите полную команду, например «удали последний приём пищи» или «удали последний подход жим лёжа»."};
@@ -4428,6 +4433,10 @@ function detectWorkoutPlanIntent_(text) {
   if(!normalized)return null;
   if(/^(?:какая|когда)\s+следующая\s+тренировка$/.test(normalized))return {intent:"NEXT_WORKOUT"};
   if(/^(?:что\s+у\s+меня\s+сегодня\s+по\s+тренировке|какая\s+сегодня\s+тренировка|что\s+мне\s+сегодня\s+делать|что\s+мне\s+делать\s+сегодня|что\s+делать\s+сегодня|что\s+сегодня\s+делать\s+в\s+зале|что\s+сегодня\s+по\s+плану|что\s+запланировано\s+сегодня|что\s+логичнее\s+делать\s+в\s+зале\s+сегодня|покажи\s+тренировку\s+на\s+сегодня|какие\s+сегодня\s+упражнения|какие\s+упражнения\s+сегодня|какие\s+упражнения\s+запланированы|есть\s+ли\s+сегодня\s+тренировка|есть\s+ли\s+занятие\s+по\s+плану)$/.test(normalized))return {intent:"WORKOUT_TODAY"};
+  const asksExactPlan=/(?:назови|покажи|перечисли|распиши|какие|что именно|подтвержденн|параметр)/.test(normalized),
+    planSubject=/(?:тренировочн\S*\s+план|план\S*\s+(?:на\s+)?сегодня|упражнен)/.test(normalized),
+    currentScope=/(?:сегодня|текущ|актуальн|действующ|подтвержденн)/.test(normalized);
+  if(asksExactPlan&&planSubject&&currentScope)return {intent:"WORKOUT_TODAY"};
   return null;
 }
 

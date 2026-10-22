@@ -102,6 +102,9 @@ function runDialog02FreeDialogueTests() {
   const weightDecision=naturalDialogDecision_("А что с моим весом?");
   rec("D02-NATURAL-WEIGHT-PARAPHRASE",weightDecision&&weightDecision.domain==="WEIGHT"&&weightDecision.action==="CURRENT",weightDecision);
   ["Что мне делать сегодня?","Что сегодня по плану?","Что логичнее делать в зале сегодня?","Какие упражнения запланированы?"].forEach(function(value,index){const decision=naturalDialogDecision_(value);rec("D02-WORKOUT-CONSISTENCY-"+(index+1),decision&&decision.domain==="WORKOUT"&&decision.action==="TODAY",{value:value,decision:decision});});
+  const exactPlanDecision=naturalDialogDecision_("Оцени актуальный план на сегодня и назови подтверждённые параметры жима лёжа.");
+  rec("D02-EXACT-PLAN-BYPASSES-AI",exactPlanDecision&&exactPlanDecision.domain==="WORKOUT"&&exactPlanDecision.action==="TODAY"&&exactPlanDecision.source==="DETERMINISTIC_AUTHORITATIVE_WORKOUT_PLAN",exactPlanDecision);
+  rec("D02-ANALYTICAL-PLAN-KEEPS_AI",naturalDialogDecision_("Насколько мой сегодняшний план соответствует цели сохранить силовые?")===null,{});
   const recoveryAdvice=parseSubjectiveRecoveryInput_("Мало спал — стоит ли менять тренировку?");
   rec("D02-RECOVERY-ADVICE-NOT-CAPTURE",recoveryAdvice.status==="NOT_RECOVERY"&&recoveryAdvice.advisory===true,recoveryAdvice);
   const recoveryDomainFact=detectDomainFactCandidate_("Мало спал — стоит ли менять тренировку?");

@@ -47,6 +47,10 @@ function runWorkoutTodayTests() {
   const changed=[base({PLANNED_SETS:3,PLANNED_REPS:"6",PLANNED_LOAD:110})];
   const changedRoute=routeWorkoutPlan_({message:{text:"Что мне делать сегодня?",from:{id:"u1"},chat:{id:"u1"}}},{now:new Date("2026-08-30T12:00:00Z"),dependencies:dependencies(changed)});
   record("WT-CONSISTENCY-ACTIVE-VERSION",changedRoute.handled&&/3 × 6/.test(changedRoute.message)&&/110 кг/.test(changedRoute.message)&&!/115 кг/.test(changedRoute.message),changedRoute);
+  ["Оцени актуальный план на сегодня и назови подтверждённые параметры жима лёжа.","Распиши действующий тренировочный план на сегодня.","Какие параметры упражнений подтверждены в текущем плане?"].forEach(function(value,index){
+    const parsed=intent(value);record("WT-EXACT-PLAN-"+(index+1),parsed&&parsed.intent==="WORKOUT_TODAY",{value:value,parsed:parsed});
+  });
+  record("WT-ANALYTICAL-QUESTION-REMAINS_AI",intent("Насколько мой сегодняшний план соответствует цели сохранить силовые?")===null,{});
   const passed=tests.filter(function(test){return test.status==="PASS";}).length;
   return {suite:"WORKOUT_TODAY",status:passed===tests.length?"PASS":"FAIL",total:tests.length,passed:passed,failed:tests.length-passed,tests:tests,safety:{sheet_writes:0,workout_log_reads:0,ai_memory_reads:0,coach_state_reads:0,telegram_calls:0,groq_calls:0,production_writes:0}};
 }

@@ -100,6 +100,17 @@ function runDialog02FreeDialogueTests() {
   const workoutMessages=buildGroqMessages_("safe","Оцени мой план на сегодня",null,workoutContext.block,workoutContext.profile);
   rec("D02-PROMPT-AUTHORITATIVE-PLAN-ONLY",/используй только training_plan_/.test(workoutMessages[1].content)&&/не подменяй подтверждённую версию/.test(workoutMessages[1].content),workoutMessages[1]);
   rec("D02-PROMPT-PARTIAL-PLAN-MISSING-IS-NARROW",/отсутствует только один параметр/.test(workoutMessages[1].content)&&/остальные подтверждённые параметры/.test(workoutMessages[1].content),workoutMessages[1]);
+  const workoutEvidence=adviceEvidenceContract_("Насколько план подходит для силы?",workoutContext.block,null);
+  rec("D02-EVIDENCE-PLAN-FACTS-ALLOWED",auditAdviceEvidence_("Жим лёжа 3 × 6 × 110 кг — подтверждённый факт.",workoutEvidence).ok,workoutEvidence);
+  rec("D02-EVIDENCE-UNSOURCED-PRINCIPLE-NUMBER-REJECTED",!auditAdviceEvidence_("Это 80% от 1RM.",workoutEvidence).ok,{});
+  rec("D02-EVIDENCE-UNSOURCED-PERSONAL-PROGRESSION-REJECTED",!auditAdviceEvidence_("Добавляй 2–5 кг каждые 2–3 недели.",workoutEvidence).ok,{});
+  const proposedEvidence=adviceEvidenceContract_("Предложи цель 2200 ккал",workoutContext.block,null);
+  rec("D02-EVIDENCE-USER-PROPOSED-NUMBER-ALLOWED",auditAdviceEvidence_("Можно рассмотреть 2200 ккал как предложение.",proposedEvidence).ok,proposedEvidence);
+  const nutritionEvidence=adviceEvidenceContract_("Что по питанию?",built.block,null);
+  rec("D02-EVIDENCE-NUTRITION-FACTS-ALLOWED",auditAdviceEvidence_("Факт: записано 13,97 г белка при дневной цели 195 г.",nutritionEvidence).ok,nutritionEvidence);
+  rec("D02-EVIDENCE-NUTRITION-PRESCRIPTION-REJECTED",!auditAdviceEvidence_("Добавь 30–40 г сейчас, а к концу дня 80–100 г.",nutritionEvidence).ok,{});
+  const crossEvidence=adviceEvidenceContract_("Как питание связано с тренировкой?",crossDomainContext.block,null);
+  rec("D02-EVIDENCE-CROSS-DOMAIN-FACTS-ALLOWED",auditAdviceEvidence_("В плане жим 3 × 6 × 110 кг, цель белка 195 г.",crossEvidence).ok,crossEvidence);
 
   const compact=compactDialog02LegacyContext_(["USER PROFILE:","Имя: Тест","HEALTH:","Плечо: без жалоб","RECENT HISTORY — DIALOG:","Пользователь: а почему?","NUTRITION:","Калории: 1"].join("\n"));
   rec("D02-CONTEXT-COMPACT",compact.indexOf("Имя: Тест")<0&&compact.indexOf("Калории: 1")<0&&compact.indexOf("Плечо: без жалоб")>=0&&compact.indexOf("Пользователь: а почему?")>=0,{compact:compact});
@@ -128,6 +139,13 @@ function runDialog02FreeDialogueTests() {
   rec("D02-GROQ-RECEIVES-TRUSTED-CONTEXT",payload&&payload.messages.length===3&&payload.messages[1].content.indexOf("weight_current_kg=118")>=0,payload);
   rec("D02-GROQ-COMPACTS-LEGACY",payload&&payload.messages[2].content.indexOf("Имя: Тест")<0&&payload.messages[2].content.indexOf("Плечо: без жалоб")<0&&payload.messages[2].content.indexOf("Пользователь: почему?")<0,payload);
   rec("D02-GROQ-PRIMARY-BUDGET",payload&&payload.max_completion_tokens===CONFIG.MAX_OUTPUT_TOKENS,payload);
+
+  let evidenceCalls=0;
+  const evidenceReply=generateCoachReply_("u1","c1","Насколько мой сегодняшний план соответствует цели сохранить силовые?",{properties:props(),build_context:function(){return "MEMORY:\nБелок: 14 г";},build_dialog02_context:function(){return workoutContext;},fetch:function(){evidenceCalls++;const text=evidenceCalls===1?"Жим 3 × 6 × 110 кг. Добавляй 5 кг каждые 2 недели.":"Факт: жим 3 × 6 × 110 кг. Общий принцип: менять нагрузку стоит по подтверждённой динамике выполнения.";return {getResponseCode:function(){return 200;},getContentText:function(){return JSON.stringify({choices:[{message:{content:text},finish_reason:"stop"}]});}};},record_usage:function(){}});
+  rec("D02-EVIDENCE-REPAIR-ONE-RETRY",evidenceCalls===2&&evidenceReply.evidence_audit==="REPAIRED"&&evidenceReply.text.indexOf("5 кг")<0,{calls:evidenceCalls,reply:evidenceReply});
+  let fallbackCalls=0;
+  const evidenceFallback=generateCoachReply_("u1","c1","Насколько мой сегодняшний план соответствует цели сохранить силовые?",{properties:props(),build_context:function(){return "safe";},build_dialog02_context:function(){return workoutContext;},fetch:function(){fallbackCalls++;return {getResponseCode:function(){return 200;},getContentText:function(){return JSON.stringify({choices:[{message:{content:"Добавляй 5 кг каждые 2 недели."},finish_reason:"stop"}]});}};},record_usage:function(){}});
+  rec("D02-EVIDENCE-REPAIR-FAILS-CLOSED",fallbackCalls===2&&evidenceFallback.evidence_fallback===true&&evidenceFallback.model==="deterministic_evidence_fallback",{calls:fallbackCalls,reply:evidenceFallback});
 
   let recoveryCalls=0,recoveryBudgets=[];
   const recovered=generateCoachReply_("u1","c1","Вес стоит, хотя калории держу",{properties:props(),build_context:function(){return "safe";},build_dialog02_context:function(){return built;},fetch:function(url,options){recoveryCalls++;const request=JSON.parse(options.payload);recoveryBudgets.push(request.max_completion_tokens);if(recoveryCalls===1)return {getResponseCode:function(){return 200;},getContentText:function(){return JSON.stringify({choices:[{message:{content:""},finish_reason:"length"}],usage:{completion_tokens:CONFIG.MAX_OUTPUT_TOKENS,total_tokens:1200}});}};return response();},record_usage:function(){}});

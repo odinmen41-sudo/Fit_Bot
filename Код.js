@@ -277,6 +277,56 @@ function compactDialog02LegacyContext_(context, requestProfile) {
   return limitText_(kept.join("\n"), 900);
 }
 
+/* AI COACH-01 — evidence contract for generated advice. */
+function adviceNumericClaims_(text) {
+  const source = String(text || ""), claims = [], pattern = /(?:^|[^\p{L}\p{N}])([+-]?\d+(?:[.,]\d+)?)(?:\s*(%|ккал|кг|г|мг|мл|л|дн(?:я|ей)?|недел(?:я|и|ь)?|месяц(?:а|ев)?|повтор(?:а|ов)?|подход(?:а|ов)?|rm))?/giu;
+  let match;
+  while ((match = pattern.exec(source))) claims.push({value:String(match[1]).replace(",","."),unit:String(match[2] || "").toLowerCase(),raw:String(match[0]).trim()});
+  return claims;
+}
+
+function adviceEvidenceContract_(userText, dialogBlock, nutritionBlock) {
+  const trusted = [String(dialogBlock || ""), String(nutritionBlock || "")].join("\n");
+  const facts = adviceNumericClaims_(trusted), requested = adviceNumericClaims_(userText), allowedFacts = {}, allowedRecommendations = {};
+  facts.forEach(function(item){ allowedFacts[item.value] = true; });
+  requested.forEach(function(item){ allowedFacts[item.value] = true; allowedRecommendations[item.value + "|" + item.unit] = true; });
+  return {allowed_facts:allowedFacts,allowed_recommendations:allowedRecommendations,
+    principles:[{id:"PROGRESS_FROM_OBSERVED_PERFORMANCE",statement:"Изменять нагрузку следует по подтверждённой динамике выполнения и восстановления; универсальный числовой шаг без этих данных не задаётся."}]};
+}
+
+function auditAdviceEvidence_(text, contract) {
+  const source = String(text || ""), violations = [], sentences = source.split(/(?<=[.!?\n])\s+/), evidence = contract || {allowed_facts:{},allowed_recommendations:{}};
+  sentences.forEach(function(sentence) {
+    const recommendation = /(?:добав|увелич|сниз|уменьш|держ|довед|старай|попроб|нужно|следует|рекоменд|до минимум|кажд)/i.test(sentence);
+    adviceNumericClaims_(sentence).forEach(function(item) {
+      const factAllowed = evidence.allowed_facts && evidence.allowed_facts[item.value] === true;
+      const recommendationAllowed = evidence.allowed_recommendations && evidence.allowed_recommendations[item.value + "|" + item.unit] === true;
+      if (!factAllowed || (recommendation && !recommendationAllowed)) violations.push({claim:item.raw,reason:recommendation?"UNSUPPORTED_PERSONAL_NUMBER":"UNSUPPORTED_NUMBER"});
+    });
+  });
+  return {ok:violations.length===0,violations:violations};
+}
+
+function evidenceSafeCoachFallback_(dialogProfile) {
+  const domains = dialogProfile && dialogProfile.domains || [];
+  return {text:domains.indexOf("WORKOUT")>=0 ?
+    "Подтверждённый план прочитан корректно. Качественно он содержит силовую основу, но персональный числовой шаг прогрессии нельзя надёжно назначить без динамики фактических подходов и восстановления. Зафиксируй выполнение текущего плана — после этого можно обосновать следующую корректировку." :
+    "Подтверждённые данные прочитаны, но для персональной числовой рекомендации пока недостаточно оснований. Уточни желаемое изменение или добавь фактическую динамику — тогда я отделю факт от оценки и предложу проверяемый следующий шаг.",model:"deterministic_evidence_fallback",evidence_fallback:true};
+}
+
+function finalizeEvidenceBoundReply_(reply, apiKey, model, messages, evidence, profile, options) {
+  if (!reply || !reply.text || !evidence) return reply;
+  const firstAudit = auditAdviceEvidence_(reply.text,evidence);
+  if (firstAudit.ok) return Object.assign({},reply,{evidence_audit:"PASS"});
+  const repairMessages = messages.concat([{role:"system",content:"Предыдущий ответ не прошёл проверку доказательности: "+JSON.stringify(firstAudit.violations)+". Перепиши ответ: сохрани подтверждённые факты, отдели общий принцип от персонального вывода, удали неподтверждённые числовые назначения. Не добавляй новых чисел. Верни только исправленный ответ пользователю."}]);
+  try {
+    const repaired = callGroq_(apiKey,model,repairMessages,Object.assign({},options||{},{completion_budget:CONFIG.MAX_OUTPUT_TOKENS,attempt_type:"evidence_repair"}));
+    const secondAudit = auditAdviceEvidence_(repaired.text,evidence);
+    if (secondAudit.ok) return Object.assign({},repaired,{evidence_audit:"REPAIRED"});
+  } catch (ignored) {}
+  return evidenceSafeCoachFallback_(profile);
+}
+
 function doGet() {
   return httpOk_("Pavel AI Fitness Coach webhook with Groq AI is running");
 }
@@ -614,29 +664,31 @@ function generateCoachReply_(userId, chatId, userText, options) {
   if (dialog02Context && dialog02Context.block) context = compactDialog02LegacyContext_(context, dialog02Context.profile);
   const messages = buildGroqMessages_(context, userText, nutritionTodayContext && nutritionTodayContext.block,
     dialog02Context && dialog02Context.block, dialog02Context && dialog02Context.profile);
+  const evidence = dialog02Context ? adviceEvidenceContract_(userText,dialog02Context.block,nutritionTodayContext && nutritionTodayContext.block) : null;
+  function finish(reply,model){return finalizeEvidenceBoundReply_(reply,apiKey,model,messages,evidence,dialog02Context&&dialog02Context.profile,runtime);}
 
   try {
-    return callGroq_(apiKey, primaryModel, messages, Object.assign({}, runtime, {
+    return finish(callGroq_(apiKey, primaryModel, messages, Object.assign({}, runtime, {
       completion_budget: CONFIG.MAX_OUTPUT_TOKENS,
       attempt_type: "primary"
-    }));
+    })),primaryModel);
   } catch (primaryError) {
     console.error("Primary Groq model failed: " + errorText_(primaryError));
 
     if (primaryError && primaryError.code === "GROQ_COMPLETION_INCOMPLETE" &&
         primaryError.finishReason === "length") {
       try {
-        return callGroq_(apiKey, primaryModel, messages, Object.assign({}, runtime, {
+        return finish(callGroq_(apiKey, primaryModel, messages, Object.assign({}, runtime, {
           completion_budget: CONFIG.MAX_RECOVERY_OUTPUT_TOKENS,
           attempt_type: "primary_recovery"
-        }));
+        })),primaryModel);
       } catch (recoveryError) {
         if (recoveryError && recoveryError.code === "GROQ_COMPLETION_NON_NORMAL") throw recoveryError;
-        return callGroqFallback_(apiKey, fallbackModel, primaryModel, messages, recoveryError, runtime);
+        return finish(callGroqFallback_(apiKey, fallbackModel, primaryModel, messages, recoveryError, runtime),fallbackModel);
       }
     }
 
-    return callGroqFallback_(apiKey, fallbackModel, primaryModel, messages, primaryError, runtime);
+    return finish(callGroqFallback_(apiKey, fallbackModel, primaryModel, messages, primaryError, runtime),fallbackModel);
   }
 }
 

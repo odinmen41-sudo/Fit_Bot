@@ -1432,6 +1432,7 @@ function routeWeightFactConfirmation_(update, options) {
     now: now,
     update_id: update && update.update_id,
     user_id: userId,
+    raw_text: message.text,
     uuid: dependencies.uuid,
     format_date: dependencies.format_date
   });
@@ -4411,7 +4412,7 @@ function weightGoalFacts_(current,profile){const start=weightTrendNumber_(profil
 function buildWeightTrendFacts_(userId,options){const runtime=options||{},deps=weightTrendDependencies_(runtime.dependencies),now=runtime.now instanceof Date?runtime.now:new Date(),history=loadAuthoritativeWeightHistory_(userId,{now:now,dependencies:deps});let profile={};try{profile=deps.read_profile(String(userId))||{};}catch(ignored){}const profileFallback=weightTrendNumber_(profile.profile_current_weight),empty={data_status:history.status,freshness:history.status==="NO_DATA"?"UNKNOWN":history.status==="NORMAL"?"FRESH":"UNKNOWN",trend_status:"INSUFFICIENT_DATA",current_weight:null,current_date:null,current_time:null,measurement_age_days:null,measurements_count:0,distinct_measurement_days:0,avg_7d:null,avg_14d:null,avg_30d:null,delta_7d:null,delta_14d:null,delta_30d:null,current_week_avg:null,previous_matched_week_avg:null,week_delta:null,trend:null,goal:weightGoalFacts_(null,profile),profile_weight_fallback:profileFallback!=null&&profileFallback>=30&&profileFallback<=350?profileFallback:null};if(history.status!=="NORMAL")return empty;
   const daily=buildDailyWeightProjection_(history.measurements),latest=history.measurements[history.measurements.length-1],today=weightTrendShiftDate_(now,0,deps),age=weightTrendCalendarAge_(latest.local_date,today),facts=empty;facts.freshness=age<=7?"FRESH":"STALE";facts.current_weight=latest.weight_kg;facts.current_date=latest.local_date;facts.current_time=latest.updated_at;facts.measurement_age_days=age;facts.measurements_count=history.measurements.length;facts.distinct_measurement_days=daily.length;[7,14,30].forEach(function(days){const items=weightTrendSelect_(daily,weightTrendWindow_(now,days,deps));facts["avg_"+days+"d"]=weightTrendAverage_(items);facts["delta_"+days+"d"]=weightTrendDelta_(items);});const weeks=weightTrendWeekWindows_(now,deps),current=weightTrendSelect_(daily,weeks.current),previous=weightTrendSelect_(daily,weeks.previous);facts.current_week_avg=weightTrendAverage_(current);facts.previous_matched_week_avg=weightTrendAverage_(previous);facts.week_delta=facts.current_week_avg==null||facts.previous_matched_week_avg==null?null:weightTrendRound_(facts.current_week_avg-facts.previous_matched_week_avg,3);if(current.length>=2&&previous.length>=2){facts.trend_status="AVAILABLE";facts.trend=weightTrendDirection_(facts.week_delta);}facts.goal=weightGoalFacts_(facts.current_weight,profile);return facts;}
 
-function detectWeightTrendIntent_(text){const n=normalizeNutritionTargetQueryText_(text);if(!n||/\d\s*(?:кг|килограмм)/.test(n)||/^(?:да|нет|отмена|отменить)$/.test(n))return null;if(/^(?:какой у меня (?:сейчас )?вес|мой текущий вес)$/.test(n))return {intent:"WEIGHT_CURRENT"};if(/^сколько.*остал.*цел.*вес/.test(n))return {intent:"WEIGHT_GOAL"};if(/(?:сравни (?:мой )?вес.*(?:прошл|предыдущ).*недел|сравни .* вес.*(?:прошл|предыдущ).*недел|вес по неделям|вес.*по сравнению с (?:прошл|предыдущ).*недел)/.test(n))return {intent:"WEIGHT_WEEK_COMPARE"};if(/вес/.test(n)&&/(?:за неделю|за 7 дн|за 14 дн|за месяц|за 30 дн)/.test(n)){const days=/(?:14)/.test(n)?14:/(?:30|месяц)/.test(n)?30:7;return {intent:"WEIGHT_PERIOD",days:days};}if(/^(?:как меняется вес|что с весом|какой тренд веса)$/.test(n))return {intent:"WEIGHT_TREND"};return null;}
+function detectWeightTrendIntent_(text){const n=normalizeNutritionTargetQueryText_(text);if(!n||/\d\s*(?:кг|килограмм)/.test(n)||/^(?:да|нет|отмена|отменить)$/.test(n))return null;if(/^(?:какой у меня (?:сейчас )?вес|мой текущий вес)$/.test(n))return {intent:"WEIGHT_CURRENT"};if(/^сколько.*остал.*цел.*вес/.test(n))return {intent:"WEIGHT_GOAL"};if(/(?:сравни (?:мой )?вес.*(?:прошл|предыдущ).*недел|сравни .* вес.*(?:прошл|предыдущ).*недел|вес по неделям|вес.*по сравнению с (?:прошл|предыдущ).*недел)/.test(n))return {intent:"WEIGHT_WEEK_COMPARE"};if(/вес/.test(n)&&/(?:за неделю|за 7 дн|за 14 дн|за месяц|за 30 дн)/.test(n)){const days=/(?:14)/.test(n)?14:/(?:30|месяц)/.test(n)?30:7;return {intent:"WEIGHT_PERIOD",days:days};}if(/^(?:как меняется вес|что с весом|какой тренд веса|покажи динамику веса|динамика веса)$/.test(n))return {intent:"WEIGHT_TREND"};return null;}
 function formatWeightTrendFacts_(facts,intent){if(facts.data_status==="DATA_INTEGRITY_ERROR")return "Не удалось надёжно прочитать историю веса из-за ошибки данных.";if(facts.data_status==="NO_DATA"){if(intent.intent==="WEIGHT_CURRENT"&&facts.profile_weight_fallback!=null)return "Последнего подтверждённого измерения веса нет. В профиле указано "+weightTrendFormatNumber_(facts.profile_weight_fallback)+" кг.";return "Подтверждённых измерений веса пока нет.";}if(intent.intent==="WEIGHT_CURRENT")return (facts.freshness==="STALE"?"Последний подтверждённый вес: ":"Текущий вес: ")+weightTrendFormatNumber_(facts.current_weight)+" кг. Измерение "+(facts.measurement_age_days===0?"сегодня":facts.measurement_age_days+" дн. назад")+".";if(intent.intent==="WEIGHT_GOAL")return facts.goal.target_weight==null?"Целевой вес в профиле не указан.":"До целевого веса: "+weightTrendFormatNumber_(facts.goal.kg_to_goal)+" кг."+(facts.goal.progress_percent==null?"":" Прогресс: "+weightTrendFormatNumber_(facts.goal.progress_percent)+"%.");if(intent.intent==="WEIGHT_PERIOD"){const avg=facts["avg_"+intent.days+"d"],delta=facts["delta_"+intent.days+"d"];return avg==null?"За этот период нет измерений.":"За последние "+intent.days+" дней средний вес — "+weightTrendFormatNumber_(avg)+" кг."+(delta==null?" Для изменения от первого до последнего нужно больше дней.":" От первого до последнего: "+(delta>0?"+":"")+weightTrendFormatNumber_(delta)+" кг.");}if(facts.trend_status!=="AVAILABLE")return "Для надёжного сравнения недель пока недостаточно измерений.";return "Средний вес этой недели: "+weightTrendFormatNumber_(facts.current_week_avg)+" кг.\nЗа такой же период прошлой недели: "+weightTrendFormatNumber_(facts.previous_matched_week_avg)+" кг.\nРазница: "+(facts.week_delta>0?"+":"")+weightTrendFormatNumber_(facts.week_delta)+" кг.";}
 function routeWeightTrends_(update,options){const message=update&&(update.message||update.edited_message),intent=message&&typeof message.text==="string"?detectWeightTrendIntent_(message.text):null;if(!intent)return weightTrendResult_(false,true,"NOT_WEIGHT_TREND");const userId=String(message.from&&message.from.id||"").trim();if(!userId)return weightTrendResult_(true,false,"INVALID_USER",{message:"Не удалось определить пользователя."});const facts=buildWeightTrendFacts_(userId,options||{});return weightTrendResult_(true,facts.data_status!=="DATA_INTEGRITY_ERROR",facts.data_status,{facts:facts,message:formatWeightTrendFacts_(facts,intent)});}
 
@@ -5508,7 +5509,7 @@ function handleWeightFactConfirmation_(userId, chatId, text, now, dependencies, 
       save: saved,
       message: saved.code === "ALREADY_SAVED"
         ? "Это обновление веса уже было подтверждено."
-        : "Вес подтверждён. Проверка сохранения выполнена в режиме SIMULATION."
+        : "Вес сохранён и проверен."
     });
   }
   return weightFactResult_(true, false, String(saved && saved.code || "SAVE_FAILED"), {
@@ -5551,7 +5552,8 @@ function parseExplicitCurrentWeightValue_(normalized) {
   const patterns = [
     /^мой(?:\s+текущий)?\s+вес\s*[:=\-–—]?\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:кг|килограмм(?:а|ов)?)?\s*[.!]?$/,
     /^сейчас\s+(?:я\s+)?вешу\s*[:=\-–—]?\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:кг|килограмм(?:а|ов)?)?\s*[.!]?$/,
-    /^(?:вес\s+(?:сегодня|на\s+сегодня)|сегодня\s+мой\s+вес)\s*[:=\-–—]?\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:кг|килограмм(?:а|ов)?)?\s*[.!]?$/
+    /^(?:вес\s+(?:сегодня|на\s+сегодня)|сегодня\s+мой\s+вес)\s*[:=\-–—]?\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:кг|килограмм(?:а|ов)?)?\s*[.!]?$/,
+    /^исправь\s+(?:мой\s+)?сегодняшний\s+вес\s+(?:на\s+)?(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:кг|килограмм(?:а|ов)?)?\s*[.!]?$/
   ];
   for (let i = 0; i < patterns.length; i += 1) {
     const match = normalized.match(patterns[i]);
@@ -5619,6 +5621,7 @@ function buildWeightPendingCapture_(candidate, options) {
     writes_allowed: false,
     capture_id: captureId,
     source: "C20A_WEIGHT_GATE",
+    operation: /^исправь\s/.test(String(runtime.raw_text || "").toLowerCase()) ? "CORRECT_TODAY" : "RECORD_TODAY",
     raw_message: "",
     items: [{
       category: "BODY_TRACKING",
@@ -5814,6 +5817,126 @@ function saveConfirmedDataWithMemory_(captureId, userId, options) {
   saved.memory_sync_status = sync.memory_sync_status;
   saved.memory_sync = sync;
   return saved;
+}
+
+function saveConfirmedWeightFact_(captureId, userId, options) {
+  const runtime = options || {};
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  let lock = null;
+  let acquired = false;
+  try {
+    lock = runtime.lock || LockService.getScriptLock();
+    acquired = typeof lock.tryLock === "function" ? lock.tryLock(10000) === true : false;
+    if (!acquired) return weightFactResult_(true, false, "LOCK_TIMEOUT");
+    const pendingSheet = runtime.pending_sheet || smartConfirmationSheet_();
+    const row = typeof runtime.find_capture === "function"
+      ? runtime.find_capture(pendingSheet, captureId) : smartConfirmationFindByCaptureId_(pendingSheet, captureId);
+    if (!row) return weightFactResult_(true, false, "CAPTURE_NOT_FOUND");
+    if (String(row.user_id) !== String(userId) ||
+        (runtime.chat_id != null && String(row.chat_id) !== String(runtime.chat_id))) {
+      return weightFactResult_(true, false, "OWNER_MISMATCH");
+    }
+    if (row.status === SMART_CONFIRMATION_CONFIG.STATUSES.SAVED) {
+      return weightFactResult_(true, true, "ALREADY_SAVED", {
+        readback: smartConfirmationParseJson_(row.saved_targets_json, {}), duplicate_created: false
+      });
+    }
+    if (row.status !== SMART_CONFIRMATION_CONFIG.STATUSES.PENDING) {
+      return weightFactResult_(true, false, "NOT_SAVEABLE");
+    }
+    const payload = runtime.payload || smartConfirmationParseJson_(row.payload_json, {});
+    const item = (payload.items || []).filter(function(value) {
+      return value && value.category === "BODY_TRACKING";
+    })[0];
+    const weight = Number(item && item.fields && item.fields.weight && item.fields.weight.value);
+    const localDate = String(item && item.fields && item.fields.date && item.fields.date.value || "");
+    if (payload.source !== "C20A_WEIGHT_GATE" || !isWeightWithinBoundary_(weight) ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(localDate)) {
+      return weightFactResult_(true, false, "CAPTURE_CONTRACT_MISMATCH");
+    }
+    const persisted = persistAuthoritativeWeight_(String(userId), weight, localDate,
+      String(captureId), now, runtime.persistence_options || {});
+    if (!persisted || persisted.ok !== true) {
+      return weightFactResult_(true, false, String(persisted && persisted.code || "WEIGHT_WRITE_FAILED"), {
+        readback: persisted || null
+      });
+    }
+    if (typeof runtime.mark_saved === "function") runtime.mark_saved(pendingSheet, row, persisted, now);
+    else smartConfirmationUpdateState_(pendingSheet, row.row_number,
+      SMART_CONFIRMATION_CONFIG.STATUSES.SAVED, JSON.stringify(persisted), now, "");
+    if (typeof runtime.flush === "function") runtime.flush(); else SpreadsheetApp.flush();
+    return weightFactResult_(true, true, "SAVED", {readback: persisted, duplicate_created: false});
+  } catch (error) {
+    return weightFactResult_(true, false, "WEIGHT_WRITE_FAILED", {error: errorText_(error)});
+  } finally {
+    if (acquired && lock) try { lock.releaseLock(); } catch (ignored) {}
+  }
+}
+
+function persistAuthoritativeWeight_(userId, weight, localDate, confirmationId, now, options) {
+  const runtime = options || {};
+  try {
+    const environment = String(runtime.deployment_env != null ? runtime.deployment_env :
+      PropertiesService.getScriptProperties().getProperty("DEPLOYMENT_ENV") || "").trim().toUpperCase();
+    if (environment !== "STAGING" && runtime.allow_test_write !== true) {
+      return {ok:false, code:"STAGING_ONLY", production_writes:false, writes:0};
+    }
+    const timestamp = (now instanceof Date ? now : new Date()).toISOString();
+    const memorySheet = runtime.memory_sheet || memoryRequiredSheet_(MEMORY_LAYER_CONFIG.MEMORY_SHEET);
+    const bodySheet = runtime.body_sheet || getSpreadsheet_().getSheetByName("Body_Tracking");
+    if (!bodySheet) return {ok:false, code:"BODY_TRACKING_MISSING", production_writes:false, writes:0};
+    const memoryTable = typeof runtime.read_memory === "function" ? runtime.read_memory(memorySheet) : memoryReadBatchTable_(memorySheet);
+    const indexes = memorySchemaIndexes_(memoryTable.headers || []);
+    const existing = (memoryTable.rows || []).filter(function(row) {
+      return String(row[indexes.user_id]) === String(userId) &&
+        String(row[indexes.confirmation_id]) === String(confirmationId);
+    });
+    if (existing.length > 1) return {ok:false, code:"DUPLICATE_CONFIRMATION", production_writes:false, writes:0};
+    if (existing.length === 1 && Number(existing[0][indexes.value]) !== Number(weight)) {
+      return {ok:false, code:"IDEMPOTENCY_CONFLICT", production_writes:false, writes:0};
+    }
+    let memoryWritten = false;
+    if (!existing.length) {
+      const memoryRow = new Array(memoryTable.headers.length).fill("");
+      const values = {id:generateEventId_(now, runtime),user_id:String(userId),category:"body_tracking",
+        key:"weight_event",value:String(Number(weight)),priority:"HIGH",updated_at:timestamp,
+        source:"WEIGHT_E2E_AUTHORITATIVE",confirmation_id:String(confirmationId)};
+      Object.keys(values).forEach(function(key) { if (indexes[key] >= 0) memoryRow[indexes[key]] = values[key]; });
+      if (typeof runtime.append_memory === "function") runtime.append_memory(memorySheet, memoryRow);
+      else memorySheet.appendRow(memoryRow);
+      memoryWritten = true;
+    }
+    const bodyValues = typeof runtime.read_body === "function" ? runtime.read_body(bodySheet) :
+      bodySheet.getRange(1,1,Math.max(1,bodySheet.getLastRow()),Math.max(1,bodySheet.getLastColumn())).getValues();
+    const headers = (bodyValues[0] || []).map(function(value){return String(value).trim();});
+    const dateIndex = headers.indexOf("Дата"), weightIndex = headers.indexOf("Вес"), commentIndex = headers.indexOf("Комментарий");
+    if (dateIndex < 0 || weightIndex < 0) return {ok:false, code:"BODY_TRACKING_SCHEMA_INVALID", production_writes:false, writes:memoryWritten?1:0};
+    const displayDate = localDate.split("-").reverse().join(".");
+    const matching=[];
+    bodyValues.slice(1).forEach(function(row,index){
+      const raw=row[dateIndex], normalized=raw instanceof Date ? Utilities.formatDate(raw,"Europe/Moscow","dd.MM.yyyy") : String(raw||"").trim();
+      if (normalized===displayDate) matching.push(index+2);
+    });
+    if (matching.length>1) return {ok:false, code:"BODY_TRACKING_DUPLICATE_DATE", production_writes:false, writes:memoryWritten?1:0};
+    const targetRow=matching[0]||Math.max(2,bodyValues.length+1), rowValues=new Array(headers.length).fill("");
+    if (matching[0]) for(let i=0;i<headers.length;i+=1) rowValues[i]=bodyValues[targetRow-1][i];
+    rowValues[dateIndex]=displayDate; rowValues[weightIndex]=Number(weight);
+    if(commentIndex>=0) rowValues[commentIndex]="Authoritative weight "+String(confirmationId);
+    if(typeof runtime.write_body==="function") runtime.write_body(bodySheet,targetRow,rowValues);
+    else bodySheet.getRange(targetRow,1,1,headers.length).setValues([rowValues]);
+    if(typeof runtime.flush==="function") runtime.flush(); else SpreadsheetApp.flush();
+    const verifyMemory=typeof runtime.verify_memory==="function"?runtime.verify_memory():memoryReadBatchTable_(memorySheet);
+    const vi=memorySchemaIndexes_(verifyMemory.headers||[]), verifiedEvents=(verifyMemory.rows||[]).filter(function(row){
+      return String(row[vi.user_id])===String(userId)&&String(row[vi.confirmation_id])===String(confirmationId)&&Number(row[vi.value])===Number(weight);
+    });
+    const verifyBody=typeof runtime.verify_body==="function"?runtime.verify_body():bodySheet.getRange(targetRow,1,1,headers.length).getValues()[0];
+    if(verifiedEvents.length!==1||Number(verifyBody[weightIndex])!==Number(weight)) {
+      return {ok:false,code:"READBACK_FAILED",production_writes:false,writes:(memoryWritten?1:0)+1};
+    }
+    return {ok:true,code:"WEIGHT_SAVED",weight_kg:Number(weight),local_date:localDate,
+      confirmation_id:String(confirmationId),memory_event_count:1,body_row:targetRow,
+      memory_written:memoryWritten,body_written:true,writes:(memoryWritten?1:0)+1,production_writes:false};
+  } catch(error){return {ok:false,code:"WEIGHT_WRITE_FAILED",error:errorText_(error),production_writes:false,writes:0};}
 }
 
 function processConfirmedFacts_(captureId, userId, payload, options) {
@@ -6168,7 +6291,7 @@ function weightFactDependencies_(injected) {
     create_pending: function(capture, metadata) { return createWeightPendingCaptureC20A_(capture, metadata); },
     get_pending: getPendingCapture_,
     detect_confirmation: detectConfirmationIntent_,
-    save: saveConfirmedDataWithMemory_,
+    save: saveConfirmedWeightFact_,
     cancel: cancelPendingCapture_,
     cancel_created: cancelWeightPendingCaptureC20A_,
     validate_capture: validateExtractedData_,

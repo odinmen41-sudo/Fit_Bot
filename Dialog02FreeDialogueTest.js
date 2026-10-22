@@ -27,6 +27,34 @@ function runDialog02FreeDialogueTests() {
   mutations.forEach(function(text){const p=dialog02RequestProfile_(text);rec("D02-LANG-"+String(ordinal++).padStart(2,"0"),p.mode==="MUTATION_REQUEST"&&p.requires_authoritative_writer,{text:text,profile:p});});
   ["Расскажи, чем ты можешь помочь","Объясни попроще","Что ты думаешь об этом?","Помоги разобраться","Какой следующий шаг?"].forEach(function(text){const p=dialog02RequestProfile_(text);rec("D02-LANG-"+String(ordinal++).padStart(2,"0"),p.domains.length===0&&!p.mutation_requested,{text:text,profile:p});});
 
+  const unseen=[
+    ["Почему цифра на весах не двигается, хотя ем по плану?",["WEIGHT","NUTRITION"]],
+    ["Что важнее добрать после сегодняшнего зала?",["WORKOUT"]],
+    ["Недоспал, как разумно скорректировать нагрузку?",["RECOVERY","WORKOUT"]],
+    ["Что по рациону к этому часу?",["NUTRITION"]],
+    ["Насколько актуально последнее взвешивание?",["WEIGHT"]],
+    ["Есть ли смысл сегодня тренироваться тяжелее?",["WORKOUT"]],
+    ["Можно ли сделать вывод о моей готовности?",["RECOVERY"]],
+    ["Как связаны сегодняшние калории и занятие?",["NUTRITION","WORKOUT"]],
+    ["Сон был плохой, что учесть в зале?",["RECOVERY","WORKOUT"]],
+    ["Питание соответствует цели по весу?",["NUTRITION","WEIGHT"]],
+    ["Как прошла нагрузка относительно плана?",["WORKOUT"]],
+    ["Хватает ли данных, чтобы судить о прогрессе веса?",["WEIGHT"]],
+    ["Какая часть КБЖУ сейчас проседает?",["NUTRITION"]],
+    ["Отдых и тренировки сейчас сбалансированы?",["RECOVERY","WORKOUT"]],
+    ["Что известно о стрессе и самочувствии?",["RECOVERY"]],
+    ["Подскажи по еде после нагрузки",["NUTRITION","WORKOUT"]],
+    ["Движусь ли я к целевому весу?",["WEIGHT"]],
+    ["Осталась ли тренировка на сегодня?",["WORKOUT"]],
+    ["Есть ли перебор по калориям к вечеру?",["NUTRITION"]],
+    ["Как восстановление соотносится с последним занятием?",["RECOVERY","WORKOUT"]],
+    ["Сравни текущий вес и цель",["WEIGHT"]],
+    ["Что выбрать вечером с учётом тренировки?",["NUTRITION","WORKOUT"]],
+    ["Усталость может быть связана с нагрузкой?",["RECOVERY","WORKOUT"]],
+    ["Что сейчас подтверждено по моему дню?",[]]
+  ];
+  unseen.forEach(function(item,index){const p=dialog02RequestProfile_(item[0]),ok=item[1].every(function(domain){return p.domains.indexOf(domain)>=0;});rec("D02-UNSEEN-"+String(index+1).padStart(2,"0"),ok,{text:item[0],expected:item[1],profile:p});});
+
   const facts={local_date:"2026-10-22",has_domain_errors:false,
     weight:{data_status:"NORMAL",current_weight:118,measurement_age_days:0,week_delta:null,target_weight:108},
     nutrition:{status:"AVAILABLE",consumed:{calories:390.5,protein:13.97,fat:8.36,carbs:66},targets:{calories:2300,protein:195,fat:70,carbs:225},remaining:{calories:1909.5,protein:181.03,fat:61.64,carbs:159}},
@@ -49,13 +77,31 @@ function runDialog02FreeDialogueTests() {
   const mutationProfile=dialog02RequestProfile_("Исправь это");
   const mutationMessages=buildGroqMessages_("safe","Исправь это",null,built.block,mutationProfile);
   rec("D02-MUTATION-CLARIFICATION-POLICY",mutationMessages[1].content.indexOf("не утверждай, что действие выполнено")>=0,mutationMessages[1]);
+  rec("D02-PROMPT-NO-PREMATURE-DEFICIT",/Не называй разницу между дневной целью/.test(messages[0].content),messages[0]);
+  rec("D02-PROMPT-NO-MANDATORY-WINDOW",/Не навязывай обязательное пищевое окно/.test(messages[0].content),messages[0]);
+
+  const compact=compactDialog02LegacyContext_(["USER PROFILE:","Имя: Тест","HEALTH:","Плечо: без жалоб","RECENT HISTORY — DIALOG:","Пользователь: а почему?","NUTRITION:","Калории: 1"].join("\n"));
+  rec("D02-CONTEXT-COMPACT",compact.indexOf("Имя: Тест")<0&&compact.indexOf("Калории: 1")<0&&compact.indexOf("Плечо: без жалоб")>=0&&compact.indexOf("Пользователь: а почему?")>=0,{compact:compact});
+
+  const weightDecision=naturalDialogDecision_("А что с моим весом?");
+  rec("D02-NATURAL-WEIGHT-PARAPHRASE",weightDecision&&weightDecision.domain==="WEIGHT"&&weightDecision.action==="CURRENT",weightDecision);
+  const recoveryAdvice=parseSubjectiveRecoveryInput_("Мало спал — стоит ли менять тренировку?");
+  rec("D02-RECOVERY-ADVICE-NOT-CAPTURE",recoveryAdvice.status==="NOT_RECOVERY"&&recoveryAdvice.advisory===true,recoveryAdvice);
+  rec("D02-RECOVERY-EXPLICIT-SAVE-PRESERVED",parseSubjectiveRecoveryInput_("запиши: спал 7 часов").status==="VALID",parseSubjectiveRecoveryInput_("запиши: спал 7 часов"));
 
   function props(){return {getProperty:function(name){if(name===CONFIG.GROQ_KEY_PROPERTY)return "test-key";if(name===CONFIG.GROQ_PRIMARY_MODEL_PROPERTY)return "test-model";return "";}};}
   function response(){return {getResponseCode:function(){return 200;},getContentText:function(){return JSON.stringify({choices:[{message:{content:"Факт: вес 118 кг. Вывод: данных тренда недостаточно."}}]});}};}
   let calls=0,payload=null;
-  const reply=generateCoachReply_("u1","c1","Почему вес стоит, хотя калории держу?",{properties:props(),build_context:function(){return "safe";},build_dialog02_context:function(){return built;},fetch:function(url,options){calls++;payload=JSON.parse(options.payload);return response();},record_usage:function(){}});
+  const reply=generateCoachReply_("u1","c1","Почему вес стоит, хотя калории держу?",{properties:props(),build_context:function(){return "USER PROFILE:\nИмя: Тест\nHEALTH:\nПлечо: без жалоб\nRECENT HISTORY — DIALOG:\nПользователь: почему?";},build_dialog02_context:function(){return built;},fetch:function(url,options){calls++;payload=JSON.parse(options.payload);return response();},record_usage:function(){}});
   rec("D02-ONE-GROQ-CALL",calls===1&&reply.text.indexOf("Факт:")===0,{calls:calls,reply:reply});
   rec("D02-GROQ-RECEIVES-TRUSTED-CONTEXT",payload&&payload.messages.length===3&&payload.messages[1].content.indexOf("weight_current_kg=118")>=0,payload);
+  rec("D02-GROQ-COMPACTS-LEGACY",payload&&payload.messages[2].content.indexOf("Имя: Тест")<0&&payload.messages[2].content.indexOf("Плечо: без жалоб")>=0&&payload.messages[2].content.indexOf("Пользователь: почему?")>=0,payload);
+  rec("D02-GROQ-PRIMARY-BUDGET",payload&&payload.max_completion_tokens===CONFIG.MAX_OUTPUT_TOKENS,payload);
+
+  let recoveryCalls=0,recoveryBudgets=[];
+  const recovered=generateCoachReply_("u1","c1","Вес стоит, хотя калории держу",{properties:props(),build_context:function(){return "safe";},build_dialog02_context:function(){return built;},fetch:function(url,options){recoveryCalls++;const request=JSON.parse(options.payload);recoveryBudgets.push(request.max_completion_tokens);if(recoveryCalls===1)return {getResponseCode:function(){return 200;},getContentText:function(){return JSON.stringify({choices:[{message:{content:""},finish_reason:"length"}],usage:{completion_tokens:CONFIG.MAX_OUTPUT_TOKENS,total_tokens:1200}});}};return response();},record_usage:function(){}});
+  rec("D02-EMPTY-LENGTH-RECOVERS",recoveryCalls===2&&recovered.text.indexOf("Факт:")===0,{calls:recoveryCalls,budgets:recoveryBudgets,recovered:recovered});
+  rec("D02-RECOVERY-BUDGET-BOUNDED",recoveryBudgets[0]===CONFIG.MAX_OUTPUT_TOKENS&&recoveryBudgets[1]===CONFIG.MAX_RECOVERY_OUTPUT_TOKENS&&CONFIG.MAX_RECOVERY_OUTPUT_TOKENS<=720,recoveryBudgets);
   rec("D02-NO-WRITES",built.sheet_writes===0&&built.domain_writes===0&&built.pending_capture_writes===0&&built.production_writes===false,built);
 
   const languageTests=tests.filter(function(t){return /^D02-LANG-/.test(t.id);}),languagePassed=languageTests.filter(function(t){return t.status==="PASS";}).length;

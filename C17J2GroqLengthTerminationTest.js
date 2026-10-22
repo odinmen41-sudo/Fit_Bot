@@ -51,7 +51,7 @@ function runC17J2GroqLengthTerminationTests() {
   let diagnostics = [];
   let run = runWith([{content:"complete primary",finish_reason:"stop",completion_tokens:20}], diagnostics);
   record("C17J2-A_NORMAL_PRIMARY", run.result && run.result.text === "complete primary" &&
-    run.requests.length === 1 && run.requests[0].max_completion_tokens === 300 &&
+    run.requests.length === 1 && run.requests[0].max_completion_tokens === CONFIG.MAX_OUTPUT_TOKENS &&
     run.requests[0].model === "openai/gpt-oss-120b", run);
 
   diagnostics = [];
@@ -61,7 +61,7 @@ function runC17J2GroqLengthTerminationTests() {
   ], diagnostics);
   record("C17J2-B_PRIMARY_LENGTH_RECOVERY", run.result && run.result.text === "complete recovery" &&
     run.result.text !== "partial output" && run.requests.length === 2 &&
-    run.requests[0].max_completion_tokens === 300 && run.requests[1].max_completion_tokens === 600 &&
+    run.requests[0].max_completion_tokens === CONFIG.MAX_OUTPUT_TOKENS && run.requests[1].max_completion_tokens === CONFIG.MAX_RECOVERY_OUTPUT_TOKENS &&
     run.requests[0].model === run.requests[1].model, run);
 
   diagnostics = [];
@@ -75,12 +75,13 @@ function runC17J2GroqLengthTerminationTests() {
 
   diagnostics = [];
   run = runWith([
-    {content:"",finish_reason:"length",completion_tokens:300},
-    {content:"fallback complete",finish_reason:"stop",completion_tokens:30}
+    {content:"",finish_reason:"length",completion_tokens:CONFIG.MAX_OUTPUT_TOKENS},
+    {content:"recovery complete",finish_reason:"stop",completion_tokens:30}
   ], diagnostics);
-  record("C17J2-D_EMPTY_LENGTH_COMPATIBILITY", run.result && run.result.text === "fallback complete" &&
-    run.result.model === "openai/gpt-oss-20b" && run.requests.length === 2 &&
-    run.requests[0].max_completion_tokens === 300 && run.requests[1].max_completion_tokens === 300, run);
+  record("C17J2-D_EMPTY_LENGTH_RECOVERY", run.result && run.result.text === "recovery complete" &&
+    run.result.model === "openai/gpt-oss-120b" && run.requests.length === 2 &&
+    run.requests[0].max_completion_tokens === CONFIG.MAX_OUTPUT_TOKENS &&
+    run.requests[1].max_completion_tokens === CONFIG.MAX_RECOVERY_OUTPUT_TOKENS, run);
 
   diagnostics = [];
   let directError = null;

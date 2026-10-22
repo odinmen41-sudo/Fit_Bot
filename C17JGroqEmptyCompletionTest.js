@@ -69,7 +69,7 @@ function testC17JGroqEmptyCompletion_() {
     record_usage: function() {}
   });
   record("C17J-01_EMPTY_COMPLETION_FALLBACK", calls.join(",") ===
-    "openai/gpt-oss-120b,openai/gpt-oss-20b" &&
+    "openai/gpt-oss-120b,openai/gpt-oss-120b,openai/gpt-oss-20b" &&
     fallbackResult && fallbackResult.text === "Fallback answer" &&
     fallbackResult.model === "openai/gpt-oss-20b", {
       calls: calls,
@@ -81,7 +81,8 @@ function testC17JGroqEmptyCompletion_() {
     usage: {total_tokens: 412, completion_tokens: 300}
   }).error;
   record("C17J-02_EMPTY_DIAGNOSTICS_SAFE", empty &&
-    empty.retryable === false && empty.fallbackEligible === true &&
+    empty.code === "GROQ_COMPLETION_INCOMPLETE" && empty.retryable === false &&
+    empty.fallbackEligible === false && empty.nonEmpty === false &&
     empty.message.indexOf("finish_reason=length") >= 0 &&
     empty.message.indexOf("usage.total_tokens=412") >= 0 &&
     empty.message.indexOf("usage.completion_tokens=300") >= 0 &&
@@ -143,8 +144,9 @@ function testC17JGroqEmptyCompletion_() {
     },
     record_usage: function() {}
   });
-  record("C17J-07_COMPLETION_BUDGET_300", requestPayload &&
-    requestPayload.max_completion_tokens === 300, requestPayload || {});
+  record("C17J-07_COMPLETION_BUDGET_BOUNDED", requestPayload &&
+    requestPayload.max_completion_tokens === CONFIG.MAX_OUTPUT_TOKENS &&
+    requestPayload.max_completion_tokens <= 420, requestPayload || {});
 
   const passed = tests.filter(function(test) { return test.passed; }).length;
   return {

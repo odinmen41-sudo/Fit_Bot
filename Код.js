@@ -2416,6 +2416,11 @@ function detectDomainFactCandidate_(text, referenceOptions) {
   const normalized = normalizeExplicitWeightText_(text);
   if (!normalized || /^\//.test(normalized)) return {domain: null, code: "NOT_DOMAIN_FACT"};
 
+  const recoveryInput = parseSubjectiveRecoveryInput_(text);
+  if (recoveryInput && recoveryInput.advisory === true) {
+    return {domain: null, code: "NOT_DOMAIN_FACT"};
+  }
+
   const domains = [];
   const workout = /(?:жим|пожал|присед|станов(?:ая)?|тяга|подтягив|штанг|гантел)/i.test(normalized) &&
     /\d+(?:[.,]\d+)?\s*кг(?=\s|$|[.,;])/i.test(normalized);

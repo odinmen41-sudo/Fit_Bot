@@ -125,8 +125,10 @@ function runC232ANutritionExtractionTests() {
   result = extraction("съел банан");
   const missingRoute = route("съел банан", missingEnv);
   record("C23.2A-09_MISSING_QUANTITY", result.requires_clarification === true &&
-    field(result.items[0], "quantity_value") === undefined && missingRoute.code === "CLARIFICATION_REQUIRED" &&
-    missingEnv.rows.length === 0, {extraction: result, route: missingRoute});
+    field(result.items[0], "quantity_value") === undefined && missingRoute.code === "CREATED" &&
+    missingRoute.message === "Сколько граммов?" && missingEnv.rows.length === 1 &&
+    missingEnv.rows[0].payload.source === NUTRITION_CLARIFICATION_SOURCE,
+    {extraction: result, route: missingRoute});
 
   let env = environment();
   result = route("сколько калорий в рисе?", env);
@@ -161,7 +163,8 @@ function runC232ANutritionExtractionTests() {
   const unresolvedEnv = environment();
   const unresolved = route("съел рис 150 г", unresolvedEnv);
   record("C23.2A-16_B1_CLARIFICATION_EVOLUTION", unresolved.handled === true &&
-    unresolved.code === "CLARIFICATION_REQUIRED" && unresolvedEnv.rows.length === 0,
+    unresolved.code === "CREATED" && unresolvedEnv.rows.length === 1 &&
+    unresolvedEnv.rows[0].payload.source === NUTRITION_CLARIFICATION_SOURCE,
     {result: unresolved, extraction: extraction("съел рис 150 г")});
 
   record("C23.2A-17_GROQ_ZERO", result.groq_calls === 0 && env.counters.groq_calls === 0, result);

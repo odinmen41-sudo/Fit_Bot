@@ -1909,6 +1909,18 @@ function routeDomainFactConfirmation_(update, options) {
 
   const dependencies = domainFactDependencies_(runtime.dependencies);
   const now = runtime.now instanceof Date ? runtime.now : new Date();
+  const referenceOptions = runtime.reference_options || (runtime.dependencies ? {resolution_disabled: true} : {});
+  const clarification = dependencies.find_clarification(userId, chatId, {now: now});
+  if (clarification && clarification.ok === true) {
+    return continueNutritionClarification_(clarification, update, dependencies, referenceOptions, now);
+  }
+  if (clarification && clarification.code === "CAPTURE_EXPIRED" &&
+      nutritionClarificationReply_(message.text).recognized === true) {
+    return domainFactResult_(true, false, "CAPTURE_EXPIRED", {
+      domain: "NUTRITION",
+      message: "Срок уточнения истёк. Отправьте запись о питании ещё раз."
+    });
+  }
   const confirmation = dependencies.detect_confirmation(message.text);
   if (confirmation && ["CONFIRM", "CANCEL"].indexOf(confirmation.intent) >= 0) {
     const selected = dependencies.find_capture(userId, chatId, {
@@ -1926,19 +1938,13 @@ function routeDomainFactConfirmation_(update, options) {
     }
   }
 
-  const referenceOptions = runtime.reference_options || (runtime.dependencies ? {resolution_disabled: true} : {});
   const detection = detectDomainFactCandidate_(message.text, referenceOptions);
   if (detection.code === "AMBIGUOUS_DOMAIN") {
     return domainFactResult_(false, true, "AMBIGUOUS_DOMAIN");
   }
   if (!detection.domain) return domainFactResult_(false, true, "NOT_DOMAIN_FACT");
   if (detection.domain === "NUTRITION" && detection.requires_clarification === true) {
-    return domainFactResult_(true, false, "CLARIFICATION_REQUIRED", {
-      domain: "NUTRITION",
-      reference_status: detection.reference_status || "CLARIFICATION_REQUIRED",
-      message: detection.clarification_message ||
-        "Укажите количество продукта: например, «банан 1 шт» или «рис 150 г»."
-    });
+    return createNutritionClarification_(detection, update, dependencies, now);
   }
   if (detection.domain === "NUTRITION" && detection.calculation_status &&
       detection.calculation_status !== "CALCULATED") {
@@ -1949,6 +1955,9 @@ function routeDomainFactConfirmation_(update, options) {
   }
   if (detection.domain === "NUTRITION" && detection.reference_status &&
       detection.reference_status !== "RESOLVED") {
+    if (detection.reference_status === "CLARIFICATION_REQUIRED") {
+      return createNutritionClarification_(detection, update, dependencies, now);
+    }
     return domainFactResult_(true, false, detection.reference_status, {
       domain: "NUTRITION",
       reference_status: detection.reference_status,
@@ -2001,6 +2010,160 @@ function routeDomainFactConfirmation_(update, options) {
     capture_id: created.capture_id || capture.capture_id,
     message: confirmationMessage
   });
+}
+
+const NUTRITION_CLARIFICATION_SOURCE = "NUTRITION_CLARIFICATION";
+
+function nutritionClarificationSpec_(detection) {
+  const items = Array.isArray(detection && detection.items) ? detection.items : [];
+  if (items.length !== 1) return null;
+  const fields = items[0] && items[0].fields || {};
+  const foodText = String(fields.food_display && fields.food_display.value || "").trim();
+  if (!foodText) return null;
+  const quantity = fields.quantity_value && fields.quantity_value.value;
+  const unit = String(fields.quantity_unit && fields.quantity_unit.value || "");
+  if (quantity == null || quantity === "" || !unit) {
+    return {missing_field: "QUANTITY", food_text: foodText, prompt: "Сколько граммов?"};
+  }
+  const preparation = String(fields.preparation_state && fields.preparation_state.value || "UNKNOWN");
+  if (preparation === "UNKNOWN" && String(detection.reference_status || "") === "CLARIFICATION_REQUIRED") {
+    return {missing_field: "PREPARATION", food_text: foodText,
+      quantity_value: Number(quantity), quantity_unit: unit,
+      prompt: detection.clarification_message || "Уточните способ приготовления."};
+  }
+  return null;
+}
+
+function buildNutritionClarificationCapture_(detection, update, now, uuid) {
+  const message = update && (update.message || update.edited_message) || {};
+  const spec = nutritionClarificationSpec_(detection);
+  if (!spec) return null;
+  const updateId = String(update && update.update_id || "").replace(/[^A-Za-z0-9._-]/g, "");
+  const token = updateId || String(typeof uuid === "function" ? uuid() : Utilities.getUuid())
+    .replace(/[^A-Za-z0-9._-]/g, "").slice(0, 32);
+  return {schema_version: "nutrition-clarification-v1", source: NUTRITION_CLARIFICATION_SOURCE,
+    capture_id: "nutrition-clarification-" + token, created_at: now.toISOString(), raw_message: "",
+    domain: "NUTRITION", clarification: spec,
+    items: [{category: "NUTRITION_LOG", confidence: 1, fields: {
+      clarification_type: {value: spec.missing_field, source: "SYSTEM_POLICY"}
+    }}], user_id: String(message.from && message.from.id || ""),
+    chat_id: String(message.chat && message.chat.id || "")};
+}
+
+function createNutritionClarification_(detection, update, dependencies, now) {
+  const message = update && (update.message || update.edited_message) || {};
+  const capture = buildNutritionClarificationCapture_(detection, update, now, dependencies.uuid);
+  if (!capture) return domainFactResult_(true, false, "CLARIFICATION_UNSUPPORTED", {
+    domain: "NUTRITION", message: detection.clarification_message || "Уточните запись о питании полностью."
+  });
+  const created = dependencies.create_pending(capture, {now: now,
+    ttl_minutes: SMART_CONFIRMATION_CONFIG.DEFAULT_TTL_MINUTES,
+    user_id: String(message.from && message.from.id || ""),
+    chat_id: String(message.chat && message.chat.id || ""),
+    source_update_id: update && update.update_id, capture_id: capture.capture_id,
+    validation: {ready_for_confirmation: true, errors: []}});
+  return domainFactResult_(true, !!(created && created.ok),
+    String(created && created.code || "CAPTURE_CREATE_FAILED"), {domain: "NUTRITION",
+      capture_id: capture.capture_id, pending_capture_writes: created && created.created === false ? 0 : created && created.ok ? 1 : 0,
+      message: created && created.ok ? capture.clarification.prompt : "Не удалось сохранить контекст уточнения. Попробуйте позже."});
+}
+
+function nutritionClarificationReply_(text) {
+  const normalized = normalizeExplicitWeightText_(text);
+  if (/^(?:на\s+)?воде$/.test(normalized)) return {recognized: true, type: "PREPARATION", phrase: "на воде"};
+  if (/^(?:на\s+)?молоке$/.test(normalized)) return {recognized: true, type: "PREPARATION", phrase: "на молоке"};
+  if (/^(?:рис\s+)?(?:варен(?:ый|ая|ое|ую)|отварн(?:ой|ая|ое|ую)|готов(?:ый|ая|ое|ую))$/.test(normalized)) {
+    return {recognized: true, type: "PREPARATION", phrase: "вареный"};
+  }
+  if (/^(?:рис\s+)?сух(?:ой|ая|ое|ую)$/.test(normalized)) {
+    return {recognized: true, type: "PREPARATION", phrase: "сухой"};
+  }
+  if (/^(?:жарен(?:ый|ая|ое|ую)|жарил(?:а)?)$/.test(normalized)) {
+    return {recognized: true, type: "PREPARATION", phrase: "жареный"};
+  }
+  if (/^(?:на\s+)?гриле$/.test(normalized)) return {recognized: true, type: "PREPARATION", phrase: "на гриле"};
+  const quantity = normalized.match(/^(\d+(?:[.,]\d+)?)\s*(?:г|гр|грамм|грамма|граммов)?$/);
+  if (quantity) return {recognized: true, type: "QUANTITY", quantity: Number(quantity[1].replace(",", "."))};
+  return {recognized: false};
+}
+
+function nutritionClarificationCompletedText_(spec, reply) {
+  if (!spec || !reply || reply.recognized !== true) return null;
+  if (spec.missing_field === "PREPARATION" && reply.type === "PREPARATION") {
+    const unit = {g: "г", ml: "мл", count: "шт"}[String(spec.quantity_unit || "")] || spec.quantity_unit;
+    return "Съел " + spec.food_text + " " + reply.phrase + " " + spec.quantity_value + " " + unit;
+  }
+  if (spec.missing_field === "QUANTITY" && reply.type === "QUANTITY" &&
+      isFinite(reply.quantity) && reply.quantity > 0 && reply.quantity <= 10000) {
+    return "Съел " + spec.food_text + " " + reply.quantity + " г";
+  }
+  return null;
+}
+
+function continueNutritionClarification_(selected, update, dependencies, referenceOptions, now) {
+  const message = update && (update.message || update.edited_message) || {};
+  const userId = String(message.from && message.from.id || "");
+  const chatId = String(message.chat && message.chat.id || "");
+  const confirmation = dependencies.detect_confirmation(message.text);
+  if (confirmation && confirmation.intent === "CANCEL") {
+    const cancelled = dependencies.cancel(userId, chatId, {now: now});
+    return domainFactResult_(true, !!(cancelled && cancelled.ok), String(cancelled && cancelled.code || "CANCEL_FAILED"), {
+      domain: "NUTRITION", message: cancelled && cancelled.ok ? "Запись отменена." : "Не удалось отменить запись."
+    });
+  }
+  const spec = selected.payload && selected.payload.clarification;
+  const reply = nutritionClarificationReply_(message.text);
+  const completedText = nutritionClarificationCompletedText_(spec, reply);
+  if (!completedText) return domainFactResult_(true, false, "CLARIFICATION_REQUIRED", {
+    domain: "NUTRITION", pending_capture_writes: 0,
+    message: spec && spec.prompt || "Уточните запись о питании."
+  });
+  const detection = detectDomainFactCandidate_(completedText, referenceOptions || {});
+  if (detection.domain === "NUTRITION" && (detection.requires_clarification === true ||
+      detection.reference_status === "CLARIFICATION_REQUIRED")) {
+    return createNutritionClarification_(detection, update, dependencies, now);
+  }
+  if (!detection.domain || detection.reference_status !== "RESOLVED" || detection.calculation_status !== "CALCULATED") {
+    return domainFactResult_(true, false, String(detection.reference_status || detection.calculation_status || "CLARIFICATION_REQUIRED"), {
+      domain: "NUTRITION", message: detection.clarification_message || nutritionReferenceClarification_(detection.reference_resolution)
+    });
+  }
+  const capture = buildDomainFactCandidate_(detection, {now: now, update_id: update && update.update_id,
+    user_id: userId, uuid: dependencies.uuid});
+  const validation = validateDomainFactCandidate_(capture);
+  if (!validation.ready_for_confirmation) return domainFactResult_(true, false, "INVALID_PAYLOAD", {
+    domain: "NUTRITION", message: "Не удалось безопасно подготовить подтверждение данных."
+  });
+  const created = dependencies.create_pending(capture, {now: now,
+    ttl_minutes: SMART_CONFIRMATION_CONFIG.DEFAULT_TTL_MINUTES, user_id: userId, chat_id: chatId,
+    source_update_id: update && update.update_id, capture_id: capture.capture_id, validation: validation});
+  return domainFactResult_(true, !!(created && created.ok), String(created && created.code || "CAPTURE_CREATE_FAILED"), {
+    domain: "NUTRITION", capture_id: capture.capture_id,
+    pending_capture_writes: created && created.created === false ? 0 : created && created.ok ? 1 : 0,
+    message: created && created.ok ? domainFactConfirmationPrompt_("NUTRITION", capture) :
+      "Не удалось безопасно подготовить подтверждение данных. Попробуйте позже."
+  });
+}
+
+function findNutritionClarificationCapture_(userId, chatId, options) {
+  const runtime = options || {};
+  const now = runtime.now instanceof Date ? runtime.now : new Date();
+  try {
+    const rows = smartConfirmationReadRows_(smartConfirmationSheet_()).filter(function(row) {
+      if (String(row.user_id) !== String(userId) || String(row.chat_id) !== String(chatId) ||
+          row.status !== SMART_CONFIRMATION_CONFIG.STATUSES.PENDING) return false;
+      const payload = smartConfirmationParseJson_(row.payload_json, {});
+      return payload && payload.source === NUTRITION_CLARIFICATION_SOURCE;
+    }).sort(smartConfirmationNewestFirst_);
+    if (!rows.length) return {ok: false, code: "NO_CLARIFICATION_CAPTURE"};
+    const row = rows[0];
+    if (smartConfirmationDate_(row.expires_at).getTime() <= now.getTime()) {
+      return {ok: false, code: "CAPTURE_EXPIRED", capture: row,
+        payload: smartConfirmationParseJson_(row.payload_json, {})};
+    }
+    return {ok: true, code: "PENDING_CLARIFICATION", capture: row,
+      payload: smartConfirmationParseJson_(row.payload_json, {})};
+  } catch (error) { return {ok: false, code: "CAPTURE_LOOKUP_FAILED"}; }
 }
 
 function detectDomainFactCandidate_(text, referenceOptions) {
@@ -2502,6 +2665,7 @@ function resolvePreparationState_(foodText) {
   let normalized = normalizeFoodAlias_(foodText);
   const definitions = [
     {state: "COOKED_WATER", pattern: /(?:^|\s)(?:на\s+воде)(?=\s|$)/g},
+    {state: "COOKED_MILK", pattern: /(?:^|\s)(?:на\s+молоке)(?=\s|$)/g},
     {state: "BOILED", pattern: /(?:^|\s)(?:вареный|вареная|вареное|вареную|вареного|отварной|отварная|отварную)(?=\s|$)/g},
     {state: "DRY", pattern: /(?:^|\s)(?:сухой|сухая|сухую|сухого)(?=\s|$)/g},
     {state: "FRIED", pattern: /(?:^|\s)(?:жареный|жареная|жареное|жареную|жареного)(?=\s|$)/g},
@@ -2609,7 +2773,7 @@ function nutritionReferenceClarification_(resolution) {
     return "Как была приготовлена куриная грудка? Отправьте полную запись, например: «куриная грудка варёная 200 г».";
   }
   if (foodId === "oatmeal") {
-    return "Овсяная каша была на воде или на молоке? Отправьте полную запись, например: «овсяная каша на воде 250 г».";
+    return "На воде или на молоке?";
   }
   return "Продукт отсутствует в проверенном справочнике. Уточните продукт и способ приготовления полной записью.";
 }
@@ -2837,6 +3001,13 @@ function findLatestDomainCapture_(userId, chatId, options) {
     })[0];
     if (recovery) return {ok: true, code: "NUTRITION_RECOVERY_CAPTURE", capture: recovery,
       payload: smartConfirmationParseJson_(recovery.payload_json, {})};
+    if (runtime.include_saved === true) {
+      const saved = rows.filter(function(row) {
+        return row.status === SMART_CONFIRMATION_CONFIG.STATUSES.SAVED;
+      })[0];
+      if (saved) return {ok: true, code: "SAVED_CAPTURE", capture: saved,
+        payload: smartConfirmationParseJson_(saved.payload_json, {})};
+    }
     return {ok: false, code: "NO_DOMAIN_CAPTURE"};
   } catch (error) {
     return {ok: false, code: "CAPTURE_LOOKUP_FAILED", error: errorText_(error)};
@@ -5256,6 +5427,7 @@ function nutritionCalculationFailureMessage_(code) {
 function domainFactDependencies_(injected) {
   if (injected) {
     return Object.assign({
+      find_clarification: function() { return {ok: false, code: "NO_CLARIFICATION_CAPTURE"}; },
       validate_nutrition_snapshot: validateNutritionSnapshotForSave_,
       nutrition_persistence_enabled: function() { return false; },
       persist_nutrition: saveNutritionDomainFact_,
@@ -5265,6 +5437,7 @@ function domainFactDependencies_(injected) {
   }
   return {
     detect_confirmation: detectConfirmationIntent_,
+    find_clarification: findNutritionClarificationCapture_,
     find_capture: findLatestDomainCapture_,
     get_pending: getPendingCapture_,
     create_pending: createPendingCapture_,

@@ -103,7 +103,8 @@ function runC232B1FoodIdentityReferenceTests() {
 
   let env = environment();
   result = route("съел рис 150 г", env);
-  record("C23.2B1-08_RICE_PREP_CLARIFICATION", result.code === "CLARIFICATION_REQUIRED" && env.rows.length === 0, result);
+  record("C23.2B1-08_RICE_PREP_CLARIFICATION", result.code === "CREATED" && env.rows.length === 1 &&
+    /Рис был сухой/.test(result.message) && env.rows[0].capture.source === NUTRITION_CLARIFICATION_SOURCE, result);
   result = detect("съел рис варёный 150 г");
   record("C23.2B1-09_RICE_BOILED", field(result.items[0], "preparation_state") === "BOILED" &&
     result.reference_status === "RESOLVED", result);
@@ -111,7 +112,8 @@ function runC232B1FoodIdentityReferenceTests() {
   record("C23.2B1-10_RICE_DRY", field(result.items[0], "preparation_state") === "DRY" &&
     result.reference_status === "RESOLVED", result);
   env = environment(); result = route("съел грудку 200 г", env);
-  record("C23.2B1-11_BREAST_PREP_CLARIFICATION", result.code === "CLARIFICATION_REQUIRED" && env.rows.length === 0, result);
+  record("C23.2B1-11_BREAST_PREP_CLARIFICATION", result.code === "CREATED" && env.rows.length === 1 &&
+    /Как была приготовлена/.test(result.message) && env.rows[0].capture.source === NUTRITION_CLARIFICATION_SOURCE, result);
   result = detect("съел грудку варёную 200 г");
   record("C23.2B1-12_BREAST_BOILED", field(result.items[0], "nutrition_reference_id") ===
     "chicken_breast_boiled_v1", result);

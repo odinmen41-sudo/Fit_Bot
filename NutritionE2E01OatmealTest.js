@@ -37,7 +37,7 @@ function runNutritionE2E01OatmealTests() {
     calculated.fat === 3.8 && calculated.carbs === 30, calculated);
   const ambiguousOatmeal = detectDomainFactCandidate_("Съел овсяную кашу 250 г", foodData);
   record("NUT-E2E-01-03A_MISSING_LIQUID_CLARIFIED", ambiguousOatmeal.reference_status === "CLARIFICATION_REQUIRED" &&
-    /на воде или на молоке/.test(ambiguousOatmeal.clarification_message), ambiguousOatmeal);
+    /на воде или на молоке/i.test(ambiguousOatmeal.clarification_message), ambiguousOatmeal);
   record("NUT-E2E-01-03B_CONTEXT_GAP_DOCUMENTED", detectDomainFactCandidate_("на воде", foodData).code === "NOT_DOMAIN_FACT",
     {first:ambiguousOatmeal,follow_up:"NOT_DOMAIN_FACT"});
 

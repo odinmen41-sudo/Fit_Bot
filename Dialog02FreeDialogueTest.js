@@ -69,6 +69,14 @@ function runDialog02FreeDialogueTests() {
   const unavailable=buildDialog02AuthoritativeContext_("u1","Почему вес стоит?",{build_dashboard:function(){throw new Error("read");}});
   rec("D02-CONTEXT-FAIL-CLOSED",!unavailable.ok&&unavailable.code==="CONTEXT_UNAVAILABLE"&&unavailable.production_writes===false,unavailable);
 
+  const activePlan={ok:true,status:"TRAINING_DAY",local_date:"2026-10-22",workout:{display_name:"грудь",exercises:[
+    {display_name:"Жим лёжа",planned_sets:3,planned_reps:"6",planned_load:110,load_unit:"kg"},
+    {display_name:"Жим гантелей",planned_sets:3,planned_reps:"8",planned_load:40,load_unit:"kg"}
+  ]}};
+  const workoutContext=buildDialog02AuthoritativeContext_("u1","Оцени мой план на сегодня",{build_dashboard:function(){return facts;},load_workout_plan:function(){return activePlan;}});
+  rec("D02-EFFECTIVE-PLAN-CONTEXT",workoutContext.ok&&workoutContext.block.indexOf("training_plan_exercise_1=Жим лёжа|sets=3|reps=6|load=110|unit=kg")>=0,workoutContext);
+  rec("D02-EFFECTIVE-PLAN-NO-INTERNAL_IDS",!/VERSION_ID|DECISION_ID|SESSION_KEY|EXERCISE_KEY/.test(workoutContext.block),workoutContext);
+
   const messages=buildGroqMessages_("safe legacy","Почему вес стоит, хотя калории держу?",null,built.block,built.profile);
   rec("D02-PROMPT-TRUSTED-SEPARATE",messages.length===3&&messages[0].role==="system"&&messages[1].role==="system"&&messages[2].role==="user"&&messages[1].content.indexOf(built.block)>=0,{messages:messages});
   rec("D02-PROMPT-FACT-INFERENCE",/факт/.test(messages[0].content)&&/вывод/.test(messages[0].content)&&/предполож/.test(messages[0].content),messages[0]);
@@ -85,12 +93,15 @@ function runDialog02FreeDialogueTests() {
   rec("D02-PROMPT-WEIGHT-TREND-REQUIRED",/для оценки нужен тренд/.test(messages[0].content),messages[0]);
   rec("D02-PROMPT-HIDES-INTERNAL-MISSING",/Не повторяй служебные маркеры/.test(messages[1].content),messages[1]);
   rec("D02-PROMPT-NORMAL-IS-NOT-HEALTH",/NORMAL — статус чтения данных/.test(messages[1].content),messages[1]);
+  const workoutMessages=buildGroqMessages_("safe","Оцени мой план на сегодня",null,workoutContext.block,workoutContext.profile);
+  rec("D02-PROMPT-AUTHORITATIVE-PLAN-ONLY",/используй только training_plan_/.test(workoutMessages[1].content)&&/не подменяй подтверждённую версию/.test(workoutMessages[1].content),workoutMessages[1]);
 
   const compact=compactDialog02LegacyContext_(["USER PROFILE:","Имя: Тест","HEALTH:","Плечо: без жалоб","RECENT HISTORY — DIALOG:","Пользователь: а почему?","NUTRITION:","Калории: 1"].join("\n"));
   rec("D02-CONTEXT-COMPACT",compact.indexOf("Имя: Тест")<0&&compact.indexOf("Калории: 1")<0&&compact.indexOf("Плечо: без жалоб")>=0&&compact.indexOf("Пользователь: а почему?")>=0,{compact:compact});
 
   const weightDecision=naturalDialogDecision_("А что с моим весом?");
   rec("D02-NATURAL-WEIGHT-PARAPHRASE",weightDecision&&weightDecision.domain==="WEIGHT"&&weightDecision.action==="CURRENT",weightDecision);
+  ["Что мне делать сегодня?","Что сегодня по плану?","Что логичнее делать в зале сегодня?","Какие упражнения запланированы?"].forEach(function(value,index){const decision=naturalDialogDecision_(value);rec("D02-WORKOUT-CONSISTENCY-"+(index+1),decision&&decision.domain==="WORKOUT"&&decision.action==="TODAY",{value:value,decision:decision});});
   const recoveryAdvice=parseSubjectiveRecoveryInput_("Мало спал — стоит ли менять тренировку?");
   rec("D02-RECOVERY-ADVICE-NOT-CAPTURE",recoveryAdvice.status==="NOT_RECOVERY"&&recoveryAdvice.advisory===true,recoveryAdvice);
   const recoveryDomainFact=detectDomainFactCandidate_("Мало спал — стоит ли менять тренировку?");

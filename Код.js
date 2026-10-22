@@ -49,7 +49,7 @@ function naturalDialogDecision_(text) {
     {domain:"NUTRITION",action:"REMAINING",canonical:"Что осталось по КБЖУ?",pattern:/^(?:сколько еще могу съесть|какой остаток по калориям|сколько осталось на сегодня|что еще можно съесть сегодня)$/},
     {domain:"WEIGHT",action:"CURRENT",canonical:"Какой у меня сейчас вес?",pattern:/^(?:мой вес сейчас|сколько я сейчас вешу|покажи последний вес|какой мой последний вес|какой вес у меня сейчас|(?:а )?что (?:у меня )?с (?:моим )?весом)$/},
     {domain:"WEIGHT",action:"TREND",canonical:"Покажи динамику веса",pattern:/^(?:как меняется мой вес|что с весом за последнее время|покажи изменение веса|есть ли прогресс по весу)$/},
-    {domain:"WORKOUT",action:"TODAY",canonical:"Какая сегодня тренировка?",pattern:/^(?:какой план на сегодня|что тренируем сегодня|покажи план тренировки|какая тренировка по плану)$/},
+    {domain:"WORKOUT",action:"TODAY",canonical:"Какая сегодня тренировка?",pattern:/^(?:какой план на сегодня|что тренируем сегодня|покажи план тренировки|какая тренировка по плану|что мне делать сегодня|что делать сегодня|что сегодня по плану|что запланировано сегодня|что логичнее делать в зале сегодня|есть ли занятие по плану|какие упражнения запланированы|какие упражнения сегодня)$/},
     {domain:"WORKOUT",action:"START",canonical:"Начинаем тренировку",mutation_policy:"SESSION_MUTATION",pattern:/^(?:давай тренироваться|начать занятие|поехали тренироваться|запусти тренировку)$/},
     {domain:"WORKOUT",action:"NEXT",canonical:"Что у меня дальше?",pattern:/^(?:следующее упражнение|что теперь делать в тренировке|покажи следующее упражнение|куда дальше по тренировке)$/},
     {domain:"WORKOUT",action:"DONE",canonical:"Что я уже сделал?",pattern:/^(?:что уже успел сделать|покажи выполненные упражнения|что выполнено в тренировке|сколько уже сделал в зале)$/},
@@ -193,6 +193,19 @@ function formatDialog02AuthoritativeContext_(facts, requestProfile, options) {
   lines.push("training_status=" + String(training.status || "UNAVAILABLE"));
   lines.push("training_today=" + String(training.today_session_name || "MISSING"));
   lines.push("training_next=" + String(training.next_workout && training.next_workout.session_name || "MISSING"));
+  const effectivePlan = source.effective_workout_plan || {};
+  lines.push("training_plan_status=" + String(effectivePlan.status || "UNAVAILABLE"));
+  lines.push("training_plan_local_date=" + String(effectivePlan.local_date || "MISSING"));
+  lines.push("training_plan_session=" + String(effectivePlan.session_name || "MISSING"));
+  (effectivePlan.exercises || []).slice(0, 12).forEach(function(exercise, index) {
+    lines.push("training_plan_exercise_" + (index + 1) + "=" + [
+      String(exercise.name || "MISSING"),
+      "sets=" + dialog02Number_(exercise.sets, 0),
+      "reps=" + String(exercise.reps == null || exercise.reps === "" ? "MISSING" : exercise.reps),
+      "load=" + dialog02Number_(exercise.load, 2),
+      "unit=" + String(exercise.unit || "MISSING")
+    ].join("|"));
+  });
   const recovery = source.recovery || {}, last = recovery.last_completed_workout || {}, today = recovery.today || {};
   lines.push("recovery_history_status=" + String(recovery.history_status || "UNAVAILABLE"));
   lines.push("recovery_subjective_status=" + String(recovery.subjective_status || "UNAVAILABLE"));
@@ -209,6 +222,22 @@ function buildDialog02AuthoritativeContext_(userId, userText, options) {
   try {
     const facts = build(String(userId), runtime.dashboard_options || {});
     if (!facts || typeof facts !== "object") return {ok:false,code:"CONTEXT_UNAVAILABLE",profile:profile,block:""};
+    let plan = null;
+    try {
+      const readPlan = runtime.load_workout_plan || function(uid) {
+        return resolveWorkoutPlan_(uid, {intent:"WORKOUT_TODAY"}, {now:runtime.now instanceof Date ? runtime.now : new Date()});
+      };
+      const loadedPlan = readPlan(String(userId));
+      if (loadedPlan && loadedPlan.ok === true) {
+        plan = {status:String(loadedPlan.status || "UNAVAILABLE"),local_date:loadedPlan.local_date || null,
+          session_name:loadedPlan.workout && loadedPlan.workout.display_name || null,
+          exercises:(loadedPlan.workout && loadedPlan.workout.exercises || []).map(function(exercise) {
+            return {name:exercise.display_name,sets:exercise.planned_sets,reps:exercise.planned_reps,
+              load:exercise.planned_load,unit:exercise.load_unit};
+          })};
+      }
+    } catch (ignored) { plan = null; }
+    facts.effective_workout_plan = plan || {status:"UNAVAILABLE",local_date:null,session_name:null,exercises:[]};
     return {ok:true,code:facts.has_domain_errors ? "CONTEXT_PARTIAL" : "CONTEXT_READY",profile:profile,facts:facts,
       block:formatDialog02AuthoritativeContext_(facts, profile, {omit_nutrition:runtime.omit_nutrition === true}),
       sheet_writes:0,domain_writes:0,pending_capture_writes:0,production_writes:false};
@@ -899,6 +928,7 @@ function buildGroqMessages_(context, userText, nutritionTodayBlock, dialog02Bloc
       "Значение MISSING означает отсутствие подтверждённого факта, а UNAVAILABLE или DATA_INTEGRITY_ERROR — невозможность надёжного чтения.",
       "Не повторяй служебные маркеры MISSING, UNAVAILABLE, DATA_INTEGRITY_ERROR или NORMAL пользователю; объясняй их обычным языком. NORMAL — статус чтения данных, а не оценка здоровья, веса или формы.",
       "Используй значения как факты, но формулируй причинные связи только как вывод или гипотезу.",
+      "Если вопрос касается действующего тренировочного плана, используй только training_plan_* из этого блока. Не придумывай упражнения, подходы, повторения или вес и не подменяй подтверждённую версию примерной программой.",
       dialog02Profile && dialog02Profile.mutation_requested ?
         "Запрос похож на изменение данных: не утверждай, что действие выполнено, и запроси безопасное уточнение/подтверждение." :
         "Этот запрос не даёт права изменять данные.",
@@ -4397,7 +4427,7 @@ function detectWorkoutPlanIntent_(text) {
   const normalized=String(text||"").toLowerCase().replace(/ё/g,"е").replace(/[!?.,;:]+/g," ").replace(/\s+/g," ").trim();
   if(!normalized)return null;
   if(/^(?:какая|когда)\s+следующая\s+тренировка$/.test(normalized))return {intent:"NEXT_WORKOUT"};
-  if(/^(?:что\s+у\s+меня\s+сегодня\s+по\s+тренировке|какая\s+сегодня\s+тренировка|что\s+мне\s+сегодня\s+делать|что\s+сегодня\s+делать\s+в\s+зале|покажи\s+тренировку\s+на\s+сегодня|какие\s+сегодня\s+упражнения|есть\s+ли\s+сегодня\s+тренировка)$/.test(normalized))return {intent:"WORKOUT_TODAY"};
+  if(/^(?:что\s+у\s+меня\s+сегодня\s+по\s+тренировке|какая\s+сегодня\s+тренировка|что\s+мне\s+сегодня\s+делать|что\s+мне\s+делать\s+сегодня|что\s+делать\s+сегодня|что\s+сегодня\s+делать\s+в\s+зале|что\s+сегодня\s+по\s+плану|что\s+запланировано\s+сегодня|что\s+логичнее\s+делать\s+в\s+зале\s+сегодня|покажи\s+тренировку\s+на\s+сегодня|какие\s+сегодня\s+упражнения|какие\s+упражнения\s+сегодня|какие\s+упражнения\s+запланированы|есть\s+ли\s+сегодня\s+тренировка|есть\s+ли\s+занятие\s+по\s+плану)$/.test(normalized))return {intent:"WORKOUT_TODAY"};
   return null;
 }
 

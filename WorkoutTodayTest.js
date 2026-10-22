@@ -41,6 +41,12 @@ function runWorkoutTodayTests() {
   record("WT-39_OTHER_USER_ISOLATED",resolve([base({TELEGRAM_ID:"u2",USER_ID:"profile-u2"})]).status==="PLAN_NOT_CONFIGURED",{});
   const route=routeWorkoutPlan_({message:{text:"какая сегодня тренировка",from:{id:"u1"},chat:{id:"u1"}}},{now:new Date("2026-08-30T12:00:00Z"),dependencies:dependencies(sunday)});
   record("WT-40_ROUTE_HANDLED",route.handled&&route.ok&&route.code==="TRAINING_DAY"&&route.groq_calls===0,route);
+  ["Что мне делать сегодня?","Что делать сегодня?","Что сегодня по плану?","Что логичнее делать в зале сегодня?","Есть ли занятие по плану?","Какие упражнения запланированы?"].forEach(function(value,index){
+    const parsed=intent(value);record("WT-CONSISTENCY-"+(index+1),parsed&&parsed.intent==="WORKOUT_TODAY",{value:value,parsed:parsed});
+  });
+  const changed=[base({PLANNED_SETS:3,PLANNED_REPS:"6",PLANNED_LOAD:110})];
+  const changedRoute=routeWorkoutPlan_({message:{text:"Что мне делать сегодня?",from:{id:"u1"},chat:{id:"u1"}}},{now:new Date("2026-08-30T12:00:00Z"),dependencies:dependencies(changed)});
+  record("WT-CONSISTENCY-ACTIVE-VERSION",changedRoute.handled&&/3 × 6/.test(changedRoute.message)&&/110 кг/.test(changedRoute.message)&&!/115 кг/.test(changedRoute.message),changedRoute);
   const passed=tests.filter(function(test){return test.status==="PASS";}).length;
   return {suite:"WORKOUT_TODAY",status:passed===tests.length?"PASS":"FAIL",total:tests.length,passed:passed,failed:tests.length-passed,tests:tests,safety:{sheet_writes:0,workout_log_reads:0,ai_memory_reads:0,coach_state_reads:0,telegram_calls:0,groq_calls:0,production_writes:0}};
 }

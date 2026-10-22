@@ -123,6 +123,7 @@ function runDialog02FreeDialogueTests() {
   const exactPlanDecision=naturalDialogDecision_("Оцени актуальный план на сегодня и назови подтверждённые параметры жима лёжа.");
   rec("D02-EXACT-PLAN-BYPASSES-AI",exactPlanDecision&&exactPlanDecision.domain==="WORKOUT"&&exactPlanDecision.action==="TODAY"&&exactPlanDecision.source==="DETERMINISTIC_AUTHORITATIVE_WORKOUT_PLAN",exactPlanDecision);
   rec("D02-ANALYTICAL-PLAN-KEEPS_AI",naturalDialogDecision_("Насколько мой сегодняшний план соответствует цели сохранить силовые?")===null,{});
+  rec("D02-CYRILLIC-WORKOUT-DOMAIN",dialog02RequestProfile_("Насколько мой сегодняшний план соответствует цели сохранить силовые?").domains.indexOf("WORKOUT")>=0,dialog02RequestProfile_("Насколько мой сегодняшний план соответствует цели сохранить силовые?"));
   const recoveryAdvice=parseSubjectiveRecoveryInput_("Мало спал — стоит ли менять тренировку?");
   rec("D02-RECOVERY-ADVICE-NOT-CAPTURE",recoveryAdvice.status==="NOT_RECOVERY"&&recoveryAdvice.advisory===true,recoveryAdvice);
   const recoveryDomainFact=detectDomainFactCandidate_("Мало спал — стоит ли менять тренировку?");

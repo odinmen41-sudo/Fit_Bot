@@ -6,9 +6,15 @@ const AI_COACH_01_DECISION_SCHEMA = Object.freeze([
   "DECISION_ID","USER_ID","DOMAIN","STATUS","CREATED_AT","CONFIRMED_AT","BASE_JSON",
   "PROPOSAL_JSON","EVIDENCE_JSON","RULE_IDS","RESULT_JSON"
 ]);
-const AI_COACH_01_PLAN_VERSION_SCHEMA = Object.freeze([
+const AI_COACH_01_PLAN_VERSION_PREFIX_SCHEMA = Object.freeze([
   "VERSION_ID","DECISION_ID","USER_ID","CREATED_AT","STATUS"
-].concat(WORKOUT_PLAN_SCHEMA));
+]);
+
+/* Apps Script does not guarantee source-file evaluation order. Resolve the
+   shared workout schema lazily, after every project file has been loaded. */
+function aiCoach01PlanVersionSchema_(){
+  return AI_COACH_01_PLAN_VERSION_PREFIX_SCHEMA.concat(WORKOUT_PLAN_SCHEMA);
+}
 
 const AI_COACH_01_RULES = Object.freeze({
   CDC_GRADUAL_WEIGHT_LOSS:Object.freeze({source:"CDC",title:"Steps for Losing Weight",url:"https://www.cdc.gov/healthy-weight-growth/losing-weight/",claim:"Постепенное устойчивое снижение веса предпочтительнее резких изменений."}),
@@ -59,7 +65,7 @@ function routeAiCoach01_(update,options){const runtime=options||{},message=updat
 
 function findAiCoach01Capture_(userId,chatId,options){const now=options&&options.now instanceof Date?options.now:new Date();try{const rows=smartConfirmationReadRows_(smartConfirmationSheet_()).filter(function(row){const p=smartConfirmationParseJson_(row.payload_json,{});return String(row.user_id)===String(userId)&&String(row.chat_id)===String(chatId)&&p.source===AI_COACH_01_SOURCE&&row.status==="PENDING_CONFIRMATION";}).sort(smartConfirmationNewestFirst_);if(!rows.length)return {ok:false,code:"NO_AI_COACH_CAPTURE"};const row=rows[0];return new Date(row.expires_at).getTime()<=now.getTime()?{ok:false,code:"CAPTURE_EXPIRED"}:{ok:true,code:"PENDING_CAPTURE",capture:row,payload:smartConfirmationParseJson_(row.payload_json,{})};}catch(error){return {ok:false,code:"CAPTURE_LOOKUP_FAILED"};}}
 
-function readEffectiveAiCoachWorkoutPlanTable_(baseTable){try{const sheet=getSpreadsheet_().getSheetByName(AI_COACH_01_PLAN_VERSION_SHEET);if(!sheet||sheet.getLastRow()<2||sheet.getLastColumn()!==AI_COACH_01_PLAN_VERSION_SCHEMA.length)return null;const values=sheet.getRange(1,1,sheet.getLastRow(),AI_COACH_01_PLAN_VERSION_SCHEMA.length).getDisplayValues(),headers=values[0];if(headers.join("|")!==AI_COACH_01_PLAN_VERSION_SCHEMA.join("|"))return null;const active=values.slice(1).filter(function(r){return r[4]==="ACTIVE";}),latestByUser={};active.forEach(function(r){const user=String(r[2]),current=latestByUser[user];if(!current||new Date(r[3]).getTime()>new Date(current.created_at).getTime())latestByUser[user]={version_id:r[0],created_at:r[3]};});const versionedUsers=Object.keys(latestByUser),projected=active.filter(function(r){const latest=latestByUser[String(r[2])];return latest&&r[0]===latest.version_id;}).map(function(r){return r.slice(5);}),base=baseTable&&baseTable.headers&&baseTable.headers.join("|")===WORKOUT_PLAN_SCHEMA.join("|")?baseTable.rows||[]:[],keptBase=base.filter(function(r){return versionedUsers.indexOf(String(r[0]))<0&&versionedUsers.indexOf(String(r[1]))<0;});return {headers:WORKOUT_PLAN_SCHEMA.slice(),rows:keptBase.concat(projected)};}catch(error){return null;}}
+function readEffectiveAiCoachWorkoutPlanTable_(baseTable){try{const schema=aiCoach01PlanVersionSchema_(),sheet=getSpreadsheet_().getSheetByName(AI_COACH_01_PLAN_VERSION_SHEET);if(!sheet||sheet.getLastRow()<2||sheet.getLastColumn()!==schema.length)return null;const values=sheet.getRange(1,1,sheet.getLastRow(),schema.length).getDisplayValues(),headers=values[0];if(headers.join("|")!==schema.join("|"))return null;const active=values.slice(1).filter(function(r){return r[4]==="ACTIVE";}),latestByUser={};active.forEach(function(r){const user=String(r[2]),current=latestByUser[user];if(!current||new Date(r[3]).getTime()>new Date(current.created_at).getTime())latestByUser[user]={version_id:r[0],created_at:r[3]};});const versionedUsers=Object.keys(latestByUser),projected=active.filter(function(r){const latest=latestByUser[String(r[2])];return latest&&r[0]===latest.version_id;}).map(function(r){return r.slice(5);}),base=baseTable&&baseTable.headers&&baseTable.headers.join("|")===WORKOUT_PLAN_SCHEMA.join("|")?baseTable.rows||[]:[],keptBase=base.filter(function(r){return versionedUsers.indexOf(String(r[0]))<0&&versionedUsers.indexOf(String(r[1]))<0;});return {headers:WORKOUT_PLAN_SCHEMA.slice(),rows:keptBase.concat(projected)};}catch(error){return null;}}
 function aiCoach01PlanComparable_(sessions){const result={};Object.keys(sessions||{}).sort().forEach(function(day){const session=sessions[day];result[day]={stable_session_identity:String(session.stable_session_identity),display_name:String(session.display_name),exercises:(session.exercises||[]).map(function(e){return {stable_exercise_identity:String(e.stable_exercise_identity),display_name:String(e.display_name),order:Number(e.order),planned_sets:Number(e.planned_sets),planned_reps:String(e.planned_reps),planned_load:Number(e.planned_load),load_unit:String(e.load_unit||""),notes:String(e.notes||"")};})};});return result;}
 
 /* Atomic production writer: failed nutrition readback is compensated;
@@ -71,7 +77,8 @@ function applyAiCoach01Proposal_(selected,userId,chatId,options){
   if(props.getProperty("DEPLOYMENT_ENV")!=="STAGING"||props.getProperty("DATA_WRITE_MODE")!=="SIMULATION")return {ok:false,code:"PERSISTENCE_DISABLED"};
   const ss=getSpreadsheet_(),decision=ss.getSheetByName(AI_COACH_01_DECISION_SHEET),versions=ss.getSheetByName(AI_COACH_01_PLAN_VERSION_SHEET);
   if(!decision||decision.getLastColumn()!==AI_COACH_01_DECISION_SCHEMA.length||decision.getRange(1,1,1,AI_COACH_01_DECISION_SCHEMA.length).getDisplayValues()[0].join("|")!==AI_COACH_01_DECISION_SCHEMA.join("|"))return {ok:false,code:"DECISION_SCHEMA_REQUIRED"};
-  if(proposal.domain==="WORKOUT_PLAN"&&(!versions||versions.getLastColumn()!==AI_COACH_01_PLAN_VERSION_SCHEMA.length||versions.getRange(1,1,1,AI_COACH_01_PLAN_VERSION_SCHEMA.length).getDisplayValues()[0].join("|")!==AI_COACH_01_PLAN_VERSION_SCHEMA.join("|")))return {ok:false,code:"PLAN_VERSION_SCHEMA_REQUIRED"};
+  const planVersionSchema=aiCoach01PlanVersionSchema_();
+  if(proposal.domain==="WORKOUT_PLAN"&&(!versions||versions.getLastColumn()!==planVersionSchema.length||versions.getRange(1,1,1,planVersionSchema.length).getDisplayValues()[0].join("|")!==planVersionSchema.join("|")))return {ok:false,code:"PLAN_VERSION_SCHEMA_REQUIRED"};
   const lock=LockService.getScriptLock();if(!lock.tryLock(5000))return {ok:false,code:"LOCK_TIMEOUT"};
   let decisionRow=0,profileRange=null,versionStart=0,versionCount=0,nutritionChanged=false;
   try{
@@ -90,8 +97,8 @@ function applyAiCoach01Proposal_(selected,userId,chatId,options){
       const versionId="plan-version-"+decisionId,rows=[];
       Object.keys(proposal.after).forEach(function(day){proposal.after[day].exercises.forEach(function(e){rows.push([versionId,decisionId,String(userId),now.toISOString(),"PREPARED",String(userId),String(userId),day,proposal.after[day].stable_session_identity,proposal.after[day].display_name,e.stable_exercise_identity,e.display_name,e.order,e.planned_sets,e.planned_reps,e.planned_load,e.load_unit||"",e.notes||"",true]);});});
       if(!rows.length)throw new Error("EMPTY_PLAN_VERSION");
-      versionStart=versions.getLastRow()+1;versionCount=rows.length;versions.getRange(versionStart,1,versionCount,AI_COACH_01_PLAN_VERSION_SCHEMA.length).setValues(rows);SpreadsheetApp.flush();
-      const staged=versions.getRange(versionStart,1,versionCount,AI_COACH_01_PLAN_VERSION_SCHEMA.length).getDisplayValues();
+      versionStart=versions.getLastRow()+1;versionCount=rows.length;versions.getRange(versionStart,1,versionCount,planVersionSchema.length).setValues(rows);SpreadsheetApp.flush();
+      const staged=versions.getRange(versionStart,1,versionCount,planVersionSchema.length).getDisplayValues();
       if(staged.length!==rows.length||staged.some(function(r){return r[0]!==versionId||r[4]!=="PREPARED";}))throw new Error("PLAN_STAGE_READBACK_FAILED");
       versions.getRange(versionStart,5,versionCount,1).setValue("ACTIVE");SpreadsheetApp.flush();
       const effective=readEffectiveAiCoachWorkoutPlanTable_({headers:WORKOUT_PLAN_SCHEMA.slice(),rows:[]}),effectiveUserRows=effective&&effective.rows.filter(function(r){return String(r[0])===String(userId)||String(r[1])===String(userId);});

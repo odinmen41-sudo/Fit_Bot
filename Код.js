@@ -329,6 +329,14 @@ function doPost(e) {
       return httpOk_("OK");
     }
 
+    const aiCoach = routeAiCoach01_(update);
+    if (aiCoach.handled) {
+      sendTelegramMessage_(chatId, aiCoach.message);
+      logAiReply_(messageText, aiCoach.message, "ai_coach_01");
+      markBotInputProcessed_(inputRow, aiCoach.ok ? "Да" : "Ошибка AI Coach");
+      return httpOk_("OK");
+    }
+
     const naturalDialog = routeNaturalDialogAction_(update);
     if (naturalDialog.handled) {
       sendTelegramMessage_(chatId, naturalDialog.message);
@@ -4401,7 +4409,9 @@ function workoutPlanDependencies_(overrides) {
     const lastRow=sheet.getLastRow();
     if(lastRow<1)return {headers:[],rows:[]};
     const values=sheet.getRange(1,1,Math.min(lastRow,500),WORKOUT_PLAN_SCHEMA.length).getDisplayValues();
-    return {headers:values[0]||[],rows:values.slice(1)};
+    const base={headers:values[0]||[],rows:values.slice(1)};
+    if(typeof readEffectiveAiCoachWorkoutPlanTable_==="function")return readEffectiveAiCoachWorkoutPlanTable_(base)||base;
+    return base;
   }};
 }
 

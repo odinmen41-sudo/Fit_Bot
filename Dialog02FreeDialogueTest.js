@@ -79,6 +79,8 @@ function runDialog02FreeDialogueTests() {
   rec("D02-MUTATION-CLARIFICATION-POLICY",mutationMessages[1].content.indexOf("не утверждай, что действие выполнено")>=0,mutationMessages[1]);
   rec("D02-PROMPT-NO-PREMATURE-DEFICIT",/Не называй разницу между дневной целью/.test(messages[0].content),messages[0]);
   rec("D02-PROMPT-NO-MANDATORY-WINDOW",/Не навязывай обязательное пищевое окно/.test(messages[0].content),messages[0]);
+  rec("D02-PROMPT-NO-UNSOURCED-PHYSIOLOGY-NUMBERS",/Не приводи числовые физиологические диапазоны/.test(messages[0].content),messages[0]);
+  rec("D02-PROMPT-WEIGHT-TREND-REQUIRED",/для оценки нужен тренд/.test(messages[0].content),messages[0]);
   rec("D02-PROMPT-HIDES-INTERNAL-MISSING",/Не повторяй служебные маркеры/.test(messages[1].content),messages[1]);
 
   const compact=compactDialog02LegacyContext_(["USER PROFILE:","Имя: Тест","HEALTH:","Плечо: без жалоб","RECENT HISTORY — DIALOG:","Пользователь: а почему?","NUTRITION:","Калории: 1"].join("\n"));

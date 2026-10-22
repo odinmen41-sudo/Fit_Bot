@@ -90,6 +90,8 @@ function runDialog02FreeDialogueTests() {
   rec("D02-RECOVERY-ADVICE-NOT-CAPTURE",recoveryAdvice.status==="NOT_RECOVERY"&&recoveryAdvice.advisory===true,recoveryAdvice);
   const recoveryDomainFact=detectDomainFactCandidate_("Мало спал — стоит ли менять тренировку?");
   rec("D02-RECOVERY-ADVICE-NOT-DOMAIN-CAPTURE",recoveryDomainFact.domain===null&&recoveryDomainFact.code==="NOT_DOMAIN_FACT",recoveryDomainFact);
+  const recoveryBlindAdvice=parseSubjectiveRecoveryInput_("Сон был хуже обычного, но цифр не записывал. Тренироваться как обычно?");
+  rec("D02-RECOVERY-BLIND-ADVICE-NOT-CAPTURE",recoveryBlindAdvice.status==="NOT_RECOVERY"&&recoveryBlindAdvice.advisory===true,recoveryBlindAdvice);
   rec("D02-RECOVERY-EXPLICIT-SAVE-PRESERVED",parseSubjectiveRecoveryInput_("запиши: спал 7 часов").status==="VALID",parseSubjectiveRecoveryInput_("запиши: спал 7 часов"));
 
   function props(){return {getProperty:function(name){if(name===CONFIG.GROQ_KEY_PROPERTY)return "test-key";if(name===CONFIG.GROQ_PRIMARY_MODEL_PROPERTY)return "test-model";return "";}};}

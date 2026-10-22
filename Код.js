@@ -4801,7 +4801,7 @@ function subjectiveRecoverySetMetric_(metrics,key,raw){const value=Number(String
 function parseSubjectiveRecoveryInput_(text){
   const n=subjectiveRecoveryNormalize_(text),metrics={},pain=subjectiveRecoveryHasPain_(n),correction=/^(?:не\s+\d|исправь\b)/.test(n);
   if(!n)return {status:"NOT_RECOVERY",metrics:{},pain:false};
-  const advisory=/(?:стоит ли|нужно ли|надо ли|можно ли|менять ли|что делать|как (?:сон|усталость|стресс|самочувствие)|почему)/.test(n);
+  const advisory=/(?:стоит ли|нужно ли|надо ли|можно ли|менять ли|что делать|как обычно|трениров|нагрузк|как (?:сон|усталость|стресс|самочувствие)|почему)/.test(n);
   const explicitSave=/(?:запиши|сохрани|отметь|добавь)/.test(n);
   if(advisory&&!explicitSave&&!/\d/.test(n))return {status:"NOT_RECOVERY",metrics:{},pain:pain,advisory:true};
   if(correction&&/(?:устал|стресс|сон|самочувств|готовност|забит|болезненност)/.test(n))return {status:"CLARIFICATION",metrics:{},pain:pain,message:"Укажи новое значение, например: «усталость 6»."};

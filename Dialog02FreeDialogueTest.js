@@ -62,7 +62,7 @@ function runDialog02FreeDialogueTests() {
     recovery:{history_status:"NORMAL",subjective_status:"NO_DATA",last_completed_workout:{days_ago:0},today:{sleep_duration_hours:null,fatigue:null}}};
   let built=buildDialog02AuthoritativeContext_("u1","Вес стоит, хотя калории держу",{build_dashboard:function(){return facts;}});
   rec("D02-CONTEXT-READY",built.ok&&built.profile.cross_domain&&built.block.indexOf("weight_current_kg=118")>=0&&/nutrition_consumed_calories=390[,.]5/.test(built.block),built);
-  rec("D02-CONTEXT-MISSING-EXPLICIT",built.block.indexOf("weight_week_delta_kg=MISSING")>=0&&built.block.indexOf("recovery_today_fatigue=MISSING")>=0,built);
+  rec("D02-CONTEXT-MISSING-EXPLICIT",built.block.indexOf("weight_week_delta_kg=MISSING")>=0,built);
   rec("D02-CONTEXT-PRIVACY",!/(USER_ID|TELEGRAM_ID|CAPTURE_ID|MEAL_ID|SNAPSHOT_HASH|raw_message)/.test(built.block),built);
   const omitted=buildDialog02AuthoritativeContext_("u1","Что съесть после тренировки?",{omit_nutrition:true,build_dashboard:function(){return facts;}});
   rec("D02-C4-NO-NUTRITION-DUPLICATION",omitted.ok&&omitted.block.indexOf("nutrition_consumed_")<0&&omitted.block.indexOf("training_today=грудь")>=0,omitted);
@@ -76,6 +76,9 @@ function runDialog02FreeDialogueTests() {
   const workoutContext=buildDialog02AuthoritativeContext_("u1","Оцени мой план на сегодня",{build_dashboard:function(){return facts;},load_workout_plan:function(){return activePlan;}});
   rec("D02-EFFECTIVE-PLAN-CONTEXT",workoutContext.ok&&workoutContext.block.indexOf("training_plan_exercise_1=Жим лёжа|sets=3|reps=6|load=110|unit=kg")>=0,workoutContext);
   rec("D02-EFFECTIVE-PLAN-NO-INTERNAL_IDS",!/VERSION_ID|DECISION_ID|SESSION_KEY|EXERCISE_KEY/.test(workoutContext.block),workoutContext);
+  rec("D02-WORKOUT-CONTEXT-IS-DOMAIN-SCOPED",workoutContext.block.indexOf("nutrition_")<0&&workoutContext.block.indexOf("weight_")<0&&workoutContext.block.indexOf("recovery_")<0,workoutContext);
+  const crossDomainContext=buildDialog02AuthoritativeContext_("u1","Что съесть с учётом тренировки?",{build_dashboard:function(){return facts;},load_workout_plan:function(){return activePlan;}});
+  rec("D02-CROSS-DOMAIN-CONTEXT-PRESERVED",crossDomainContext.block.indexOf("nutrition_target_protein=195")>=0&&crossDomainContext.block.indexOf("training_plan_exercise_1=")>=0,crossDomainContext);
 
   const messages=buildGroqMessages_("safe legacy","Почему вес стоит, хотя калории держу?",null,built.block,built.profile);
   rec("D02-PROMPT-TRUSTED-SEPARATE",messages.length===3&&messages[0].role==="system"&&messages[1].role==="system"&&messages[2].role==="user"&&messages[1].content.indexOf(built.block)>=0,{messages:messages});
@@ -90,6 +93,7 @@ function runDialog02FreeDialogueTests() {
   rec("D02-PROMPT-NO-PREMATURE-DEFICIT",/Не называй разницу между дневной целью/.test(messages[0].content),messages[0]);
   rec("D02-PROMPT-NO-MANDATORY-WINDOW",/Не навязывай обязательное пищевое окно/.test(messages[0].content),messages[0]);
   rec("D02-PROMPT-NO-UNSOURCED-PHYSIOLOGY-NUMBERS",/Не приводи числовые физиологические диапазоны/.test(messages[0].content),messages[0]);
+  rec("D02-PROMPT-NO-INVENTED-NUMERIC-TARGETS",/Не вводи новые числовые цели/.test(messages[0].content)&&/придуманную промежуточную цель/.test(messages[0].content),messages[0]);
   rec("D02-PROMPT-WEIGHT-TREND-REQUIRED",/для оценки нужен тренд/.test(messages[0].content),messages[0]);
   rec("D02-PROMPT-HIDES-INTERNAL-MISSING",/Не повторяй служебные маркеры/.test(messages[1].content),messages[1]);
   rec("D02-PROMPT-NORMAL-IS-NOT-HEALTH",/NORMAL — статус чтения данных/.test(messages[1].content),messages[1]);

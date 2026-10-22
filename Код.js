@@ -160,7 +160,7 @@ function dialog02RequestProfile_(text) {
   function add(domain, pattern) { if (pattern.test(normalized)) domains.push(domain); }
   add("NUTRITION", /(?:(?:^| )(?:еда|еды|еде|еду|ем)(?: |$)|питан|рацион|калори|ккал|белк|жир|углевод|кбжу|бжу|завтрак|обед|ужин|перекус|продукт|съесть|съеденн|поесть|прием пищ|что выбрать вечером)/);
   add("WEIGHT", /(?:вес|вешу|взвешив|похуд|набрать массу|сбросить|килограмм|кг\b|измерени|до цели)/);
-  add("WORKOUT", /(?:трениров|упражнен|подход|повтор|жим|присед|тяга|зал|нагрузк|заняти|план и факт|факт с планом)/);
+  add("WORKOUT", /(?:трениров|упражнен|подход|повтор|жим|присед|тяга|зал|нагрузк|заняти|план и факт|факт с планом|план (?:на )?сегодня|сегодняшн\w* план|актуальн\w* план)/);
   add("RECOVERY", /(?:восстанов|сон|сну|сна|спал|устал|усталост|стресс|самочув|готовност|забит|болезнен|отдых|свежий)/);
   const mutation = /(?:запиш|сохран|добав|удал|убер|исправ|подправ|замен|измени|отмени|скорректир)/.test(normalized);
   const analytical = /(?:почему|как|стоит ли|можно ли|что лучше|сравни|оцени|объясни|помоги|посоветуй|связано ли|влияет ли)/.test(normalized);
@@ -176,16 +176,20 @@ function dialog02Number_(value, digits) {
 
 function formatDialog02AuthoritativeContext_(facts, requestProfile, options) {
   const runtime = options || {}, source = facts || {}, profile = requestProfile || {domains:[],mode:"INFORMATIONAL"};
+  const requestedDomains = profile.domains || [], includeAllDomains = requestedDomains.length === 0;
+  function includeDomain(domain) { return includeAllDomains || requestedDomains.indexOf(domain) >= 0; }
   const lines = ["=== DIALOG_02_AUTHORITATIVE ===", "scope=user", "local_date=" + String(source.local_date || "MISSING"),
     "request_domains=" + (profile.domains && profile.domains.length ? profile.domains.join(",") : "GENERAL"),
     "request_mode=" + String(profile.mode || "INFORMATIONAL")];
-  const weight = source.weight || {};
-  lines.push("weight_status=" + String(weight.data_status || weight.status || "UNAVAILABLE"));
-  lines.push("weight_current_kg=" + dialog02Number_(weight.current_weight, 2));
-  lines.push("weight_measurement_age_days=" + dialog02Number_(weight.measurement_age_days, 0));
-  lines.push("weight_week_delta_kg=" + dialog02Number_(weight.week_delta, 2));
-  lines.push("weight_target_kg=" + dialog02Number_(weight.target_weight, 2));
-  if (runtime.omit_nutrition !== true) {
+  if (includeDomain("WEIGHT")) {
+    const weight = source.weight || {};
+    lines.push("weight_status=" + String(weight.data_status || weight.status || "UNAVAILABLE"));
+    lines.push("weight_current_kg=" + dialog02Number_(weight.current_weight, 2));
+    lines.push("weight_measurement_age_days=" + dialog02Number_(weight.measurement_age_days, 0));
+    lines.push("weight_week_delta_kg=" + dialog02Number_(weight.week_delta, 2));
+    lines.push("weight_target_kg=" + dialog02Number_(weight.target_weight, 2));
+  }
+  if (includeDomain("NUTRITION") && runtime.omit_nutrition !== true) {
     const nutrition = source.nutrition || {}, consumed = nutrition.consumed || {}, targets = nutrition.targets || {}, remaining = nutrition.remaining || {};
     lines.push("nutrition_status=" + String(nutrition.status || "UNAVAILABLE"));
     ["calories","protein","fat","carbs"].forEach(function(key) {
@@ -194,30 +198,34 @@ function formatDialog02AuthoritativeContext_(facts, requestProfile, options) {
       lines.push("nutrition_remaining_" + key + "=" + dialog02Number_(remaining[key], 3));
     });
   }
-  const training = source.training || {};
-  lines.push("training_status=" + String(training.status || "UNAVAILABLE"));
-  lines.push("training_today=" + String(training.today_session_name || "MISSING"));
-  lines.push("training_next=" + String(training.next_workout && training.next_workout.session_name || "MISSING"));
-  const effectivePlan = source.effective_workout_plan || {};
-  lines.push("training_plan_status=" + String(effectivePlan.status || "UNAVAILABLE"));
-  lines.push("training_plan_local_date=" + String(effectivePlan.local_date || "MISSING"));
-  lines.push("training_plan_session=" + String(effectivePlan.session_name || "MISSING"));
-  (effectivePlan.exercises || []).slice(0, 12).forEach(function(exercise, index) {
-    lines.push("training_plan_exercise_" + (index + 1) + "=" + [
-      String(exercise.name || "MISSING"),
-      "sets=" + dialog02Number_(exercise.sets, 0),
-      "reps=" + String(exercise.reps == null || exercise.reps === "" ? "MISSING" : exercise.reps),
-      "load=" + dialog02Number_(exercise.load, 2),
-      "unit=" + String(exercise.unit || "MISSING")
-    ].join("|"));
-  });
-  const recovery = source.recovery || {}, last = recovery.last_completed_workout || {}, today = recovery.today || {};
-  lines.push("recovery_history_status=" + String(recovery.history_status || "UNAVAILABLE"));
-  lines.push("recovery_subjective_status=" + String(recovery.subjective_status || "UNAVAILABLE"));
-  lines.push("recovery_last_workout_days_ago=" + dialog02Number_(last.days_ago, 0));
-  ["sleep_duration_hours","sleep_quality","fatigue","soreness","stress","wellbeing","readiness"].forEach(function(key) {
-    lines.push("recovery_today_" + key + "=" + dialog02Number_(today[key], 2));
-  });
+  if (includeDomain("WORKOUT")) {
+    const training = source.training || {};
+    lines.push("training_status=" + String(training.status || "UNAVAILABLE"));
+    lines.push("training_today=" + String(training.today_session_name || "MISSING"));
+    lines.push("training_next=" + String(training.next_workout && training.next_workout.session_name || "MISSING"));
+    const effectivePlan = source.effective_workout_plan || {};
+    lines.push("training_plan_status=" + String(effectivePlan.status || "UNAVAILABLE"));
+    lines.push("training_plan_local_date=" + String(effectivePlan.local_date || "MISSING"));
+    lines.push("training_plan_session=" + String(effectivePlan.session_name || "MISSING"));
+    (effectivePlan.exercises || []).slice(0, 12).forEach(function(exercise, index) {
+      lines.push("training_plan_exercise_" + (index + 1) + "=" + [
+        String(exercise.name || "MISSING"),
+        "sets=" + dialog02Number_(exercise.sets, 0),
+        "reps=" + String(exercise.reps == null || exercise.reps === "" ? "MISSING" : exercise.reps),
+        "load=" + dialog02Number_(exercise.load, 2),
+        "unit=" + String(exercise.unit || "MISSING")
+      ].join("|"));
+    });
+  }
+  if (includeDomain("RECOVERY")) {
+    const recovery = source.recovery || {}, last = recovery.last_completed_workout || {}, today = recovery.today || {};
+    lines.push("recovery_history_status=" + String(recovery.history_status || "UNAVAILABLE"));
+    lines.push("recovery_subjective_status=" + String(recovery.subjective_status || "UNAVAILABLE"));
+    lines.push("recovery_last_workout_days_ago=" + dialog02Number_(last.days_ago, 0));
+    ["sleep_duration_hours","sleep_quality","fatigue","soreness","stress","wellbeing","readiness"].forEach(function(key) {
+      lines.push("recovery_today_" + key + "=" + dialog02Number_(today[key], 2));
+    });
+  }
   lines.push("=== END_DIALOG_02_AUTHORITATIVE ===");
   return limitText_(lines.join("\n"), 2600);
 }
@@ -915,6 +923,7 @@ function buildGroqMessages_(context, userText, nutritionTodayBlock, dialog02Bloc
     "Хвали только за конкретный подтверждённый результат. Не стыди за еду, вес, ошибки учёта или пропуск тренировки.",
     "Разделяй смысл явно: подтверждённое называй фактом, причинное объяснение — выводом, гипотезой или предположением, неизвестное — неопределённостью.",
     "Любые числа бери только из доверенных системных блоков; не пересчитывай и не восстанавливай пропущенные значения.",
+    "Не вводи новые числовые цели, порции, диапазоны или этапы достижения цели, которых нет в доверенном контексте. Не превращай дневную цель в придуманную промежуточную цель.",
     "Не приводи числовые физиологические диапазоны, если их нет в доверенном контексте. Разница между текущим и целевым весом сама по себе не доказывает, что план не работает; для оценки нужен тренд.",
     "Не называй разницу между дневной целью и текущими записями дефицитом до завершения дня. Не навязывай обязательное пищевое окно после тренировки без подтверждённых медицинских оснований.",
     "Ты не выполняешь запись, исправление или удаление данных. Для такого запроса объясни, что нужно уточнить или подтвердить через поддерживаемый поток.",

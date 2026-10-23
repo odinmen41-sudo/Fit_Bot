@@ -342,6 +342,8 @@ function doPost(e) {
   let updateId = "";
 
   try {
+    const betaWebhook = validateBeta01Webhook_(e);
+    if (!betaWebhook.ok) return httpOk_("IGNORED");
     if (!e || !e.postData || !e.postData.contents) {
       logSystem_("EMPTY_REQUEST", "POST body is missing");
       return httpOk_("IGNORED");
@@ -361,12 +363,22 @@ function doPost(e) {
       return httpOk_("DUPLICATE");
     }
 
+    const betaAccess = routeBeta01Access_(update);
+    if (betaAccess.handled && betaAccess.authorized !== true) {
+      const accessChatId = update.callback_query && update.callback_query.message && update.callback_query.message.chat
+        ? update.callback_query.message.chat.id
+        : update.message && update.message.chat ? update.message.chat.id
+        : update.edited_message && update.edited_message.chat ? update.edited_message.chat.id : "";
+      if (accessChatId) sendTelegramMessage_(accessChatId, betaAccess.message);
+      return httpOk_("OK");
+    }
+
     if (update.callback_query) {
       const callbackCollection = routeCollectionProductionBridge_(update);
       if (callbackCollection.handled) return httpOk_("OK");
     }
 
-    const message = update.message || update.edited_message || null;
+    let message = update.message || update.edited_message || null;
     if (!message) {
       console.log("Unsupported update ignored: " + updateId);
       return httpOk_("IGNORED");
@@ -388,19 +400,53 @@ function doPost(e) {
       return httpOk_("IGNORED");
     }
 
+    if ((!message.text || !String(message.text).trim()) && message.voice) {
+      const voiceResult = transcribeBeta01VoiceMessage_(message);
+      if (!voiceResult.ok) {
+        sendTelegramMessage_(chatId, voiceResult.message);
+        return httpOk_("OK");
+      }
+      message = Object.assign({}, message, {text:voiceResult.text, beta_voice_transcript:true});
+      update = Object.assign({}, update, {message:message});
+      sendTelegramMessage_(chatId, "Распознал: «" + limitText_(voiceResult.text, 500) + "». Если что-то неверно — не подтверждай запись и пришли исправление текстом.");
+    }
+
     const hasText = typeof message.text === "string" && message.text.trim() !== "";
     const messageText = hasText
       ? limitText_(message.text.trim(), CONFIG.MAX_USER_CHARS)
       : "[Сообщение без текста]";
 
+    const betaAdmin = routeBeta01Admin_(update);
+    if (betaAdmin.handled) {
+      sendTelegramMessage_(chatId, betaAdmin.message);
+      return httpOk_("OK");
+    }
+
+    const betaLog = beta01AuditLogValues_(userId, username, messageText, hasText);
     const inputRow = appendBotInput_([
       new Date(),
-      safeCell_(userId),
-      safeCell_("Telegram @" + username),
-      safeCell_(messageText),
+      safeCell_(betaLog.user_id),
+      safeCell_(betaLog.source),
+      safeCell_(betaLog.message),
       hasText ? "Сообщение" : "Пустое сообщение",
       "В обработке"
     ]);
+
+    const betaOnboarding = routeBeta01Onboarding_(update);
+    if (betaOnboarding.handled) {
+      sendTelegramMessage_(chatId, betaOnboarding.message);
+      logAiReply_(messageText, betaOnboarding.message, "beta_01_onboarding");
+      markBotInputProcessed_(inputRow, betaOnboarding.ok ? "Да" : "Ошибка onboarding");
+      return httpOk_("OK");
+    }
+
+    const betaFeedback = routeBeta01Feedback_(update);
+    if (betaFeedback.handled) {
+      sendTelegramMessage_(chatId, betaFeedback.message);
+      logAiReply_(messageText, betaFeedback.message, "beta_01_feedback");
+      markBotInputProcessed_(inputRow, betaFeedback.ok ? "Да" : "Ошибка feedback");
+      return httpOk_("OK");
+    }
 
     if (!hasText) {
       sendTelegramMessage_(chatId, "Я пока понимаю только текстовые сообщения.");
@@ -6867,6 +6913,16 @@ function getSpreadsheet_(options) {
     return stagingSpreadsheet;
   }
 
+  if (environment === "BETA") {
+    const betaSpreadsheetId = String(
+      properties.getProperty("BETA_SPREADSHEET_ID") || ""
+    ).trim();
+    if (!betaSpreadsheetId) throw new Error("BETA: BETA_SPREADSHEET_ID is not configured");
+    const betaSpreadsheet = spreadsheetApp.openById(betaSpreadsheetId);
+    if (!betaSpreadsheet) throw new Error("BETA: spreadsheet is unavailable");
+    return betaSpreadsheet;
+  }
+
   const spreadsheet = spreadsheetApp.getActiveSpreadsheet();
   if (!spreadsheet) throw new Error("Active spreadsheet is unavailable");
   return spreadsheet;
@@ -6956,11 +7012,20 @@ function markBotInputProcessed_(rowNumber, status) {
 
 function logAiReply_(userText, reply, model) {
   try {
+    let loggedInput = limitText_(userText, 1000);
+    let loggedReply = limitText_(reply, 3000);
+    try {
+      const environment = String(PropertiesService.getScriptProperties().getProperty("DEPLOYMENT_ENV") || "").trim().toUpperCase();
+      if (environment === "BETA") {
+        loggedInput = "[BETA input redacted; chars=" + String(userText || "").length + "]";
+        loggedReply = "[BETA reply redacted; chars=" + String(reply || "").length + "]";
+      }
+    } catch (ignored) {}
     appendRowToSheet_(CONFIG.AI_COACH_SHEET, [
       new Date(),
       "Telegram",
-      safeCell_(limitText_(userText, 1000)),
-      safeCell_(limitText_(reply, 3000)),
+      safeCell_(loggedInput),
+      safeCell_(loggedReply),
       safeCell_(model)
     ]);
   } catch (error) {

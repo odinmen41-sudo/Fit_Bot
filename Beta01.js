@@ -23,6 +23,8 @@ function beta01Sha256_(value,deps){const raw=String(value||"");if(deps&&typeof d
 function beta01UserKey_(telegramId,deps){const salt=beta01Property_(deps,"BETA_ANALYTICS_SALT");return beta01Sha256_(salt+"|"+String(telegramId||""),deps).slice(0,20);}
 function beta01Json_(value,fallback){try{return JSON.parse(String(value||""));}catch(e){return fallback;}}
 function beta01Iso_(date){return (date instanceof Date?date:new Date(date)).toISOString();}
+function beta01ParticipantLimit_(deps){return Math.min(5,Math.max(1,Number(beta01Property_(deps,"BETA_PARTICIPANT_LIMIT")||1)));}
+function beta01WithLock_(deps,action){const lock=deps&&deps.lock;let acquired=false;try{if(lock&&typeof lock.waitLock==="function"){lock.waitLock(10000);acquired=true;}return action();}finally{if(acquired&&lock&&typeof lock.releaseLock==="function")lock.releaseLock();}}
 
 function beta01ReadTable_(sheetName,deps){
   const schema=BETA01_SCHEMAS[sheetName];if(!schema)throw new Error("BETA01_UNKNOWN_TABLE");
@@ -39,6 +41,7 @@ function beta01Rows_(table){return (table.rows||[]).map(function(row,index){cons
 function beta01Dependencies_(overrides){const supplied=overrides||{},properties=supplied.properties||(typeof PropertiesService!=="undefined"?PropertiesService.getScriptProperties():null);return {
   properties:properties,spreadsheet:supplied.spreadsheet||(typeof getSpreadsheet_==="function"?getSpreadsheet_():null),now:supplied.now||function(){return new Date();},
   uuid:supplied.uuid||function(){return Utilities.getUuid();},sha256:supplied.sha256,flush:supplied.flush||(typeof SpreadsheetApp!=="undefined"?function(){SpreadsheetApp.flush();}:function(){}),
+  lock:supplied.lock||(typeof LockService!=="undefined"?LockService.getScriptLock():null),
   fetch:supplied.fetch||(typeof UrlFetchApp!=="undefined"?function(url,options){return UrlFetchApp.fetch(url,options);}:null),
   create_profile:supplied.create_profile||beta01CreateProfile_,profile_exists:supplied.profile_exists||beta01ProfileExists_
 };}
@@ -51,10 +54,11 @@ function beta01StartToken_(text){const m=/^\/start(?:@\w+)?(?:\s+invite_([A-Za-z
 function beta01InviteHash_(token,deps){return beta01Sha256_("fitbot-beta-invite|"+String(token||""),deps);}
 
 function beta01ActivateInvite_(telegramId,token,deps){
+ return beta01WithLock_(deps,function(){
   const table=beta01ReadTable_(BETA01.INVITES_SHEET,deps);if(!table.ok)return beta01Result_(true,false,table.code,{message:"Доступ временно недоступен. Попробуй позже."});
   const existing=beta01FindUser_(telegramId,deps);if(existing.ok&&existing.user.STATUS==="ACTIVE")return beta01Result_(true,true,"ALREADY_ACTIVE",{authorized:true});
   if(beta01Property_(deps,"BETA_NEW_CONNECTIONS_PAUSED").toLowerCase()==="true")return beta01Result_(true,false,"BETA_PAUSED",{message:"Новые подключения временно приостановлены. Попробуй позже."});
-  const participantLimit=Math.max(1,Number(beta01Property_(deps,"BETA_PARTICIPANT_LIMIT")||1)),activeUsers=beta01Rows_(beta01ReadTable_(BETA01.USERS_SHEET,deps)).filter(function(row){return row.STATUS==="ACTIVE";}).length;if(activeUsers>=participantLimit)return beta01Result_(true,false,"PARTICIPANT_LIMIT",{message:"Набор в текущую волну закрыт. Обратись к владельцу тестирования."});
+  const participantLimit=beta01ParticipantLimit_(deps),activeUsers=beta01Rows_(beta01ReadTable_(BETA01.USERS_SHEET,deps)).filter(function(row){return row.STATUS==="ACTIVE";}).length;if(activeUsers>=participantLimit)return beta01Result_(true,false,"PARTICIPANT_LIMIT",{message:"Набор в текущую волну закрыт. Обратись к владельцу тестирования."});
   const hash=beta01InviteHash_(token,deps),now=deps.now(),matches=beta01Rows_(table).filter(function(row){return row.INVITE_HASH===hash;});
   if(matches.length!==1)return beta01Result_(true,false,"INVITE_INVALID",{message:"Приглашение недействительно. Попроси владельца беты прислать новую ссылку."});
   const invite=matches[0],uses=Number(invite.USES||0),maxUses=Math.max(1,Number(invite.MAX_USES||1)),expires=Date.parse(invite.EXPIRES_AT||"");
@@ -63,7 +67,9 @@ function beta01ActivateInvite_(telegramId,token,deps){
   beta01UpdateRow_(BETA01.INVITES_SHEET,invite._row,updated,deps);
   if(existing.ok){const u=existing.user;beta01UpdateRow_(BETA01.USERS_SHEET,u._row,[String(telegramId),"ACTIVE","INVITE","CONSENT_REQUIRED",u.CONSENT_VERSION||"",u.CONSENT_AT||"",u.OPTIONAL_IMPROVEMENT_CONSENT||"",u.STATE_JSON||"{}",u.CREATED_AT||beta01Iso_(now),beta01Iso_(now)],deps);}
   else beta01Append_(BETA01.USERS_SHEET,[String(telegramId),"ACTIVE","INVITE","CONSENT_REQUIRED","","","","{}",beta01Iso_(now),beta01Iso_(now)],deps);
-  return beta01Result_(true,true,"INVITE_ACTIVATED",{authorized:true,sheet_writes:2});
+  beta01RecordEvent_(telegramId,"INVITE_ACTIVATED",true,{},deps);
+  return beta01Result_(true,true,"INVITE_ACTIVATED",{authorized:true,sheet_writes:3});
+ });
 }
 
 function beta01AccessDecision_(telegramId,text,deps){
@@ -90,6 +96,7 @@ function beta01ParseProfile_(text){
 function beta01ProfileSummary_(state){const p=state.profile||{},lines=["Проверь, что я понял:"];if(p.goal)lines.push("• Цель: "+p.goal);if(p.age!=null)lines.push("• Возраст: "+p.age);if(p.height!=null)lines.push("• Рост: "+p.height+" см");if(p.weight!=null)lines.push("• Вес: "+String(p.weight).replace(".",",")+" кг");if(p.level)lines.push("• Уровень: "+p.level);if(p.training_per_week!=null)lines.push("• Тренировок в неделю: "+p.training_per_week);lines.push("","Сохранить профиль? Ответь «Да», «Исправить» или «Отмена».");return lines.join("\n");}
 function beta01InternalUserId_(telegramId,deps){return "beta-"+beta01UserKey_(telegramId,deps).slice(0,12);}
 function beta01CreateProfile_(telegramId,profile,deps){
+ return beta01WithLock_(deps,function(){
   const sheet=deps.spreadsheet.getSheetByName("User_Profile");if(!sheet)return {ok:false,code:"PROFILE_SHEET_MISSING"};
   const values=sheet.getDataRange().getDisplayValues(),headers=values[0]||[],schema=nutritionTargetSchema_(headers);if(!schema.ok)return {ok:false,code:"PROFILE_SCHEMA_INVALID"};
   const telegramIndex=schema.indexes.Telegram_ID,userIndex=schema.indexes.User_ID,matches=values.slice(1).filter(function(row){return String(row[telegramIndex])===String(telegramId);});
@@ -97,7 +104,10 @@ function beta01CreateProfile_(telegramId,profile,deps){
   const row=new Array(headers.length).fill("");function put(name,value){const i=schema.indexes[name];if(i>=0&&value!==undefined&&value!==null&&value!=="")row[i]=value;}
   put("User_ID",beta01InternalUserId_(telegramId,deps));put("Telegram_ID",String(telegramId));put("Возраст",profile.age);put("Рост",profile.height);put("Вес старт",profile.weight);put("Текущий вес",profile.weight);put("Цель",profile.goal);put("Уровень подготовки",profile.level);put("Тренировки в неделю",profile.training_per_week);
   sheet.appendRow(row);if(deps.flush)deps.flush();const verify=sheet.getDataRange().getDisplayValues().slice(1).filter(function(r){return String(r[telegramIndex])===String(telegramId);});return verify.length===1?{ok:true,code:"PROFILE_CREATED",created:true,user_id:row[userIndex]}:{ok:false,code:"PROFILE_READBACK_FAILED"};
+ });
 }
+
+function beta01CompleteOnboarding_(telegramId,deps){return beta01WithLock_(deps,function(){const current=beta01FindUser_(telegramId,deps);if(!current.ok)return beta01Result_(true,false,current.code,{authorized:true,message:"Не удалось сохранить и проверить профиль. Ничего не подтверждаю — попробуй позже."});if(current.user.ONBOARDING_STATUS==="COMPLETE")return beta01Result_(true,true,"ONBOARDING_ALREADY_COMPLETE",{authorized:true,message:"Профиль уже сохранён и проверен."});if(current.user.ONBOARDING_STATUS!=="PROFILE_CONFIRMATION")return beta01Result_(true,false,"ONBOARDING_STATE_CHANGED",{authorized:true,message:"Состояние знакомства изменилось. Повтори последнее действие."});const state=beta01Json_(current.user.STATE_JSON,{}),saved=deps.create_profile(telegramId,state.profile||{},Object.assign({},deps,{lock:null}));if(!saved||!saved.ok)return beta01Result_(true,false,saved&&saved.code||"PROFILE_SAVE_FAILED",{authorized:true,message:"Не удалось сохранить и проверить профиль. Ничего не подтверждаю — попробуй позже."});beta01SetUser_(current.user,{ONBOARDING_STATUS:"COMPLETE",STATE_JSON:"{}"},deps);beta01RecordEvent_(telegramId,"ONBOARDING_COMPLETED",true,{profile_fields:Object.keys(state.profile||{}).length},deps);return beta01Result_(true,true,"ONBOARDING_COMPLETE",{authorized:true,sheet_writes:saved.created?3:2,message:"Профиль сохранён и проверен. Я знаю только подтверждённые тобой данные. Теперь можно начать с полезного действия: запиши еду, вес или спроси «Что мне делать сегодня?». Цели питания и тренировок можно добавить позже."});});}
 
 function routeBeta01Onboarding_(update,options){
   const message=update&&(update.message||update.edited_message),text=String(message&&message.text||""),telegramId=String(message&&message.from&&message.from.id||"");if(!telegramId)return beta01Result_(false,true,"NOT_ONBOARDING");
@@ -119,15 +129,13 @@ function routeBeta01Onboarding_(update,options){
     if(/^(?:исправить|нет)$/.test(n)){beta01SetUser_(user,{ONBOARDING_STATUS:"PROFILE_COLLECTION",STATE_JSON:JSON.stringify({profile:{}})},deps);return beta01Result_(true,true,"PROFILE_RETRY",{authorized:true,sheet_writes:1,message:"Хорошо. Пришли исправленные данные одним сообщением или напиши «Пропустить»."});}
     if(n==="отмена"){beta01SetUser_(user,{ONBOARDING_STATUS:"PROFILE_COLLECTION"},deps);return beta01Result_(true,true,"PROFILE_CANCELLED",{authorized:true,sheet_writes:1,message:"Профиль не сохранён. Можно начать снова командой /start."});}
     if(!/^(?:да|подтверждаю|сохранить)$/.test(n))return beta01Result_(true,true,"PROFILE_CONFIRMATION_REQUIRED",{authorized:true,message:beta01ProfileSummary_(state)});
-    const saved=deps.create_profile(telegramId,state.profile||{},deps);if(!saved||!saved.ok)return beta01Result_(true,false,saved&&saved.code||"PROFILE_SAVE_FAILED",{authorized:true,message:"Не удалось сохранить и проверить профиль. Ничего не подтверждаю — попробуй позже."});
-    beta01SetUser_(user,{ONBOARDING_STATUS:"COMPLETE",STATE_JSON:"{}"},deps);beta01RecordEvent_(telegramId,"ONBOARDING_COMPLETED",true,{profile_fields:Object.keys(state.profile||{}).length},deps);
-    return beta01Result_(true,true,"ONBOARDING_COMPLETE",{authorized:true,sheet_writes:saved.created?3:2,message:"Профиль сохранён и проверен. Я знаю только подтверждённые тобой данные. Теперь можно начать с полезного действия: запиши еду, вес или спроси «Что мне делать сегодня?». Цели питания и тренировок можно добавить позже."});
+    return beta01CompleteOnboarding_(telegramId,deps);
   }
   return beta01Result_(true,false,"ONBOARDING_STATE_INVALID",{authorized:true,message:"Не удалось продолжить знакомство. Обратись к владельцу тестирования."});
 }
 
 function beta01RecordEvent_(telegramId,eventType,success,metadata,deps){try{return beta01Append_(BETA01.EVENTS_SHEET,[deps.uuid(),beta01UserKey_(telegramId,deps),beta01Iso_(deps.now()),String(eventType),success?"TRUE":"FALSE",JSON.stringify(metadata||{})],deps);}catch(e){return 0;}}
-function beta01AuditLogValues_(telegramId,username,messageText,hasText,options){try{const deps=beta01Dependencies_(options&&options.dependencies);if(beta01Property_(deps,"DEPLOYMENT_ENV").toUpperCase()!=="BETA")return {user_id:String(telegramId||""),source:"Telegram @"+String(username||"без_username"),message:String(messageText||"")};return {user_id:beta01UserKey_(telegramId,deps),source:"Telegram beta user",message:hasText?"[message redacted; chars="+String(messageText||"").length+"]":"[non-text message]"};}catch(e){return {user_id:"BETA_REDACTED",source:"Telegram beta user",message:"[message redacted]"};}}
+function beta01AuditLogValues_(telegramId,username,messageText,hasText,options){try{const deps=beta01Dependencies_(options&&options.dependencies);if(!beta01Enabled_(deps))return {user_id:String(telegramId||""),source:"Telegram @"+String(username||"без_username"),message:String(messageText||"")};return {user_id:beta01UserKey_(telegramId,deps),source:"Telegram beta user",message:hasText?"[message redacted; chars="+String(messageText||"").length+"]":"[non-text message]"};}catch(e){return {user_id:"BETA_REDACTED",source:"Telegram beta user",message:"[message redacted]"};}}
 function routeBeta01Feedback_(update,options){
   const message=update&&(update.message||update.edited_message),text=String(message&&message.text||""),telegramId=String(message&&message.from&&message.from.id||""),n=beta01Normalize_(text);if(!telegramId)return beta01Result_(false,true,"NOT_FEEDBACK");
   const deps=beta01Dependencies_(options&&options.dependencies);if(!beta01Enabled_(deps))return beta01Result_(false,true,"BETA_GATE_DISABLED");
@@ -147,20 +155,21 @@ function transcribeBeta01VoiceMessage_(message,options){
   }catch(e){return {ok:false,code:"STT_FAILED",message:"Не удалось надёжно распознать голос. Отправь сообщение текстом."};}
 }
 
-function createBeta01Invite_(createdBy,options){const deps=beta01Dependencies_(options&&options.dependencies),admins=beta01Property_(deps,"BETA_ADMIN_TELEGRAM_IDS").split(",").map(function(v){return v.trim();}).filter(Boolean);if(admins.indexOf(String(createdBy))<0)return {ok:false,code:"ADMIN_REQUIRED"};const token=deps.uuid().replace(/-/g,"")+deps.uuid().replace(/-/g,"").slice(0,8),now=deps.now(),expires=new Date(now.getTime()+BETA01.INVITE_TTL_DAYS*86400000);beta01Append_(BETA01.INVITES_SHEET,[beta01InviteHash_(token,deps),"ACTIVE",beta01Iso_(now),beta01Iso_(expires),1,0,String(createdBy),"","",""],deps);return {ok:true,code:"INVITE_CREATED",token:token,expires_at:beta01Iso_(expires),writes:1};}
+function createBeta01Invite_(createdBy,options){const deps=beta01Dependencies_(options&&options.dependencies);return beta01WithLock_(deps,function(){const admins=beta01Property_(deps,"BETA_ADMIN_TELEGRAM_IDS").split(",").map(function(v){return v.trim();}).filter(Boolean);if(admins.indexOf(String(createdBy))<0)return {ok:false,code:"ADMIN_REQUIRED"};if(beta01Property_(deps,"BETA_NEW_CONNECTIONS_PAUSED").toLowerCase()==="true")return {ok:false,code:"BETA_PAUSED"};const status=beta01AdminStatus_(deps),limit=beta01ParticipantLimit_(deps);if(status.active_users+status.active_invites>=limit)return {ok:false,code:"PARTICIPANT_LIMIT",limit:limit};const token=deps.uuid().replace(/-/g,"")+deps.uuid().replace(/-/g,"").slice(0,8),now=deps.now(),expires=new Date(now.getTime()+BETA01.INVITE_TTL_DAYS*86400000);beta01Append_(BETA01.INVITES_SHEET,[beta01InviteHash_(token,deps),"ACTIVE",beta01Iso_(now),beta01Iso_(expires),1,0,String(createdBy),"","",""],deps);return {ok:true,code:"INVITE_CREATED",token:token,expires_at:beta01Iso_(expires),writes:1};});}
+
+function beta01RevokeActiveInvites_(deps){return beta01WithLock_(deps,function(){const table=beta01ReadTable_(BETA01.INVITES_SHEET,deps);if(!table.ok)return {ok:false,code:table.code,count:0};const now=beta01Iso_(deps.now());let count=0;beta01Rows_(table).forEach(function(invite){if(invite.STATUS!=="ACTIVE")return;beta01UpdateRow_(BETA01.INVITES_SHEET,invite._row,[invite.INVITE_HASH,"REVOKED",invite.CREATED_AT,invite.EXPIRES_AT,invite.MAX_USES,invite.USES,invite.CREATED_BY,invite.ACTIVATED_USER_ID,invite.ACTIVATED_AT,now],deps);count+=1;});return {ok:true,code:"INVITES_REVOKED",count:count};});}
 
 function beta01Admins_(deps){return beta01Property_(deps,"BETA_ADMIN_TELEGRAM_IDS").split(",").map(function(v){return v.trim();}).filter(Boolean);}
 function beta01AdminStatus_(deps){const users=beta01Rows_(beta01ReadTable_(BETA01.USERS_SHEET,deps)),invites=beta01Rows_(beta01ReadTable_(BETA01.INVITES_SHEET,deps));return {active_users:users.filter(function(u){return u.STATUS==="ACTIVE";}).length,onboarding_complete:users.filter(function(u){return u.ONBOARDING_STATUS==="COMPLETE";}).length,active_invites:invites.filter(function(i){return i.STATUS==="ACTIVE";}).length,paused:beta01Property_(deps,"BETA_NEW_CONNECTIONS_PAUSED").toLowerCase()==="true"};}
 function routeBeta01Admin_(update,options){
-  const message=update&&(update.message||update.edited_message),text=String(message&&message.text||"").trim(),userId=String(message&&message.from&&message.from.id||"");if(!/^\/beta_(?:invite|status|pause|resume|revoke)(?:\s|$)/i.test(text))return beta01Result_(false,true,"NOT_BETA_ADMIN");
+  const message=update&&(update.message||update.edited_message),text=String(message&&message.text||"").trim(),userId=String(message&&message.from&&message.from.id||"");if(!/^\/beta_(?:invite|status|pause|resume|revoke_invites|revoke)(?:\s|$)/i.test(text))return beta01Result_(false,true,"NOT_BETA_ADMIN");
   const deps=beta01Dependencies_(options&&options.dependencies);if(beta01Admins_(deps).indexOf(userId)<0)return beta01Result_(true,false,"ADMIN_REQUIRED",{message:"Команда доступна только владельцу закрытой беты."});
   if(/^\/beta_status/i.test(text)){const s=beta01AdminStatus_(deps);return beta01Result_(true,true,"BETA_STATUS",{authorized:true,message:["Закрытая бета:","• Активных участников: "+s.active_users,"• Завершили знакомство: "+s.onboarding_complete,"• Активных приглашений: "+s.active_invites,"• Новые подключения: "+(s.paused?"приостановлены":"разрешены")].join("\n")});}
   if(/^\/beta_pause/i.test(text)){deps.properties.setProperty("BETA_NEW_CONNECTIONS_PAUSED","true");return beta01Result_(true,true,"BETA_PAUSED",{authorized:true,message:"Новые подключения приостановлены. Уже активные участники сохраняют доступ."});}
   if(/^\/beta_resume/i.test(text)){deps.properties.setProperty("BETA_NEW_CONNECTIONS_PAUSED","false");return beta01Result_(true,true,"BETA_RESUMED",{authorized:true,message:"Новые подключения снова разрешены."});}
   const revoke=/^\/beta_revoke\s+(-?\d{1,32})$/i.exec(text);if(revoke){const found=beta01FindUser_(revoke[1],deps);if(!found.ok)return beta01Result_(true,false,"USER_NOT_FOUND",{authorized:true,message:"Участник не найден."});beta01SetUser_(found.user,{STATUS:"REVOKED"},deps);return beta01Result_(true,true,"ACCESS_REVOKED",{authorized:true,sheet_writes:1,message:"Доступ участника отозван. Данные не удалены."});}
-  if(beta01Property_(deps,"BETA_NEW_CONNECTIONS_PAUSED").toLowerCase()==="true")return beta01Result_(true,false,"BETA_PAUSED",{authorized:true,message:"Новые подключения приостановлены. Сначала используй /beta_resume."});
-  const limit=Math.max(1,Number(beta01Property_(deps,"BETA_PARTICIPANT_LIMIT")||1)),status=beta01AdminStatus_(deps);if(status.active_users+status.active_invites>=limit)return beta01Result_(true,false,"PARTICIPANT_LIMIT",{authorized:true,message:"Достигнут лимит участников и активных приглашений: "+limit+"."});
-  const invite=createBeta01Invite_(userId,{dependencies:deps});if(!invite.ok)return beta01Result_(true,false,invite.code,{authorized:true,message:"Не удалось создать приглашение."});const username=beta01Property_(deps,"TELEGRAM_BOT_USERNAME");return beta01Result_(true,true,"INVITE_CREATED",{authorized:true,sheet_writes:1,message:username?"Персональная ссылка действует 14 дней и активируется один раз:\nhttps://t.me/"+username+"?start=invite_"+invite.token:"Код приглашения: invite_"+invite.token+"\nДобавь TELEGRAM_BOT_USERNAME, чтобы получать готовую ссылку."});
+  if(/^\/beta_revoke_invites$/i.test(text)){const revoked=beta01RevokeActiveInvites_(deps);return beta01Result_(true,revoked.ok,revoked.code,{authorized:true,sheet_writes:revoked.count,message:revoked.ok?"Неиспользованные приглашения отозваны: "+revoked.count+".":"Не удалось отозвать приглашения."});}
+  const invite=createBeta01Invite_(userId,{dependencies:deps});if(!invite.ok)return beta01Result_(true,false,invite.code,{authorized:true,message:invite.code==="BETA_PAUSED"?"Новые подключения приостановлены. Сначала используй /beta_resume.":invite.code==="PARTICIPANT_LIMIT"?"Достигнут лимит участников и активных приглашений: "+beta01ParticipantLimit_(deps)+".":"Не удалось создать приглашение."});const username=beta01Property_(deps,"TELEGRAM_BOT_USERNAME");return beta01Result_(true,true,"INVITE_CREATED",{authorized:true,sheet_writes:1,message:username?"Персональная ссылка действует 14 дней и активируется один раз:\nhttps://t.me/"+username+"?start=invite_"+invite.token:"Код приглашения: invite_"+invite.token+"\nДобавь TELEGRAM_BOT_USERNAME, чтобы получать готовую ссылку."});
 }
 
 function beta01ReadinessAudit_(options){const deps=beta01Dependencies_(options&&options.dependencies),tables={};Object.keys(BETA01_SCHEMAS).forEach(function(name){const t=beta01ReadTable_(name,deps);tables[name]={ok:t.ok,code:t.code,rows:t.ok?t.rows.length:0};});return {ok:Object.keys(tables).every(function(name){return tables[name].ok;}),environment:beta01Property_(deps,"DEPLOYMENT_ENV"),access_enabled:beta01Enabled_(deps),tables:tables,stt_provider:"GROQ_WHISPER",production_writes:0};}

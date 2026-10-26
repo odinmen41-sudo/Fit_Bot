@@ -7016,7 +7016,8 @@ function logAiReply_(userText, reply, model) {
     let loggedReply = limitText_(reply, 3000);
     try {
       const environment = String(PropertiesService.getScriptProperties().getProperty("DEPLOYMENT_ENV") || "").trim().toUpperCase();
-      if (environment === "BETA") {
+      const betaGateEnabled = String(PropertiesService.getScriptProperties().getProperty("BETA_ACCESS_ENABLED") || "").trim().toLowerCase() === "true";
+      if (environment === "BETA" || betaGateEnabled) {
         loggedInput = "[BETA input redacted; chars=" + String(userText || "").length + "]";
         loggedReply = "[BETA reply redacted; chars=" + String(reply || "").length + "]";
       }

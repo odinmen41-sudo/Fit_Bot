@@ -2559,7 +2559,7 @@ function nutritionClarificationReply_(text) {
     return {recognized: true, type: "PREPARATION", phrase: "жареный"};
   }
   if (/^(?:на\s+)?гриле$/.test(normalized)) return {recognized: true, type: "PREPARATION", phrase: "на гриле"};
-  const quantity = normalized.match(/^(\d+(?:[.,]\d+)?)\s*(кг|мл|л|г|гр|грамм|грамма|граммов|шт|штука|штуки|штук)?$/);
+  const quantity = normalized.match(/(?:^|\s)(\d+(?:[.,]\d+)?)\s*(кг|мл|л|г|гр|грамм|грамма|граммов|шт|штука|штуки|штук)?\s*$/);
   if (quantity) {
     const normalizedQuantity = normalizeNutritionQuantity_(quantity[1], quantity[2] || "г");
     if (normalizedQuantity.valid) return {recognized: true, type: "QUANTITY",
@@ -2568,28 +2568,64 @@ function nutritionClarificationReply_(text) {
   return {recognized: false};
 }
 
-function nutritionClarificationCompletedText_(spec, reply) {
-  if (!spec || !reply || reply.recognized !== true) return null;
+function nutritionClarificationApply_(spec, reply) {
+  if (!spec || !reply || reply.recognized !== true) return {progressed: false};
   const draftItems = Array.isArray(spec.draft_items) ? spec.draft_items.map(function(item) {
     return {food_text: item.food_text, quantity_value: item.quantity_value, quantity_unit: item.quantity_unit};
   }) : [{food_text: spec.food_text, quantity_value: spec.quantity_value, quantity_unit: spec.quantity_unit}];
   const targetIndex = Number(spec.item_index || 0);
+  if (!draftItems[targetIndex]) return {progressed: false};
   if (spec.missing_field === "PREPARATION" && reply.type === "PREPARATION") {
     draftItems[targetIndex].food_text += " " + reply.phrase;
-  }
-  else if (spec.missing_field === "QUANTITY" && reply.type === "QUANTITY" &&
+  } else if (spec.missing_field === "QUANTITY" && reply.type === "QUANTITY" &&
       isFinite(reply.quantity) && reply.quantity > 0 && reply.quantity <= 10000) {
     draftItems[targetIndex].quantity_value = reply.quantity;
     draftItems[targetIndex].quantity_unit = reply.unit || "g";
   } else {
-    return null;
+    return {progressed: false};
   }
-  const completed = draftItems.map(function(item) {
+  const nextMissingIndex = draftItems.findIndex(function(item) {
+    return !item.food_text || item.quantity_value == null || item.quantity_value === "" || !item.quantity_unit;
+  });
+  return {progressed: true, draft_items: draftItems, next_missing_index: nextMissingIndex};
+}
+
+function nutritionClarificationCompletedText_(spec, reply) {
+  const applied = nutritionClarificationApply_(spec, reply);
+  if (!applied.progressed || applied.next_missing_index >= 0) return null;
+  const completed = applied.draft_items.map(function(item) {
     if (!item.food_text || item.quantity_value == null || !item.quantity_unit) return "";
     const unit = {g: "г", ml: "мл", count: "шт"}[String(item.quantity_unit)] || item.quantity_unit;
     return item.food_text + " " + item.quantity_value + " " + unit;
   });
   return completed.indexOf("") >= 0 ? null : "Съел " + completed.join(" и ");
+}
+
+function createNextNutritionQuantityClarification_(spec, reply, update, dependencies, now) {
+  const applied = nutritionClarificationApply_(spec, reply);
+  if (!applied.progressed || applied.next_missing_index < 0) return null;
+  const message = update && (update.message || update.edited_message) || {};
+  const next = applied.draft_items[applied.next_missing_index];
+  if (!next || !next.food_text) return null;
+  const token = String(update && update.update_id || (typeof dependencies.uuid === "function" ? dependencies.uuid() : "next"))
+    .replace(/[^A-Za-z0-9._-]/g, "").slice(0, 32);
+  const capture = {schema_version: "nutrition-clarification-v2", source: NUTRITION_CLARIFICATION_SOURCE,
+    capture_id: "nutrition-clarification-" + token, created_at: now.toISOString(), raw_message: "",
+    domain: "NUTRITION", clarification: {missing_field: "QUANTITY", food_text: next.food_text,
+      item_index: applied.next_missing_index, draft_items: applied.draft_items,
+      prompt: "Уточните количество «" + next.food_text + "» (например, 300 мл или 150 г)."},
+    items: [{category: "NUTRITION_LOG", confidence: 1, fields: {
+      clarification_type: {value: "QUANTITY", source: "SYSTEM_POLICY"}
+    }}], user_id: String(message.from && message.from.id || ""), chat_id: String(message.chat && message.chat.id || "")};
+  const created = dependencies.create_pending(capture, {now: now,
+    ttl_minutes: SMART_CONFIRMATION_CONFIG.DEFAULT_TTL_MINUTES, user_id: capture.user_id, chat_id: capture.chat_id,
+    source_update_id: update && update.update_id, capture_id: capture.capture_id,
+    validation: {ready_for_confirmation: true, errors: []}});
+  return domainFactResult_(true, !!(created && created.ok), String(created && created.code || "CAPTURE_CREATE_FAILED"), {
+    domain: "NUTRITION", capture_id: capture.capture_id,
+    pending_capture_writes: created && created.created === false ? 0 : created && created.ok ? 1 : 0,
+    message: created && created.ok ? capture.clarification.prompt : "Не удалось сохранить уточнение. Отправьте запись заново."
+  });
 }
 
 function continueNutritionClarification_(selected, update, dependencies, referenceOptions, now) {
@@ -2606,6 +2642,10 @@ function continueNutritionClarification_(selected, update, dependencies, referen
   const spec = selected.payload && selected.payload.clarification;
   const reply = nutritionClarificationReply_(message.text);
   const completedText = nutritionClarificationCompletedText_(spec, reply);
+  if (!completedText && reply.recognized === true) {
+    const nextClarification = createNextNutritionQuantityClarification_(spec, reply, update, dependencies, now);
+    if (nextClarification) return nextClarification;
+  }
   if (!completedText) {
     const replacement = extractNutritionFactCandidate_(message.text);
     if (replacement.detected === true && /(?:съел|выпил|добавил|запиш)/i.test(String(message.text || ""))) {
@@ -2754,7 +2794,7 @@ function extractNutritionFactCandidate_(text) {
     .trim();
   if (!content) return result;
 
-  const parts = content.split(/\s*(?:,|\s+и\s+)\s*/i).filter(Boolean);
+  const parts = splitNutritionParts_(content);
   parts.forEach(function(part) {
     const parsed = parseNutritionItem_(part);
     if (!parsed) return;
@@ -2765,6 +2805,30 @@ function extractNutritionFactCandidate_(text) {
   });
   if (result.detected && !result.items.length) result.requires_clarification = true;
   return result;
+}
+
+function splitNutritionParts_(content) {
+  const commaParts = String(content || "").split(/\s*[,;]\s*/).filter(Boolean);
+  return commaParts.reduce(function(parts, part) {
+    const connector = /\s+и\s+/gi;
+    let start = 0;
+    let match;
+    while ((match = connector.exec(part)) !== null) {
+      const left = part.slice(start, match.index).trim();
+      const right = part.slice(match.index + match[0].length).trim();
+      const leftItem = parseNutritionItem_(left);
+      const rightItem = parseNutritionItem_(right);
+      const leftComplete = leftItem && leftItem.item && !leftItem.requires_clarification && !leftItem.invalid;
+      const rightComplete = rightItem && rightItem.item && !rightItem.requires_clarification && !rightItem.invalid;
+      if (leftComplete && rightComplete) {
+        parts.push(left);
+        start = match.index + match[0].length;
+      }
+    }
+    const tail = part.slice(start).trim();
+    if (tail) parts.push(tail);
+    return parts;
+  }, []);
 }
 
 function normalizeNutritionNaturalInput_(text) {
@@ -2803,7 +2867,7 @@ function parseNutritionItem_(part) {
       food = match[3];
     } else {
       match = cleaned.match(/^(-?\d+)\s+(.+)$/i);
-      if (match && /(?:яйц|банан|яблок|груш|апельсин)/i.test(match[2])) {
+      if (match && !/%/.test(match[2]) && Number(match[1]) > 0 && Number(match[1]) <= 100) {
         numberText = match[1];
         unitText = "шт";
         food = match[2];

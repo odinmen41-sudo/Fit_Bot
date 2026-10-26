@@ -16,7 +16,7 @@ function runBeta01Tests(){
   const replay=routeBeta01Access_(update(4,"/start invite_"+invite.token),{dependencies:e});rec("BETA-006_INVITE_REPLAY_IDEMPOTENT",replay.authorized&&replay.code==="ALREADY_ACTIVE",replay);
   const other=Object.assign({},update(5,"/start invite_"+invite.token),{message:{text:"/start invite_"+invite.token,from:{id:"202"},chat:{id:"202"}}});const exhausted=routeBeta01Access_(other,{dependencies:e});rec("BETA-007_INVITE_SINGLE_USE",!exhausted.authorized&&exhausted.code==="INVITE_UNAVAILABLE",exhausted);
 
-  let r=routeBeta01Onboarding_(update(6,"/start"),{dependencies:e});rec("BETA-008_CONSENT_EXPLAINED",r.code==="CONSENT_REQUIRED"&&/удалени/.test(r.message),r);
+  let r=routeBeta01Onboarding_(update(6,"/start"),{dependencies:e});rec("BETA-008_CONSENT_EXPLAINED",r.code==="CONSENT_REQUIRED"&&/частное лицо/.test(r.message)&&/бесплатн/.test(r.message)&&/добровольн/.test(r.message)&&/Telegram/.test(r.message)&&/Google/.test(r.message)&&/Groq/.test(r.message)&&/удалени/.test(r.message),r);
   r=routeBeta01Onboarding_(update(7,"Принимаю"),{dependencies:e});rec("BETA-009_CONSENT_DURABLE",r.code==="CONSENT_ACCEPTED"&&e.spreadsheet.sheets.BETA_USERS.rows[1][4]===BETA01.CONSENT_VERSION,r);
   r=routeBeta01Onboarding_(update(8,"Хочу похудеть, мне 35 лет, рост 180 см, вес 95,5 кг, начинающий, 3 тренировки в неделю"),{dependencies:e});rec("BETA-010_PROFILE_PARSED",r.code==="PROFILE_CONFIRMATION"&&/95,5 кг/.test(r.message)&&/Снижение веса/.test(r.message),r);
   rec("BETA-011_NO_PREMATURE_PROFILE_WRITE",e.spreadsheet.sheets.User_Profile.rows.length===1,{});

@@ -82,6 +82,8 @@ jurisdiction and the retention period of the tombstone/audit remain explicit own
 
 ## Acceptance gate before wave 1
 
+The first screen identifies the organizer as a private individual and the closed beta as voluntary and free. It names Telegram as the interaction channel, Google as the active data store, and Groq as the provider used for voice recognition and selected AI responses. It also explains support access, withdrawal, deletion and the non-medical nature of the product. Acceptance is recorded as `beta-01-v2`; profile questions remain optional and skippable.
+
 1. Existing STAGING resource identities and deployment version are recorded; Production is verified unchanged.
 2. Registrations start paused, stale test invitations are revoked and the participant limit is exactly five.
 3. Protected regression and focused beta tests are green against the exact released source.

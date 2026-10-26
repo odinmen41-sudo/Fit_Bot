@@ -1,7 +1,7 @@
 /* BETA-01 — invitation access, progressive onboarding, voice input and feedback. */
 const BETA01 = Object.freeze({
   INVITES_SHEET:"BETA_INVITES", USERS_SHEET:"BETA_USERS", FEEDBACK_SHEET:"BETA_FEEDBACK",
-  EVENTS_SHEET:"BETA_EVENTS", REQUESTS_SHEET:"BETA_DATA_REQUESTS", DELETION_AUDIT_SHEET:"BETA_DELETION_AUDIT", CONSENT_VERSION:"beta-01-v1",
+  EVENTS_SHEET:"BETA_EVENTS", REQUESTS_SHEET:"BETA_DATA_REQUESTS", DELETION_AUDIT_SHEET:"BETA_DELETION_AUDIT", CONSENT_VERSION:"beta-01-v2",
   INVITE_TTL_DAYS:14, MAX_TRANSCRIPT_CHARS:1200
 });
 
@@ -125,9 +125,9 @@ function routeBeta01Onboarding_(update,options){
   let user=found.user,status=user.ONBOARDING_STATUS||"CONSENT_REQUIRED",state=beta01Json_(user.STATE_JSON,{}),n=beta01Normalize_(text);
   if(status==="COMPLETE")return beta01Result_(false,true,"ONBOARDING_COMPLETE",{authorized:true});
   if(status==="CONSENT_REQUIRED"){
-    if(/^(?:принимаю|согласен|согласна)$/.test(n)){user=beta01SetUser_(user,{ONBOARDING_STATUS:"PROFILE_COLLECTION",CONSENT_VERSION:BETA01.CONSENT_VERSION,CONSENT_AT:beta01Iso_(deps.now()),STATE_JSON:JSON.stringify({profile:{}})},deps);return beta01Result_(true,true,"CONSENT_ACCEPTED",{authorized:true,sheet_writes:1,message:"Спасибо. Расскажи одним сообщением только то, чем готов поделиться: цель, возраст, рост, текущий вес и опыт тренировок. Например: «Хочу снизить вес, мне 35 лет, рост 180 см, вес 95 кг, начинающий». Можно написать «Пропустить» — всё необязательное добавишь позже."});}
+    if(/^(?:принимаю|согласен|согласна)$/.test(n)){user=beta01SetUser_(user,{ONBOARDING_STATUS:"PROFILE_COLLECTION",CONSENT_VERSION:BETA01.CONSENT_VERSION,CONSENT_AT:beta01Iso_(deps.now()),STATE_JSON:JSON.stringify({profile:{}})},deps);return beta01Result_(true,true,"CONSENT_ACCEPTED",{authorized:true,sheet_writes:1,message:"Спасибо! Чтобы начать, напиши одним сообщением цель и только те данные, которыми готов поделиться: например, «Хочу снизить вес, 35 лет, 180 см, 95 кг». Или ответь «Пропустить» — всё можно добавить позже."});}
     if(/^(?:не согласен|не согласна|отказываюсь)$/.test(n)){beta01SetUser_(user,{STATUS:"DECLINED",ONBOARDING_STATUS:"DECLINED"},deps);return beta01Result_(true,true,"CONSENT_DECLINED",{message:"Понял. Без согласия профиль и история не создаются. Если передумаешь, понадобится новое приглашение.",sheet_writes:1});}
-    return beta01Result_(true,true,"CONSENT_REQUIRED",{authorized:true,message:"Привет! Это закрытая бета Fit_Bot. Бот обрабатывает твои сообщения и данные о питании, весе, тренировках и самочувствии, чтобы вести личную историю и давать рекомендации. Данные доступны владельцу тестирования для поддержки; необязательное использование для улучшения продукта будет спрашиваться отдельно. Ты сможешь запросить удаление данных.\n\nЧтобы продолжить, ответь «Принимаю». Если не согласен — «Не согласен»."});
+    return beta01Result_(true,true,"CONSENT_REQUIRED",{authorized:true,message:"Привет! Это бесплатная закрытая бета Fit_Bot, которую проводит частное лицо. Участие добровольное.\n\nБот работает через Telegram, хранит в Google твои сообщения и данные о питании, весе, тренировках и самочувствии. Для распознавания голоса и части ответов используется Groq. Организатор может видеть данны для поддержки.\n\nТы можешь в любой момент прекратить участие или запросить удаление данных. Fit_Bot не заменяет врача.\n\nЕсли согласен, ответь «Принимаю». Если нет — «Не согласен»."});
   }
   if(status==="PROFILE_COLLECTION"){
     if(n==="отмена")return beta01Result_(true,true,"ONBOARDING_PAUSED",{authorized:true,message:"Знакомство приостановлено. Напиши /start, когда захочешь продолжить."});

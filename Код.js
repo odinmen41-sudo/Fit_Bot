@@ -2379,14 +2379,14 @@ function routeDomainFactConfirmation_(update, options) {
     return createNutritionClarification_(detection, update, dependencies, now);
   }
   if (detection.domain === "NUTRITION" && detection.calculation_status &&
-      detection.calculation_status !== "CALCULATED") {
+      ["CALCULATED", "PARTIAL_CALCULATED"].indexOf(detection.calculation_status) < 0) {
     return domainFactResult_(true, false, detection.calculation_status, {
       domain: "NUTRITION",
       message: nutritionCalculationFailureMessage_(detection.calculation_status)
     });
   }
   if (detection.domain === "NUTRITION" && detection.reference_status &&
-      detection.reference_status !== "RESOLVED") {
+      ["RESOLVED", "PARTIAL"].indexOf(detection.reference_status) < 0) {
     if (detection.reference_status === "CLARIFICATION_REQUIRED") {
       return createNutritionClarification_(detection, update, dependencies, now);
     }
@@ -2666,7 +2666,8 @@ function continueNutritionClarification_(selected, update, dependencies, referen
       detection.reference_status === "CLARIFICATION_REQUIRED")) {
     return createNutritionClarification_(detection, update, dependencies, now);
   }
-  if (!detection.domain || detection.reference_status !== "RESOLVED" || detection.calculation_status !== "CALCULATED") {
+  if (!detection.domain || ["RESOLVED", "PARTIAL"].indexOf(detection.reference_status) < 0 ||
+      ["CALCULATED", "PARTIAL_CALCULATED"].indexOf(detection.calculation_status) < 0) {
     return domainFactResult_(true, false, String(detection.reference_status || detection.calculation_status || "CLARIFICATION_REQUIRED"), {
       domain: "NUTRITION", message: detection.clarification_message || nutritionReferenceClarification_(detection.reference_resolution)
     });
@@ -2954,6 +2955,15 @@ function resolveNutritionReferences_(items, options) {
   const calculationEnabled = !injectedFixture || options.calculation_enabled === true;
   if (!calculationEnabled) return result;
   if (status !== "RESOLVED") {
+    const partial = source.available === true
+      ? calculatePartialNutritionReferences_(resolvedItems, source.references || []) : null;
+    if (partial) {
+      result.status = "PARTIAL";
+      result.items = partial.items;
+      result.calculation_status = "PARTIAL_CALCULATED";
+      result.nutrition_calculation = partial.nutrition_calculation;
+      return result;
+    }
     result.calculation_status = nutritionReferenceFailureCode_(resolvedItems, source.references || []);
     return result;
   }
@@ -2963,6 +2973,38 @@ function resolveNutritionReferences_(items, options) {
   result.calculation_error = calculated.error || null;
   result.nutrition_calculation = calculated.nutrition_calculation || null;
   return result;
+}
+
+function calculatePartialNutritionReferences_(items, references) {
+  const calculatedItems = [], rawItems = [];
+  let calculable = 0, unknown = 0;
+  (items || []).forEach(function(item) {
+    const fields = item && item.fields || {};
+    const referenceId = String(fields.nutrition_reference_id && fields.nutrition_reference_id.value || "");
+    const matches = (references || []).filter(function(reference) { return reference.REFERENCE_ID === referenceId; });
+    if (String(fields.reference_status && fields.reference_status.value || "") === "RESOLVED" && matches.length === 1) {
+      const calculated = calculateNutritionItem_(item, matches[0]);
+      if (calculated.ok) {
+        calculatedItems.push(calculated.item); rawItems.push(calculated.raw); calculable += 1; return;
+      }
+    }
+    if (String(fields.reference_status && fields.reference_status.value || "") !== "UNKNOWN_REFERENCE" ||
+        String(fields.food_id && fields.food_id.value || "")) {
+      unknown = -1000; calculatedItems.push(item); return;
+    }
+    const copy = {category:item.category, confidence:item.confidence, fields:{}};
+    Object.keys(fields).forEach(function(key) { copy.fields[key] = Object.assign({}, fields[key]); });
+    copy.fields.nutrition_completeness = {value:"UNKNOWN", confidence:1, source:"SYSTEM_POLICY"};
+    copy.fields.calculated_nutrition = {value:null, confidence:1, source:"SYSTEM_POLICY"};
+    calculatedItems.push(copy); unknown += 1;
+  });
+  if (unknown < 1) return null;
+  const totalResult = nutritionTotals_(rawItems);
+  if (!totalResult.ok) return null;
+  return {items:calculatedItems, nutrition_calculation:{status:"PARTIAL_CALCULATED",
+    items_count:calculatedItems.length, calculable_items_count:calculable,
+    approximate_items_count:calculable, unknown_items_count:unknown,
+    totals_are_partial:true, totals:totalResult.totals}};
 }
 
 function nutritionReferenceFailureCode_(items, references) {
@@ -3378,7 +3420,7 @@ function buildDomainFactCandidate_(detection, options) {
     ? detection.items : null;
   const candidate = {
     schema_version: domain === "NUTRITION"
-      ? (detection.calculation_status === "CALCULATED" ? "c232b2-nutrition-calculation-v1" :
+      ? (["CALCULATED", "PARTIAL_CALCULATED"].indexOf(detection.calculation_status) >= 0 ? "c232b2-nutrition-calculation-v1" :
         detection.reference_status ? "c232b1-nutrition-reference-v1" :
         "c232a-nutrition-extraction-v1") : "c231-domain-routing-v1",
     mode: "SIMULATION",
@@ -3433,6 +3475,11 @@ function validateDomainFactCandidate_(capture) {
       const foodId = String(fields.food_id && fields.food_id.value || "");
       const basisQuantity = Number(fields.reference_basis_quantity && fields.reference_basis_quantity.value);
       const basisUnit = String(fields.reference_basis_unit && fields.reference_basis_unit.value || "");
+      if (b2Schema && capture.nutrition_calculation && capture.nutrition_calculation.status === "PARTIAL_CALCULATED" &&
+          referenceStatus !== "RESOLVED") {
+        return !referenceId && fields.nutrition_completeness && fields.nutrition_completeness.value === "UNKNOWN" &&
+          fields.calculated_nutrition && fields.calculated_nutrition.value === null;
+      }
       const referenceValid = referenceStatus === "RESOLVED" && !!referenceId && !!foodId &&
         isFinite(basisQuantity) && basisQuantity > 0 && basisUnit === unit;
       return referenceValid && (!b2Schema || validateNutritionCalculatedSnapshot_(item));
@@ -3476,9 +3523,10 @@ function validateNutritionCalculatedSnapshot_(item) {
 }
 
 function validateNutritionCalculationSummary_(summary, itemCount) {
-  if (!summary || summary.status !== "CALCULATED" || Number(summary.items_count) !== Number(itemCount) ||
-      Number(summary.calculable_items_count) !== Number(itemCount) ||
-      Number(summary.approximate_items_count) !== Number(itemCount) || !summary.totals) return false;
+  if (!summary || ["CALCULATED", "PARTIAL_CALCULATED"].indexOf(summary.status) < 0 ||
+      Number(summary.items_count) !== Number(itemCount) || Number(summary.calculable_items_count) < 0 ||
+      Number(summary.calculable_items_count) + Number(summary.unknown_items_count || 0) !== Number(itemCount) ||
+      Number(summary.approximate_items_count) !== Number(summary.calculable_items_count) || !summary.totals) return false;
   return ["calories", "protein", "fat", "carbs"].every(function(key) {
     return summary.totals[key] !== null && summary.totals[key] !== undefined &&
       isFinite(Number(summary.totals[key])) && Number(summary.totals[key]) >= 0;
@@ -3635,7 +3683,7 @@ function nutritionSnapshotTotalsMatch_(items, totals, tolerance) {
   for (let i = 0; i < items.length; i += 1) {
     const fields = items[i] && items[i].fields || {};
     const calculated = fields.calculated_nutrition && fields.calculated_nutrition.value;
-    if (!calculated) return false;
+    if (!calculated) continue;
     for (let j = 0; j < keys.length; j += 1) {
       const key = keys[j];
       if (!nutritionSnapshotNumberValid_(calculated[key], false)) return false;
@@ -3652,10 +3700,11 @@ function validateNutritionSnapshotForSave_(capture) {
   const items = capture && Array.isArray(capture.items) ? capture.items : [];
   const summary = capture && capture.nutrition_calculation;
   if (!isB2NutritionCapture_(capture) || capture.raw_message !== "" || !summary ||
-      summary.status !== "CALCULATED" || items.length < 1 || items.length > 10 ||
+      ["CALCULATED", "PARTIAL_CALCULATED"].indexOf(summary.status) < 0 || items.length < 1 || items.length > 10 ||
       Number(summary.items_count) !== items.length ||
-      Number(summary.calculable_items_count) !== items.length ||
-      Number(summary.approximate_items_count) !== items.length || !summary.totals) {
+      Number(summary.calculable_items_count) < 0 ||
+      Number(summary.calculable_items_count) + Number(summary.unknown_items_count || 0) !== items.length ||
+      Number(summary.approximate_items_count) !== Number(summary.calculable_items_count) || !summary.totals) {
     return {ok: false, code: "INVALID_NUTRITION_SNAPSHOT"};
   }
   const supportedUnits = ["g", "ml", "count"];
@@ -3670,8 +3719,13 @@ function validateNutritionSnapshotForSave_(capture) {
     const calculated = fields.calculated_nutrition && fields.calculated_nutrition.value;
     const referenceStatus = String(fields.reference_status && fields.reference_status.value || "");
     const referenceId = String(fields.nutrition_reference_id && fields.nutrition_reference_id.value || "");
-    if (item.category !== "NUTRITION_LOG" || referenceStatus !== "RESOLVED" || !referenceId ||
-        !nutritionSnapshotNumberValid_(quantity, true) || supportedUnits.indexOf(quantityUnit) < 0 ||
+    if (item.category !== "NUTRITION_LOG" || !nutritionSnapshotNumberValid_(quantity, true) ||
+        supportedUnits.indexOf(quantityUnit) < 0) return false;
+    if (referenceStatus !== "RESOLVED") {
+      return summary.status === "PARTIAL_CALCULATED" && !referenceId && !calculated &&
+        fields.nutrition_completeness && fields.nutrition_completeness.value === "UNKNOWN";
+    }
+    if (!referenceId ||
         !nutritionSnapshotNumberValid_(basisQuantity, true) || basisUnit !== quantityUnit ||
         !basis || !calculated || String(basis.unit || "") !== basisUnit ||
         !nutritionSnapshotNumberValid_(basis.quantity, true) ||
@@ -3693,6 +3747,7 @@ function validateNutritionSnapshotForSave_(capture) {
 function buildNutritionSaveItemSnapshot_(item) {
   const fields = item && item.fields || {};
   function value(name) { return fields[name] && fields[name].value; }
+  const basis = value("reference_nutrition_basis"), calculated = value("calculated_nutrition");
   return {
     food_id: value("food_id"),
     food_display: value("food_display"),
@@ -3700,12 +3755,13 @@ function buildNutritionSaveItemSnapshot_(item) {
     nutrition_reference_id: value("nutrition_reference_id"),
     quantity_value: value("quantity_value"),
     quantity_unit: value("quantity_unit"),
-    reference_nutrition_basis: Object.assign({}, value("reference_nutrition_basis")),
-    calculated_nutrition: Object.assign({}, value("calculated_nutrition")),
+    reference_nutrition_basis: basis ? Object.assign({}, basis) : null,
+    calculated_nutrition: calculated ? Object.assign({}, calculated) : null,
     nutrition_authority: value("nutrition_authority"),
     nutrition_source: value("nutrition_source"),
     nutrition_source_version: value("nutrition_source_version"),
-    nutrition_approximate: value("nutrition_approximate")
+    nutrition_approximate: value("nutrition_approximate"),
+    nutrition_completeness: value("nutrition_completeness") || (calculated ? "CALCULATED" : "UNKNOWN")
   };
 }
 
@@ -3805,14 +3861,23 @@ function loadDailyNutritionSummary_(userId, options) {
   const effective = loadEffectiveNutritionMeals_(userId, table, day, dependencies.format_date);
   if (!effective.ok) return dailyNutritionSummaryError_("DATA_INTEGRITY_ERROR", day.date);
   const totals = {calories: 0, protein: 0, fat: 0, carbs: 0};
+  let unknownItems = 0, calculatedItems = 0;
   effective.effective_meals.forEach(function(meal) {
     totals.calories += meal.totals.calories;
     totals.protein += meal.totals.protein;
     totals.fat += meal.totals.fat;
     totals.carbs += meal.totals.carbs;
+    unknownItems += (meal.items || []).filter(function(item) {
+      return item.nutrition_completeness === "UNKNOWN";
+    }).length;
+    calculatedItems += (meal.items || []).filter(function(item) {
+      return item.nutrition_completeness !== "UNKNOWN";
+    }).length;
   });
   return {ok: true, code: "DAILY_NUTRITION_SUMMARY", date: day.date,
-    meals_count: effective.effective_meals.length, consumed: totals};
+    meals_count: effective.effective_meals.length, consumed: totals,
+    unknown_items_count:unknownItems, calculated_items_count:calculatedItems,
+    totals_complete:unknownItems === 0};
 }
 
 function nutritionLifecycleIntegrityError_(reason, details) {
@@ -4663,10 +4728,16 @@ function formatDailyNutritionSummary_(summary) {
   }
   if (!summary.meals_count) return "Сегодня пока нет сохранённых записей о питании.";
   const consumed = summary.consumed;
+  if (summary.totals_complete === false && Number(summary.calculated_items_count || 0) === 0) {
+    return "Сегодня сохранено питание, но КБЖУ пока не рассчитаны: " +
+      Number(summary.unknown_items_count || 0) + " поз.";
+  }
+  const suffix = summary.totals_complete === false ? "\nИтог неполный: " + Number(summary.unknown_items_count || 0) +
+    " поз. без рассчитанных КБЖУ." : "";
   return "Сегодня:\n" + dailyNutritionNumber_(consumed.calories, 1) + " ккал\n" +
     "Б: " + dailyNutritionNumber_(consumed.protein, 1) + " г | Ж: " +
     dailyNutritionNumber_(consumed.fat, 1) + " г | У: " +
-    dailyNutritionNumber_(consumed.carbs, 1) + " г";
+    dailyNutritionNumber_(consumed.carbs, 1) + " г" + suffix;
 }
 
 function dailyNutritionNumber_(value, decimals) {
@@ -5554,7 +5625,8 @@ function buildNutritionPersistenceItems_(capture) {
       nutrition_authority: frozen.nutrition_authority,
       nutrition_source: frozen.nutrition_source,
       nutrition_source_version: frozen.nutrition_source_version,
-      nutrition_approximate: frozen.nutrition_approximate
+      nutrition_approximate: frozen.nutrition_approximate,
+      nutrition_completeness: frozen.nutrition_completeness || (frozen.calculated_nutrition ? "CALCULATED" : "UNKNOWN")
     };
   });
 }
@@ -6005,10 +6077,19 @@ function formatNutritionConfirmation_(capture) {
     lines.push(String(fields.food_display && fields.food_display.value || "Продукт") + " — " +
       nutritionQuantityLabel_(fields.quantity_value && fields.quantity_value.value,
         fields.quantity_unit && fields.quantity_unit.value));
-    lines.push(nutritionMacroLine_(fields.calculated_nutrition && fields.calculated_nutrition.value || {}));
+    const calculated = fields.calculated_nutrition && fields.calculated_nutrition.value;
+    lines.push(calculated ? nutritionMacroLine_(calculated) : "КБЖУ пока не определены");
     if (index < capture.items.length - 1) lines.push("");
   });
-  lines.push("", "Итого:", nutritionMacroLine_(capture.nutrition_calculation.totals), "", "Сохранить? Да / Нет");
+  const partial = capture.nutrition_calculation.status === "PARTIAL_CALCULATED";
+  if (partial && Number(capture.nutrition_calculation.calculable_items_count || 0) === 0) {
+    lines.push("", "Рассчитанных КБЖУ пока нет.");
+  } else {
+    lines.push("", partial ? "Рассчитанный минимум:" : "Итого:", nutritionMacroLine_(capture.nutrition_calculation.totals));
+  }
+  if (partial) lines.push("Итог неполный: " + Number(capture.nutrition_calculation.unknown_items_count || 0) +
+    " поз. без КБЖУ. Их можно сохранить сейчас и уточнить рецепт позже.");
+  lines.push("", "Сохранить? Да / Нет");
   return lines.join("\n");
 }
 

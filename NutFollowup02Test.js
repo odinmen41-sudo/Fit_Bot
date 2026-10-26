@@ -67,8 +67,8 @@ function runNutFollowup02Tests() {
   record("NUT-FOLLOWUP-02_13_REPEAT_CONFIRMATION_IDEMPOTENT", routed.ok && runtime.meals.length === 1, routed);
 
   const unknown = detectDomainFactCandidate_("Съел неизвестный домашний суп 250 г", referenceOptions);
-  record("NUT-FOLLOWUP-02_14_UNKNOWN_RECIPE_FAILS_CLOSED", unknown.reference_status === "UNKNOWN_REFERENCE" &&
-    unknown.calculation_status !== "CALCULATED", unknown);
+  record("NUT-FOLLOWUP-02_14_UNKNOWN_RECIPE_PRESERVED", unknown.reference_status === "PARTIAL" &&
+    unknown.calculation_status === "PARTIAL_CALCULATED" && unknown.items[0].fields.calculated_nutrition.value === null, unknown);
   const passed=results.filter(function(r){return r.status==="PASS";}).length;
   return {ok:passed===results.length,passed:passed,total:results.length,results:results};
 }

@@ -1946,6 +1946,20 @@ function routeNutritionTargetConfirmation_(update, options) {
   const dependencies = nutritionTargetDependencies_(runtime.dependencies);
   const now = runtime.now instanceof Date ? runtime.now : new Date();
   const confirmation = dependencies.detect_confirmation(message.text);
+  if (confirmation && confirmation.intent === "CORRECTION") {
+    const selectedCorrection = dependencies.find_capture(userId, chatId, {now: now, include_saved: false});
+    const correctedText = selectedCorrection && selectedCorrection.ok === true
+      ? nutritionPendingCorrectionText_(selectedCorrection.payload, message.text) : null;
+    if (correctedText) {
+      const released = dependencies.cancel(userId, chatId, {now: now});
+      if (!released || released.ok !== true) return domainFactResult_(true, false, "CORRECTION_RELEASE_FAILED", {
+        domain: "NUTRITION", message: "Не удалось обновить запись. Попробуйте ещё раз."
+      });
+      const correctedUpdate = Object.assign({}, update, {message: Object.assign({}, message, {text: correctedText})});
+      return routeDomainFactConfirmation_(correctedUpdate, {now: now, dependencies: dependencies,
+        reference_options: referenceOptions || {}});
+    }
+  }
   if (confirmation && ["CONFIRM", "CANCEL"].indexOf(confirmation.intent) >= 0) {
     const selected = dependencies.find_capture(userId, chatId, {now: now, include_saved: false});
     if (selected && selected.ok === true) {
@@ -2432,20 +2446,65 @@ function routeDomainFactConfirmation_(update, options) {
 
 const NUTRITION_CLARIFICATION_SOURCE = "NUTRITION_CLARIFICATION";
 
+function nutritionPendingCorrectionText_(payload, text) {
+  if (!isB2NutritionCapture_(payload)) return null;
+  const normalized = normalizeNutritionNaturalInput_(normalizeExplicitWeightText_(text));
+  const change = normalized.match(/(?:нет,?\s*)?(?:не\s+)?(\d+(?:[.,]\d+)?)\s*,?\s*а\s+(\d+(?:[.,]\d+)?)\s*(кус(?:ка|ков)?|ломт(?:ика|иков|ик)?|шт|штуки|штук|штука)/i);
+  if (!change) return null;
+  const oldValue = Number(change[1].replace(",", "."));
+  const newValue = Number(change[2].replace(",", "."));
+  if (!isFinite(newValue) || newValue <= 0 || newValue > 100) return null;
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  const candidates = items.filter(function(item) {
+    const fields = item && item.fields || {};
+    return String(fields.quantity_unit && fields.quantity_unit.value || "") === "count" &&
+      Number(fields.quantity_value && fields.quantity_value.value) === oldValue;
+  });
+  if (candidates.length !== 1) return null;
+  const phrases = items.map(function(item) {
+    const fields = item && item.fields || {};
+    const food = String(fields.food_display && fields.food_display.value || "").trim();
+    let quantity = Number(fields.quantity_value && fields.quantity_value.value);
+    const unit = String(fields.quantity_unit && fields.quantity_unit.value || "");
+    if (item === candidates[0]) quantity = newValue;
+    const displayUnit = {g: "г", ml: "мл", count: "шт"}[unit];
+    return food && displayUnit && isFinite(quantity) ? food + " " + quantity + " " + displayUnit : "";
+  });
+  return phrases.length && phrases.indexOf("") < 0 ? "Съел " + phrases.join(" и ") : null;
+}
+
 function nutritionClarificationSpec_(detection) {
   const items = Array.isArray(detection && detection.items) ? detection.items : [];
-  if (items.length !== 1) return null;
-  const fields = items[0] && items[0].fields || {};
+  if (!items.length) return null;
+  let index = -1;
+  for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
+    const candidateFields = items[itemIndex] && items[itemIndex].fields || {};
+    const candidateQuantity = candidateFields.quantity_value && candidateFields.quantity_value.value;
+    const candidateUnit = String(candidateFields.quantity_unit && candidateFields.quantity_unit.value || "");
+    if (candidateQuantity == null || candidateQuantity === "" || !candidateUnit) { index = itemIndex; break; }
+  }
+  if (index < 0) index = 0;
+  const fields = items[index] && items[index].fields || {};
   const foodText = String(fields.food_display && fields.food_display.value || "").trim();
   if (!foodText) return null;
+  const draftItems = items.map(function(item) {
+    const itemFields = item && item.fields || {};
+    return {
+      food_text: String(itemFields.food_display && itemFields.food_display.value || "").trim(),
+      quantity_value: itemFields.quantity_value && itemFields.quantity_value.value,
+      quantity_unit: String(itemFields.quantity_unit && itemFields.quantity_unit.value || "")
+    };
+  });
   const quantity = fields.quantity_value && fields.quantity_value.value;
   const unit = String(fields.quantity_unit && fields.quantity_unit.value || "");
   if (quantity == null || quantity === "" || !unit) {
-    return {missing_field: "QUANTITY", food_text: foodText, prompt: "Сколько граммов?"};
+    return {missing_field: "QUANTITY", food_text: foodText, item_index: index, draft_items: draftItems,
+      prompt: items.length === 1 ? "Сколько граммов?" :
+        "Уточните количество «" + foodText + "» (например, 300 мл или 150 г)."};
   }
   const preparation = String(fields.preparation_state && fields.preparation_state.value || "UNKNOWN");
   if (preparation === "UNKNOWN" && String(detection.reference_status || "") === "CLARIFICATION_REQUIRED") {
-    return {missing_field: "PREPARATION", food_text: foodText,
+    return {missing_field: "PREPARATION", food_text: foodText, item_index: index, draft_items: draftItems,
       quantity_value: Number(quantity), quantity_unit: unit,
       prompt: detection.clarification_message || "Уточните способ приготовления."};
   }
@@ -2500,22 +2559,37 @@ function nutritionClarificationReply_(text) {
     return {recognized: true, type: "PREPARATION", phrase: "жареный"};
   }
   if (/^(?:на\s+)?гриле$/.test(normalized)) return {recognized: true, type: "PREPARATION", phrase: "на гриле"};
-  const quantity = normalized.match(/^(\d+(?:[.,]\d+)?)\s*(?:г|гр|грамм|грамма|граммов)?$/);
-  if (quantity) return {recognized: true, type: "QUANTITY", quantity: Number(quantity[1].replace(",", "."))};
+  const quantity = normalized.match(/^(\d+(?:[.,]\d+)?)\s*(кг|мл|л|г|гр|грамм|грамма|граммов|шт|штука|штуки|штук)?$/);
+  if (quantity) {
+    const normalizedQuantity = normalizeNutritionQuantity_(quantity[1], quantity[2] || "г");
+    if (normalizedQuantity.valid) return {recognized: true, type: "QUANTITY",
+      quantity: normalizedQuantity.value, unit: normalizedQuantity.unit};
+  }
   return {recognized: false};
 }
 
 function nutritionClarificationCompletedText_(spec, reply) {
   if (!spec || !reply || reply.recognized !== true) return null;
+  const draftItems = Array.isArray(spec.draft_items) ? spec.draft_items.map(function(item) {
+    return {food_text: item.food_text, quantity_value: item.quantity_value, quantity_unit: item.quantity_unit};
+  }) : [{food_text: spec.food_text, quantity_value: spec.quantity_value, quantity_unit: spec.quantity_unit}];
+  const targetIndex = Number(spec.item_index || 0);
   if (spec.missing_field === "PREPARATION" && reply.type === "PREPARATION") {
-    const unit = {g: "г", ml: "мл", count: "шт"}[String(spec.quantity_unit || "")] || spec.quantity_unit;
-    return "Съел " + spec.food_text + " " + reply.phrase + " " + spec.quantity_value + " " + unit;
+    draftItems[targetIndex].food_text += " " + reply.phrase;
   }
-  if (spec.missing_field === "QUANTITY" && reply.type === "QUANTITY" &&
+  else if (spec.missing_field === "QUANTITY" && reply.type === "QUANTITY" &&
       isFinite(reply.quantity) && reply.quantity > 0 && reply.quantity <= 10000) {
-    return "Съел " + spec.food_text + " " + reply.quantity + " г";
+    draftItems[targetIndex].quantity_value = reply.quantity;
+    draftItems[targetIndex].quantity_unit = reply.unit || "g";
+  } else {
+    return null;
   }
-  return null;
+  const completed = draftItems.map(function(item) {
+    if (!item.food_text || item.quantity_value == null || !item.quantity_unit) return "";
+    const unit = {g: "г", ml: "мл", count: "шт"}[String(item.quantity_unit)] || item.quantity_unit;
+    return item.food_text + " " + item.quantity_value + " " + unit;
+  });
+  return completed.indexOf("") >= 0 ? null : "Съел " + completed.join(" и ");
 }
 
 function continueNutritionClarification_(selected, update, dependencies, referenceOptions, now) {
@@ -2532,6 +2606,17 @@ function continueNutritionClarification_(selected, update, dependencies, referen
   const spec = selected.payload && selected.payload.clarification;
   const reply = nutritionClarificationReply_(message.text);
   const completedText = nutritionClarificationCompletedText_(spec, reply);
+  if (!completedText) {
+    const replacement = extractNutritionFactCandidate_(message.text);
+    if (replacement.detected === true && /(?:съел|выпил|добавил|запиш)/i.test(String(message.text || ""))) {
+      const cancelled = dependencies.cancel(userId, chatId, {now: now});
+      if (!cancelled || cancelled.ok !== true) return domainFactResult_(true, false, "CLARIFICATION_RELEASE_FAILED", {
+        domain: "NUTRITION", message: "Не удалось обновить уточнение. Попробуйте ещё раз."
+      });
+      return routeDomainFactConfirmation_(update, {now: now, dependencies: dependencies,
+        reference_options: referenceOptions || {}});
+    }
+  }
   if (!completedText) return domainFactResult_(true, false, "CLARIFICATION_REQUIRED", {
     domain: "NUTRITION", pending_capture_writes: 0,
     message: spec && spec.prompt || "Уточните запись о питании."
@@ -2653,16 +2738,18 @@ function detectDomainFactCandidate_(text, referenceOptions) {
 }
 
 function extractNutritionFactCandidate_(text) {
-  const normalized = normalizeExplicitWeightText_(text).toLowerCase();
+  const normalized = normalizeNutritionNaturalInput_(normalizeExplicitWeightText_(text).toLowerCase());
   const result = {detected: false, invalid: false, requires_clarification: false, items: []};
   if (!normalized || nutritionQuestion_(normalized)) return result;
 
-  const hasAction = /^(?:съел(?:а|и)?|ел(?:а|и)?|выпил(?:а|и)?)(?=\s|$)/i.test(normalized);
-  const hasKnownFood = /(?:рис|куриц|грудк|греч|кефир|банан|яйц|творог|овсян|мяс|рыб|хлеб|сыр)/i.test(normalized);
+  const hasAction = /(?:^|\s)(?:съел(?:а|и)?|ел(?:а|и)?|выпил(?:а|и)?|добавил(?:а|и)?|запиш(?:и|ите)?)(?=\s|$)/i.test(normalized);
+  const hasKnownFood = /(?:рис|куриц|грудк|греч|кефир|банан|яйц|творог|овсян|мяс|рыб|хлеб|сыр|кофе|капучин|сгущ|пицц)/i.test(normalized);
   if (!hasAction && !hasKnownFood) return result;
 
   const content = normalized
-    .replace(/^(?:съел(?:а|и)?|ел(?:а|и)?|выпил(?:а|и)?)\s+/i, "")
+    .replace(/^(?:(?:нет|неверно),?\s+)?(?:на\s+(?:завтрак|обед|ужин)\s+)?(?:я\s+)?(?:съел(?:а|и)?|ел(?:а|и)?|выпил(?:а|и)?)\s+/i, "")
+    .replace(/\s+(?:запиши|запишите)(?:\s+это)?(?:\s+в\s+мой\s+дневной\s+рацион)?\s*$/i, "")
+    .replace(/\s+(?:добавил(?:а|и)?|и\s+съел(?:а|и)?|и\s+выпил(?:а|и)?)\s+/gi, ", ")
     .replace(/[!?]+$/g, "")
     .trim();
   if (!content) return result;
@@ -2680,6 +2767,17 @@ function extractNutritionFactCandidate_(text) {
   return result;
 }
 
+function normalizeNutritionNaturalInput_(text) {
+  let value = String(text || "").replace(/[\u201c\u201d«»"]/g, " ").replace(/ё/g, "е");
+  const words = {"один":"1","одна":"1","одну":"1","два":"2","две":"2","пара":"2","пару":"2","три":"3","четыре":"4"};
+  Object.keys(words).forEach(function(word) {
+    value = value.replace(new RegExp("(?:^|\\s)" + word + "(?=\\s+(?:шт|штук|кус|лож|чайн(?:ая|ые|ых)?\\s+лож))", "gi"), function(match) {
+      return (match.charAt(0) === " " ? " " : "") + words[word];
+    });
+  });
+  return value.replace(/\s+/g, " ").trim();
+}
+
 function nutritionQuestion_(text) {
   return /\?\s*$/.test(text) ||
     /^(?:сколько|что\s+лучше|что\s+можно|как|можно\s+ли|стоит\s+ли)\b/i.test(text);
@@ -2688,7 +2786,7 @@ function nutritionQuestion_(text) {
 function parseNutritionItem_(part) {
   const cleaned = String(part || "").replace(/^[\s,;:.]+|[\s,;:.]+$/g, "").trim();
   if (!cleaned) return null;
-  const unitPattern = "(?:граммов|грамма|грамм|гр|кг|мл|литра|литров|литр|штуки|штук|штука|шт|г|л)";
+  const unitPattern = "(?:чайн(?:ая|ые|ых)\\s+лож(?:ек|ки|ка)|кус(?:ка|ков)?|ломт(?:ика|иков|ик)?|граммов|грамма|грамм|гр|кг|мл|литра|литров|литр|штуки|штук|штука|шт|г|л)";
   let match = cleaned.match(new RegExp("^(.+?)\\s+(-?\\d+(?:[.,]\\d+)?)\\s*(" + unitPattern + ")(?=\\s|$)", "i"));
   let food = "";
   let numberText = "";
@@ -2739,6 +2837,7 @@ function normalizeNutritionQuantity_(numberText, unitText) {
   else if (unit === "мл") canonical = "ml";
   else if (/^(?:л|литр|литра|литров)$/.test(unit)) { canonical = "ml"; value = numeric * 1000; }
   else if (/^(?:шт|штука|штуки|штук)$/.test(unit)) canonical = "count";
+  else if (/^(?:чайн(?:ая|ые|ых)\s+лож(?:ек|ки|ка)|кус(?:ка|ков)?|ломт(?:ика|иков|ик)?)$/.test(unit)) canonical = "count";
 
   const upperBound = canonical === "count" ? 100 : 10000;
   return {value: value, unit: canonical, valid: !!canonical && isFinite(value) && value > 0 && value <= upperBound};

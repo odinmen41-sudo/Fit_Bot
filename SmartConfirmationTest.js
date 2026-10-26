@@ -303,11 +303,11 @@ function expirePendingCaptures_(options) {
 function detectConfirmationIntent_(message) {
   const original = String(message || "").trim();
   const normalized = original.toLowerCase().replace(/ё/g, "е").replace(/[.!?]+$/g, "").trim();
-  const hasCorrectionData = /\d+(?:[.,]\d+)?/.test(normalized) && /вес|жим|сон|энерг|куриц|рис|кг|грамм/.test(normalized);
+  const hasCorrectionData = /\d+(?:[.,]\d+)?/.test(normalized) && /вес|жим|сон|энерг|куриц|рис|пицц|кус|шт|кг|грамм/.test(normalized);
   if (/^(нет|неверно|исправ)/.test(normalized) && hasCorrectionData) {
     return {intent: "CORRECTION", confidence: 0.99, source: "EXPLICIT_USER_INPUT", raw: original};
   }
-  if (/^(да|записать|подтверждаю|подтвердить|сохранить)$/.test(normalized)) {
+  if (/^(да|записать|записывай|подтверждаю|подтвердить|сохранить|все верно(?:,? записывай)?|верно,? записывай)$/.test(normalized)) {
     return {intent: "CONFIRM", confidence: 0.99, source: "EXPLICIT_USER_INPUT", raw: original};
   }
   if (/^(нет|отмена|отменить|не записывать|не сохранять)$/.test(normalized)) {

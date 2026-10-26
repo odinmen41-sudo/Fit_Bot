@@ -61,7 +61,24 @@ No new paid provider is introduced. Quota, latency and applicable data-processin
 
 When the beta gate is enabled, Telegram and AI audit logs store pseudonymous keys and message lengths rather than raw dialogue, even though the environment remains STAGING. Domain rows remain scoped to the authenticated Telegram identity. Invitation activation, onboarding completion and profile creation are serialized to prevent concurrency races. Update claiming, domain idempotency and pending/callback ownership remain mandatory.
 
-A deletion request is confirmation-required and never causes automatic irreversible deletion. Legal basis, retention, support access and participant copy remain owner/legal decisions.
+A deletion request is confirmation-required. The user must send the separate exact phrase
+`ПОДТВЕРЖДАЮ БЕЗВОЗВРАТНОЕ УДАЛЕНИЕ`; a generic `Да` is insufficient. Before any row is
+removed, a pseudonymous tombstone closes access and blocks delayed messages and callbacks.
+The deletion job removes user-scoped active data, rechecks every covered store, anonymizes the
+activated invitation and request record, and retains only a pseudonymous technical audit. A
+partial failure keeps access blocked and can be retried idempotently.
+
+Covered active stores are: `User_Profile`, `Nutrition_Log`, `Workout_Log`,
+`Recovery_Checkin`, `Workout_Plan`, `Workout_Plan_Versions`, `AI_Coach_Decisions`,
+`AI_MEMORY`, `PENDING_CAPTURES`, `Bot_Input`, `BETA_USERS`, `BETA_FEEDBACK`,
+`BETA_EVENTS`, related user properties, and attributable authoritative weight rows in
+`Body_Tracking`. Legacy `Body_Tracking` rows are deleted only when their confirmation marker is
+proven to belong to the deleted user; date or weight similarity is never sufficient.
+
+`Recovery_Log` and other legacy global tables without a user identity are not guessed or deleted.
+They are not part of the beta authoritative write path. Backups are outside the active spreadsheet
+erasure transaction: backup retention, deletion windows, legal holds, operator identity,
+jurisdiction and the retention period of the tombstone/audit remain explicit owner/legal decisions.
 
 ## Acceptance gate before wave 1
 

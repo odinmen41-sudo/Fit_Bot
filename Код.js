@@ -432,11 +432,12 @@ function doPost(e) {
       "В обработке"
     ]);
 
-    const betaOnboarding = routeBeta01Onboarding_(update);
-    if (betaOnboarding.handled) {
-      sendTelegramMessage_(chatId, betaOnboarding.message);
-      logAiReply_(messageText, betaOnboarding.message, "beta_01_onboarding");
-      markBotInputProcessed_(inputRow, betaOnboarding.ok ? "Да" : "Ошибка onboarding");
+    const betaDeletion = routeBeta01Deletion_(update);
+    if (betaDeletion.handled) {
+      sendTelegramMessage_(chatId, betaDeletion.message);
+      // The privacy transaction deletes the current user's Bot_Input rows.
+      // Never reuse the pre-deletion row number or append a post-deletion reply log:
+      // either action could mutate or recreate context after verified erasure.
       return httpOk_("OK");
     }
 
@@ -445,6 +446,14 @@ function doPost(e) {
       sendTelegramMessage_(chatId, betaFeedback.message);
       logAiReply_(messageText, betaFeedback.message, "beta_01_feedback");
       markBotInputProcessed_(inputRow, betaFeedback.ok ? "Да" : "Ошибка feedback");
+      return httpOk_("OK");
+    }
+
+    const betaOnboarding = routeBeta01Onboarding_(update);
+    if (betaOnboarding.handled) {
+      sendTelegramMessage_(chatId, betaOnboarding.message);
+      logAiReply_(messageText, betaOnboarding.message, "beta_01_onboarding");
+      markBotInputProcessed_(inputRow, betaOnboarding.ok ? "Да" : "Ошибка onboarding");
       return httpOk_("OK");
     }
 

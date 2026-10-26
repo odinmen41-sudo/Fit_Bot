@@ -1,7 +1,7 @@
 /* BETA-01 — invitation access, progressive onboarding, voice input and feedback. */
 const BETA01 = Object.freeze({
   INVITES_SHEET:"BETA_INVITES", USERS_SHEET:"BETA_USERS", FEEDBACK_SHEET:"BETA_FEEDBACK",
-  EVENTS_SHEET:"BETA_EVENTS", REQUESTS_SHEET:"BETA_DATA_REQUESTS", CONSENT_VERSION:"beta-01-v1",
+  EVENTS_SHEET:"BETA_EVENTS", REQUESTS_SHEET:"BETA_DATA_REQUESTS", DELETION_AUDIT_SHEET:"BETA_DELETION_AUDIT", CONSENT_VERSION:"beta-01-v1",
   INVITE_TTL_DAYS:14, MAX_TRANSCRIPT_CHARS:1200
 });
 
@@ -10,7 +10,8 @@ const BETA01_SCHEMAS = Object.freeze({
   BETA_USERS:Object.freeze(["TELEGRAM_ID","STATUS","ACCESS_SOURCE","ONBOARDING_STATUS","CONSENT_VERSION","CONSENT_AT","OPTIONAL_IMPROVEMENT_CONSENT","STATE_JSON","CREATED_AT","UPDATED_AT"]),
   BETA_FEEDBACK:Object.freeze(["EVENT_ID","TELEGRAM_ID","CREATED_AT","CATEGORY","MESSAGE","STATUS"]),
   BETA_EVENTS:Object.freeze(["EVENT_ID","USER_KEY","CREATED_AT","EVENT_TYPE","SUCCESS","METADATA_JSON"]),
-  BETA_DATA_REQUESTS:Object.freeze(["REQUEST_ID","TELEGRAM_ID","CREATED_AT","REQUEST_TYPE","STATUS","CONFIRMED_AT","COMPLETED_AT"])
+  BETA_DATA_REQUESTS:Object.freeze(["REQUEST_ID","TELEGRAM_ID","CREATED_AT","REQUEST_TYPE","STATUS","CONFIRMED_AT","COMPLETED_AT"]),
+  BETA_DELETION_AUDIT:Object.freeze(["REQUEST_ID","SUBJECT_KEY","STARTED_AT","COMPLETED_AT","STATUS","COUNTS_JSON","ERROR_CODE"])
 });
 
 function beta01Normalize_(value){return String(value==null?"":value).toLowerCase().replace(/ё/g,"е").replace(/[.,!?;:«»"'`()\[\]{}]+/g," ").replace(/\s+/g," ").trim();}
@@ -21,6 +22,9 @@ function beta01ConstantTimeEqual_(left,right){const a=String(left||""),b=String(
 function validateBeta01Webhook_(event,options){try{const deps=beta01Dependencies_(options&&options.dependencies),env=beta01Property_(deps,"DEPLOYMENT_ENV").toUpperCase();if(env!=="BETA")return {ok:true,code:"NOT_BETA"};const expected=beta01Property_(deps,"BETA_WEBHOOK_SECRET"),actual=event&&event.parameter&&event.parameter.webhook_secret;if(!expected)return {ok:false,code:"WEBHOOK_SECRET_MISSING"};return beta01ConstantTimeEqual_(expected,actual)?{ok:true,code:"WEBHOOK_VERIFIED"}:{ok:false,code:"WEBHOOK_REJECTED"};}catch(e){return {ok:false,code:"WEBHOOK_CHECK_FAILED"};}}
 function beta01Sha256_(value,deps){const raw=String(value||"");if(deps&&typeof deps.sha256==="function")return deps.sha256(raw);const bytes=Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,raw,Utilities.Charset.UTF_8);return bytes.map(function(b){const n=b<0?b+256:b;return ("0"+n.toString(16)).slice(-2);}).join("");}
 function beta01UserKey_(telegramId,deps){const salt=beta01Property_(deps,"BETA_ANALYTICS_SALT");return beta01Sha256_(salt+"|"+String(telegramId||""),deps).slice(0,20);}
+function beta01DeletionTombstoneKey_(telegramId,deps){return "BETA_DELETED_"+beta01UserKey_(telegramId,deps).toUpperCase();}
+function beta01DeletionTombstoned_(telegramId,deps){return !!beta01Property_(deps,beta01DeletionTombstoneKey_(telegramId,deps));}
+function beta01DeletionTombstone_(telegramId,deps){return beta01Json_(beta01Property_(deps,beta01DeletionTombstoneKey_(telegramId,deps)),{});}
 function beta01Json_(value,fallback){try{return JSON.parse(String(value||""));}catch(e){return fallback;}}
 function beta01Iso_(date){return (date instanceof Date?date:new Date(date)).toISOString();}
 function beta01ParticipantLimit_(deps){return Math.min(5,Math.max(1,Number(beta01Property_(deps,"BETA_PARTICIPANT_LIMIT")||1)));}
@@ -75,6 +79,11 @@ function beta01ActivateInvite_(telegramId,token,deps){
 function beta01AccessDecision_(telegramId,text,deps){
   if(!beta01Enabled_(deps))return beta01Result_(false,true,"BETA_GATE_DISABLED",{authorized:true});
   if(beta01Admins_(deps).indexOf(String(telegramId))>=0)return beta01Result_(false,true,"AUTHORIZED_ADMIN",{authorized:true});
+  if(beta01DeletionTombstoned_(telegramId,deps)){
+    const deletion=beta01DeletionTombstone_(telegramId,deps),retry=beta01Normalize_(text)==="подтверждаю безвозвратное удаление"&&["IN_PROGRESS","PARTIAL_FAILURE"].indexOf(deletion.status)>=0;
+    if(retry)return beta01Result_(false,true,"DELETION_RETRY_AUTHORIZED",{authorized:true});
+    return beta01Result_(true,false,"DATA_DELETED",{message:"Данные этого профиля удалены или поставлены на безопасную очистку, доступ закрыт. Для поддержки обратись к владельцу тестирования."});
+  }
   const token=beta01StartToken_(text);if(token)return beta01ActivateInvite_(telegramId,token,deps);
   const found=beta01FindUser_(telegramId,deps);if(found.ok&&found.user.STATUS==="ACTIVE")return beta01Result_(false,true,"AUTHORIZED",{authorized:true,user:found.user});
   if(deps.profile_exists(telegramId,deps))return beta01Result_(false,true,"AUTHORIZED_EXISTING_PROFILE",{authorized:true});
@@ -142,7 +151,7 @@ function routeBeta01Feedback_(update,options){
   const m=/^(?:\/feedback|отзыв|сообщить о проблеме|предложение)\s*:?\s+([\s\S]{3,1000})$/i.exec(text.trim());
   if(m){let category=/проблем|ошиб|не работ/i.test(n)?"PROBLEM":/предлож|хотелось|идея/i.test(n)?"IDEA":"IMPRESSION";beta01Append_(BETA01.FEEDBACK_SHEET,[deps.uuid(),telegramId,beta01Iso_(deps.now()),category,m[1].trim(),"NEW"],deps);beta01RecordEvent_(telegramId,"FEEDBACK_SUBMITTED",true,{category:category},deps);return beta01Result_(true,true,"FEEDBACK_SAVED",{authorized:true,sheet_writes:2,message:"Спасибо, обратную связь сохранил. Если проблема мешает пользоваться ботом, опиши ещё ожидаемый результат и что произошло."});}
   if(/^(?:как оставить отзыв|оставить отзыв|сообщить о проблеме)$/.test(n))return beta01Result_(true,true,"FEEDBACK_HELP",{authorized:true,message:"Напиши одним сообщением: «Отзыв: …», «Сообщить о проблеме: …» или «Предложение: …». Я сохраню текст для владельца закрытой беты."});
-  if(/^(?:удалить мои данные|удали мой профиль|запросить удаление данных)$/.test(n)){beta01Append_(BETA01.REQUESTS_SHEET,[deps.uuid(),telegramId,beta01Iso_(deps.now()),"DELETE_ALL","PENDING_CONFIRMATION","",""],deps);return beta01Result_(true,true,"DELETION_REQUEST_CREATED",{authorized:true,sheet_writes:1,message:"Запрос на удаление подготовлен, но данные ещё не удалены. Для защиты от случайного удаления владелец беты свяжется с тобой для подтверждения."});}
+  if(/^(?:удалить мои данные|удали мой профиль|запросить удаление данных)$/.test(n))return createBeta01DeletionRequest_(telegramId,{dependencies:deps});
   return beta01Result_(false,true,"NOT_FEEDBACK",{authorized:true});
 }
 

@@ -39,6 +39,17 @@ function runNutRecipe01Tests() {
   record("NUT-RECIPE-01_14_ALL_UNKNOWN_SAVEABLE_WITHOUT_ZERO_ITEM",allUnknown.calculation_status==="PARTIAL_CALCULATED"&&
     allUnknown.nutrition_calculation.calculable_items_count===0&&allUnknown.items[0].fields.calculated_nutrition.value===null,allUnknown);
   record("NUT-RECIPE-01_15_PERCENT_PRESERVED",detection.items[0].fields.quantity_value.value===200,detection.items[0]);
+  const effectiveMeal={meal_at:"2026-10-27T04:53:00.000Z",items:persisted,
+    totals:{calories:232,protein:15.1,fat:10.2,carbs:19.8}};
+  const daily=buildNutritionDailyHistory_([effectiveMeal],{dates:["2026-10-27"],time_zone:"Europe/Moscow"},{
+    format_date_time:function(date,zone,pattern){return pattern==="HH:mm"?"07:53":"2026-10-27";}});
+  record("NUT-RECIPE-01_16_HISTORY_NULLS_PRESERVED",daily[0].meals[0].items.filter(function(i){
+    return i.nutrition_completeness==="UNKNOWN"&&i.calories===null;}).length===3,daily);
+  const historySummary=buildNutritionPeriodSummary_(daily,{dates:["2026-10-27"]});
+  const historyText=formatNutritionHistory_(historySummary,{scope:"TODAY",mode:"HISTORY"},null);
+  record("NUT-RECIPE-01_17_HISTORY_NO_NAN",historyText.indexOf("NaN")<0&&
+    historyText.indexOf("КБЖУ пока не определены")>=0,historyText);
+  record("NUT-RECIPE-01_18_HISTORY_INCOMPLETE_TOTAL",historyText.indexOf("Итог неполный")>=0,historyText);
   const passed=results.filter(function(r){return r.status==="PASS";}).length;
   return {ok:passed===results.length,passed:passed,total:results.length,results:results};
 }

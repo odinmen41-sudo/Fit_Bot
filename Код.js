@@ -5309,7 +5309,8 @@ function loadNutritionHistory_(userId, window, options) {
   } catch (error) { return nutritionHistoryResult_(false, false, "DATA_INTEGRITY_ERROR"); }
 }
 
-function nutritionHistoryTotals_() { return {calories:0, protein:0, fat:0, carbs:0, meal_count:0, item_count:0}; }
+function nutritionHistoryTotals_() { return {calories:0, protein:0, fat:0, carbs:0,
+  meal_count:0, item_count:0, unknown_item_count:0, totals_complete:true}; }
 
 function buildNutritionDailyHistory_(effectiveMeals, window, options) {
   const runtime = options || {}, format = runtime.format_date_time || function(date, zone, pattern) {
@@ -5319,14 +5320,21 @@ function buildNutritionDailyHistory_(effectiveMeals, window, options) {
   (effectiveMeals || []).forEach(function(meal) {
     const date = format(new Date(meal.meal_at), window.time_zone, "yyyy-MM-dd"), day = byDate[date];
     if (!day) return;
-    const safeItems = meal.items.map(function(item) { return {food_display:String(item.food_display || ""),
-      quantity_value:Number(item.quantity_value), quantity_unit:String(item.quantity_unit), calories:Number(item.calculated_calories),
-      protein:Number(item.calculated_protein), fat:Number(item.calculated_fat), carbs:Number(item.calculated_carbs)}; });
+    const safeItems = meal.items.map(function(item) {
+      const unknown = item.nutrition_completeness === "UNKNOWN";
+      return {food_display:String(item.food_display || ""), quantity_value:Number(item.quantity_value),
+        quantity_unit:String(item.quantity_unit), nutrition_completeness:unknown ? "UNKNOWN" : "CALCULATED",
+        calories:unknown ? null : Number(item.calculated_calories), protein:unknown ? null : Number(item.calculated_protein),
+        fat:unknown ? null : Number(item.calculated_fat), carbs:unknown ? null : Number(item.calculated_carbs)};
+    });
     day.meals.push({local_time:format(new Date(meal.meal_at), window.time_zone, "HH:mm"), items:safeItems,
       totals:{calories:Number(meal.totals.calories), protein:Number(meal.totals.protein), fat:Number(meal.totals.fat), carbs:Number(meal.totals.carbs)}});
     day.totals.calories += Number(meal.totals.calories); day.totals.protein += Number(meal.totals.protein);
     day.totals.fat += Number(meal.totals.fat); day.totals.carbs += Number(meal.totals.carbs);
-    day.totals.meal_count += 1; day.totals.item_count += safeItems.length; day.record_status = "LOGGED";
+    const unknownCount=safeItems.filter(function(item){return item.nutrition_completeness==="UNKNOWN";}).length;
+    day.totals.meal_count += 1; day.totals.item_count += safeItems.length;
+    day.totals.unknown_item_count += unknownCount; day.totals.totals_complete = day.totals.unknown_item_count === 0;
+    day.record_status = "LOGGED";
   });
   return window.dates.map(function(date) { const day = byDate[date]; day.meals.sort(function(a,b){return a.local_time.localeCompare(b.local_time);}); return day; });
 }
@@ -5376,8 +5384,18 @@ function formatNutritionHistory_(summary, intent, comparison) {
   if (summary.code === "NO_RECORDS") return intent.scope === "YESTERDAY" ? "Вчера записей о питании нет." : "За выбранный период записей о питании нет.";
   if (intent.scope === "TODAY" || intent.scope === "YESTERDAY") {
     const day=summary.daily[0]; lines.push((intent.scope === "TODAY" ? "Сегодня" : "Вчера") + ", " + day.local_date + ":");
-    day.meals.forEach(function(meal){lines.push("",meal.local_time);meal.items.forEach(function(item){lines.push("• "+item.food_display+" — "+n(item.quantity_value)+" "+nutritionHistoryUnit_(item.quantity_unit),"  "+n(item.calories)+" ккал | Б "+n(item.protein)+" | Ж "+n(item.fat)+" | У "+n(item.carbs));});});
-    lines.push("","Итого:",n(day.totals.calories)+" ккал | Б "+n(day.totals.protein)+" | Ж "+n(day.totals.fat)+" | У "+n(day.totals.carbs));
+    day.meals.forEach(function(meal){lines.push("",meal.local_time);meal.items.forEach(function(item){
+      lines.push("• "+item.food_display+" — "+n(item.quantity_value)+" "+nutritionHistoryUnit_(item.quantity_unit),
+        item.nutrition_completeness==="UNKNOWN" ? "  КБЖУ пока не определены" :
+          "  "+n(item.calories)+" ккал | Б "+n(item.protein)+" | Ж "+n(item.fat)+" | У "+n(item.carbs));});});
+    if(day.totals.totals_complete){
+      lines.push("","Итого:",n(day.totals.calories)+" ккал | Б "+n(day.totals.protein)+" | Ж "+n(day.totals.fat)+" | У "+n(day.totals.carbs));
+    }else if(day.totals.item_count>day.totals.unknown_item_count){
+      lines.push("","Рассчитанный минимум:",n(day.totals.calories)+" ккал | Б "+n(day.totals.protein)+" | Ж "+n(day.totals.fat)+" | У "+n(day.totals.carbs),
+        "Итог неполный: "+day.totals.unknown_item_count+" поз. без КБЖУ.");
+    }else{
+      lines.push("","Итог пока не рассчитан: "+day.totals.unknown_item_count+" поз. без КБЖУ.");
+    }
   } else {
     lines.push(intent.scope === "LAST_7_DAYS" ? "Последние 7 дней:" : "Текущая неделя:","");
     summary.daily.slice().reverse().forEach(function(day){lines.push(day.local_date+" — "+(day.record_status==="LOGGED"?n(day.totals.calories)+" ккал | Б "+n(day.totals.protein)+" | Ж "+n(day.totals.fat)+" | У "+n(day.totals.carbs):"записей нет"));});

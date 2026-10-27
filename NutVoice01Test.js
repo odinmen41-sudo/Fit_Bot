@@ -58,8 +58,9 @@ function runNutVoice01Tests() {
     nutritionClarificationReply_("150 г").unit === "g", {});
 
   const unknown = detectDomainFactCandidate_("Съел неизвестный батончик 80 г", referenceOptions);
-  record("NUT-VOICE-01_08_UNKNOWN_REFERENCE_FAILS_CLOSED", unknown.reference_status === "UNKNOWN_REFERENCE" &&
-    unknown.calculation_status !== "CALCULATED", unknown);
+  record("NUT-VOICE-01_08_UNKNOWN_REFERENCE_PRESERVED", unknown.reference_status === "PARTIAL" &&
+    unknown.calculation_status === "PARTIAL_CALCULATED" && unknown.nutrition_calculation.unknown_items_count === 1 &&
+    unknown.items[0].fields.calculated_nutrition.value === null, unknown);
 
   const correction = extractNutritionFactCandidate_("Нет, я съел три куска пиццы среднего размера");
   record("NUT-VOICE-01_09_CORRECTION_REPARSES_FULL_FACT", correction.detected &&

@@ -108,6 +108,15 @@ function runC232C3RemainingNutritionTargetsTests() {
     !counts.groq&&!counts.memory&&!counts.coach&&!counts.food&&result.groq_calls===0&&result.production_writes===0&&
     serialized.indexOf("tg1")<0&&serialized.indexOf("User_Profile")<0, {result:result,counts:counts});
 
+  result=routeRemainingNutritionTargets_(update("что осталось по кбжу?"),{dependencies:{
+    load_targets:function(){return targetResult(fixtureTargets,"AVAILABLE");},
+    load_consumed:function(){return Object.assign(consumedResult({calories:100,protein:10,fat:2,carbs:15},1),{
+      totals_complete:false,unknown_items_count:2,calculated_items_count:1});}
+  }});
+  record("C23.2C3-29_INCOMPLETE_TOTAL_BLOCKS_REMAINING",result.ok&&result.code==="CONSUMPTION_TOTAL_INCOMPLETE"&&
+    result.remaining===null&&result.totals_complete===false&&result.message.indexOf("Точный итог и остаток")>=0&&
+    result.message.indexOf("2200")<0,result);
+
   const passed=tests.filter(function(test){return test.status==="PASS";}).length;
   return {suite:"C-23.2C3_REMAINING_NUTRITION_TARGETS",status:passed===tests.length?"PASS":"FAIL",
     total:tests.length,passed:passed,failed:tests.length-passed,tests:tests,

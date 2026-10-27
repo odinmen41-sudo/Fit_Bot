@@ -108,6 +108,16 @@ function runC232C4NutritionTodayContextTests() {
   record("C23.2C4-35_PARTIAL_BLOCK_OMITS_MISSING", partialBlock.indexOf("targets_missing=protein,fat,carbs") >= 0 &&
     partialBlock.indexOf("target_protein_g=") < 0 && partialBlock.indexOf("remaining_based_on_logged_protein_g=") < 0,
     {block:partialBlock});
+  const incompleteContext=loadNutritionTodayContext_("tg1",{dependencies:{
+    load_targets:function(){return targetResult(fullTargets,"AVAILABLE");},
+    load_logged:function(){return Object.assign(loggedResult({calories:100,protein:10,fat:2,carbs:15},1),{
+      totals_complete:false,unknown_items_count:2,calculated_items_count:1});}
+  }});
+  const incompleteBlock=formatNutritionTodayContextBlock_(incompleteContext);
+  record("C23.2C4-35A_INCOMPLETE_OMITS_REMAINING",incompleteContext.logged_totals_status==="INCOMPLETE"&&
+    Object.keys(incompleteContext.remaining_based_on_logged).length===0&&
+    incompleteBlock.indexOf("logged_totals_status=INCOMPLETE")>=0&&
+    incompleteBlock.indexOf("remaining_based_on_logged_")<0,{context:incompleteContext,block:incompleteBlock});
 
   const dirtyContext = [
     "USER PROFILE:", "Имя: Pavel", "PROFILE DETAILS:",

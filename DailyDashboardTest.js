@@ -73,6 +73,10 @@ function runDailyDashboardTests() {
   record("DASH-45_FORMATTER_NO_READS",result.calls.weight===1&&result.calls.consumed===1&&result.calls.targets===1&&result.calls.recovery===1,result.calls);
   f=build({targets_throw:true}).facts;text=formatDailyDashboard_(f);record("DASH-46_TARGET_EXCEPTION",f.nutrition.available&&f.nutrition.target_status==="UNAVAILABLE"&&f.has_domain_errors&&/Цели по питанию: сейчас не удалось/.test(text),f);
   record("DASH-47_SPECIFIC_OWNER_ALIASES",detectWorkoutPlanIntent_("что мне сегодня делать").intent==="WORKOUT_TODAY"&&detectDailyNutritionQueryIntent_("что я съел сегодня"),{});
+  f=build({consumed:consumed({totals_complete:false,unknown_items_count:2,calculated_items_count:1,
+    consumed:{calories:100,protein:10,fat:2,carbs:15}})}).facts;text=formatDailyDashboard_(f);
+  record("DASH-48_INCOMPLETE_BLOCKS_REMAINING",f.nutrition.totals_complete===false&&f.nutrition.remaining.calories===null&&
+    /известный минимум/.test(text)&&/остаток по цели пока определить нельзя/.test(text)&&!/Осталось:/.test(text),{facts:f,text:text});
   const passed=tests.filter(function(test){return test.status==="PASS";}).length;
   return {suite:"UNIFIED_DAILY_DASHBOARD_DASH1",status:passed===tests.length?"PASS":"FAIL",total:tests.length,passed:passed,failed:tests.length-passed,tests:tests,safety:{sheet_writes:0,telegram_calls:0,groq_calls:0,production_writes:0}};
 }

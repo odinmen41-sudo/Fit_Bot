@@ -50,6 +50,15 @@ function runNutRecipe01Tests() {
   record("NUT-RECIPE-01_17_HISTORY_NO_NAN",historyText.indexOf("NaN")<0&&
     historyText.indexOf("КБЖУ пока не определены")>=0,historyText);
   record("NUT-RECIPE-01_18_HISTORY_INCOMPLETE_TOTAL",historyText.indexOf("Итог неполный")>=0,historyText);
+  const suffixIdentity=resolveFoodIdentity_("куриных яйца","куриных яйца",[
+    {ALIAS_NORMALIZED:"яйца",FOOD_ID:"egg",PRIORITY:100,ACTIVE:true,VARIANT_HINT:"",PREPARATION_HINT:""}
+  ]);
+  record("NUT-RECIPE-01_19_SAFE_CONTAINED_ALIAS",suffixIdentity.status==="RESOLVED"&&suffixIdentity.food_id==="egg",suffixIdentity);
+  const conflictingIdentity=resolveFoodIdentity_("груша банан","груша банан",[
+    {ALIAS_NORMALIZED:"груша",FOOD_ID:"pear",PRIORITY:100,ACTIVE:true,VARIANT_HINT:"",PREPARATION_HINT:""},
+    {ALIAS_NORMALIZED:"банан",FOOD_ID:"banana",PRIORITY:100,ACTIVE:true,VARIANT_HINT:"",PREPARATION_HINT:""}
+  ]);
+  record("NUT-RECIPE-01_20_CONTAINED_ALIAS_AMBIGUITY",conflictingIdentity.status==="AMBIGUOUS_IDENTITY",conflictingIdentity);
   const passed=results.filter(function(r){return r.status==="PASS";}).length;
   return {ok:passed===results.length,passed:passed,total:results.length,results:results};
 }

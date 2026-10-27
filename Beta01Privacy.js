@@ -7,6 +7,7 @@ const BETA01_DELETION_STORES = Object.freeze([
   Object.freeze({sheet:"Bot_Input", keys:["user_id"], pseudonymous:true}),
   Object.freeze({sheet:"User_Profile", keys:["Telegram_ID","User_ID"]}),
   Object.freeze({sheet:"Nutrition_Log", keys:["USER_ID"]}),
+  Object.freeze({sheet:"Nutrition_Recipes", keys:["USER_ID"]}),
   Object.freeze({sheet:"Workout_Log", keys:["USER_ID","TELEGRAM_ID"]}),
   Object.freeze({sheet:"Recovery_Checkin", keys:["USER_ID"]}),
   Object.freeze({sheet:"Workout_Plan", keys:["USER_ID","TELEGRAM_ID"]}),

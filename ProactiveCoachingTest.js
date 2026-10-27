@@ -69,6 +69,8 @@ function runProactiveCoachingTests(){
   const nutritionThrows=base({weight:weight({freshness:"STALE",measurement_age_days:9})});Object.defineProperty(nutritionThrows,"nutrition",{get:function(){throw new Error("nutrition unavailable");}});record("PC1-51_NUTRITION_EXCEPTION_ISOLATED",detect(nutritionThrows,22).some(function(s){return s.key==="WEIGHT_MEASUREMENT_STALE";}),detect(nutritionThrows,22));
   const weightThrows=base({nutrition:nutrition({status:"NO_RECORDS",has_records:false,consumed:null})});Object.defineProperty(weightThrows,"weight",{get:function(){throw new Error("weight unavailable");}});record("PC1-52_WEIGHT_EXCEPTION_ISOLATED",detect(weightThrows,22).some(function(s){return s.key==="NO_NUTRITION_LOGGED_LATE_DAY";}),detect(weightThrows,22));
   record("PC1-53_NO_MISSED_WORKOUT_CLAIM",!/пропустил/.test(messages),messages);
+  f=base({nutrition:nutrition({totals_complete:false,unknown_items_count:2,consumed:{calories:2100,protein:20,fat:10,carbs:30}})});
+  record("PC1-54_INCOMPLETE_NUTRITION_NO_SIGNAL",keys(f,22).every(function(k){return !/CALORIES|PROTEIN|NUTRITION/.test(k);}),keys(f,22));
   const passed=tests.filter(function(test){return test.status==="PASS";}).length;
   return {suite:"PROACTIVE_COACHING_PC1",status:passed===tests.length?"PASS":"FAIL",total:tests.length,passed:passed,failed:tests.length-passed,tests:tests,safety:{writes:0,telegram_calls:0,groq_calls:0,production_writes:0}};
 }

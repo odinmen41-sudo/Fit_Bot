@@ -2666,7 +2666,8 @@ function continueNutritionClarification_(selected, update, dependencies, referen
   }
   if (!completedText) {
     const replacement = extractNutritionFactCandidate_(message.text);
-    if (replacement.detected === true && /(?:съел|выпил|добавил|запиш)/i.test(String(message.text || ""))) {
+    const explicitReplacement = /(?:съел|выпил|добав(?:ь|ил)|запиш|внеси|на\s+(?:завтрак|обед|ужин)|в\s+(?:дневник|рацион))/i.test(String(message.text || ""));
+    if (replacement.detected === true && (explicitReplacement || replacement.items.length >= 2)) {
       const cancelled = dependencies.cancel(userId, chatId, {now: now});
       if (!cancelled || cancelled.ok !== true) return domainFactResult_(true, false, "CLARIFICATION_RELEASE_FAILED", {
         domain: "NUTRITION", message: "Не удалось обновить уточнение. Попробуйте ещё раз."
@@ -2675,10 +2676,15 @@ function continueNutritionClarification_(selected, update, dependencies, referen
         reference_options: referenceOptions || {}});
     }
   }
-  if (!completedText) return domainFactResult_(true, false, "CLARIFICATION_REQUIRED", {
-    domain: "NUTRITION", pending_capture_writes: 0,
-    message: spec && spec.prompt || "Уточните запись о питании."
-  });
+  if (!completedText) {
+    const cancelled = dependencies.cancel(userId, chatId, {now: now});
+    return domainFactResult_(true, false, "CLARIFICATION_NO_PROGRESS", {
+      domain: "NUTRITION", pending_capture_writes: 0,
+      message: cancelled && cancelled.ok
+        ? "Не удалось применить уточнение. Незавершённая запись отменена — отправьте весь приём пищи одним сообщением."
+        : "Не удалось применить уточнение. Отправьте весь приём пищи одним сообщением или напишите «Нет» для отмены."
+    });
+  }
   const detection = detectDomainFactCandidate_(completedText, referenceOptions || {});
   if (detection.domain === "NUTRITION" && (detection.requires_clarification === true ||
       detection.reference_status === "CLARIFICATION_REQUIRED")) {
@@ -2801,11 +2807,11 @@ function extractNutritionFactCandidate_(text) {
   const result = {detected: false, invalid: false, requires_clarification: false, items: []};
   if (!normalized || nutritionQuestion_(normalized)) return result;
 
-  const hasAction = /(?:^|\s)(?:съел(?:а|и)?|ел(?:а|и)?|выпил(?:а|и)?|добавил(?:а|и)?|запиш(?:и|ите)?)(?=\s|$)/i.test(normalized);
-  const hasKnownFood = /(?:рис|куриц|грудк|греч|кефир|банан|яйц|творог|овсян|мяс|рыб|хлеб|сыр|кофе|капучин|сгущ|пицц)/i.test(normalized);
+  const hasAction = /(?:^|\s)(?:съел(?:а|и)?|ел(?:а|и)?|выпил(?:а|и)?|добав(?:ь|ил(?:а|и)?)|запиш(?:и|ите)?|внеси(?:те)?)(?=\s|$)/i.test(normalized);
+  const hasKnownFood = /(?:рис|куриц|грудк|греч|кефир|банан|яйц|творог|овсян|мяс|рыб|хлеб|сыр|кофе|капучин|круассан|сгущ|пицц)/i.test(normalized);
   if (!hasAction && !hasKnownFood) return result;
 
-  const content = normalized
+  const content = stripNutritionIntentPreamble_(normalized)
     .replace(/^(?:(?:нет|неверно),?\s+)?(?:на\s+(?:завтрак|обед|ужин)\s+)?(?:я\s+)?(?:съел(?:а|и)?|ел(?:а|и)?|выпил(?:а|и)?)\s+/i, "")
     .replace(/\s+(?:запиши|запишите)(?:\s+это)?(?:\s+в\s+мой\s+дневной\s+рацион)?\s*$/i, "")
     .replace(/\s+(?:добавил(?:а|и)?|и\s+съел(?:а|и)?|и\s+выпил(?:а|и)?)\s+/gi, ", ")
@@ -2826,6 +2832,16 @@ function extractNutritionFactCandidate_(text) {
   return result;
 }
 
+function stripNutritionIntentPreamble_(text) {
+  let value = String(text || "").trim();
+  value = value.replace(/^(?:привет|здравствуй(?:те)?|доброе\s+(?:утро|день|вечер))[\s,!.-]*/i, "");
+  value = value.replace(/^(?:пожалуйста[\s,!.-]*)?(?:запиш(?:и|ите)|добав(?:ь|ьте)|внеси(?:те)?)\s*(?:,?\s*пожалуйста[\s,!.-]*)?(?:мне\s+)?(?:это\s+)?(?:сегодня\s+)?(?:в\s+(?:мой\s+)?(?:дневник|рацион)|(?:на|в)\s+(?:завтрак|обед|ужин))?[\s,:-]*/i, "");
+  value = value.replace(/^(?:сегодня\s+)?на\s+(?:завтрак|обед|ужин)\s+(?:у\s+меня\s+)?(?:был(?:о|и)?|я\s+съел(?:а)?|я\s+выпил(?:а)?)?[\s,:-]*/i, "");
+  value = value.replace(/^сегодня\s+(?:я\s+)?(?:съел(?:а|и)?|выпил(?:а|и)?|ел(?:а|и)?)[\s,:-]*/i, "");
+  value = value.replace(/^(?:у\s+меня\s+)?(?:на\s+(?:завтрак|обед|ужин)\s+)?(?:был(?:о|и)?)[\s,:-]*/i, "");
+  return value.trim();
+}
+
 function splitNutritionParts_(content) {
   const commaParts = String(content || "").split(/\s*[,;]\s*/).filter(Boolean);
   return commaParts.reduce(function(parts, part) {
@@ -2838,8 +2854,8 @@ function splitNutritionParts_(content) {
       const leftItem = parseNutritionItem_(left);
       const rightItem = parseNutritionItem_(right);
       const leftComplete = leftItem && leftItem.item && !leftItem.requires_clarification && !leftItem.invalid;
-      const rightComplete = rightItem && rightItem.item && !rightItem.requires_clarification && !rightItem.invalid;
-      if (leftComplete && rightComplete) {
+      const rightUsable = rightItem && rightItem.item && !rightItem.invalid;
+      if (leftComplete && rightUsable) {
         parts.push(left);
         start = match.index + match[0].length;
       }
@@ -2852,6 +2868,9 @@ function splitNutritionParts_(content) {
 
 function normalizeNutritionNaturalInput_(text) {
   let value = String(text || "").replace(/[\u201c\u201d«»"]/g, " ").replace(/ё/g, "е");
+  value = value.replace(/,?\s*(?:одна|1)\s+порци(?:я|ю)(?:\s*,?\s*вес\s+не\s+знаю)?(?=\s*(?:,|$))/gi, " 1 шт");
+  value = value.replace(/миллилитр(?:а|ов)?(?=\s|$|[,.;])/gi, "мл");
+  value = value.replace(/(^|\s)(один|одна|одно)(?=\s+\S)/i, function(match, prefix) { return prefix + "1"; });
   const words = {"один":"1","одна":"1","одну":"1","два":"2","две":"2","пара":"2","пару":"2","три":"3","четыре":"4"};
   Object.keys(words).forEach(function(word) {
     value = value.replace(new RegExp("(?:^|\\s)" + word + "(?=\\s+(?:шт|штук|кус|лож|чайн(?:ая|ые|ых)?\\s+лож))", "gi"), function(match) {
@@ -2867,15 +2886,16 @@ function nutritionQuestion_(text) {
 }
 
 function parseNutritionItem_(part) {
-  const cleaned = String(part || "").replace(/^[\s,;:.]+|[\s,;:.]+$/g, "").trim();
+  let cleaned = String(part || "").replace(/^[\s,;:.]+|[\s,;:.]+$/g, "").trim();
   if (!cleaned) return null;
   const unitPattern = "(?:чайн(?:ая|ые|ых)\\s+лож(?:ек|ки|ка)|кус(?:ка|ков)?|ломт(?:ика|иков|ик)?|граммов|грамма|грамм|гр|кг|мл|литра|литров|литр|штуки|штук|штука|шт|г|л)";
+  cleaned = cleaned.replace(new RegExp("^1\\s+(.+?\\s+\\d+(?:[.,]\\d+)?\\s*(?:" + unitPattern + "))$", "i"), "$1");
   let match = cleaned.match(new RegExp("^(.+?)\\s+(-?\\d+(?:[.,]\\d+)?)\\s*(" + unitPattern + ")(?=\\s|$)", "i"));
   let food = "";
   let numberText = "";
   let unitText = "";
   if (match) {
-    food = match[1];
+    food = match[1].replace(/^1\s+/, "");
     numberText = match[2];
     unitText = match[3];
   } else {

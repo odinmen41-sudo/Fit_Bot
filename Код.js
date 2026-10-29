@@ -222,6 +222,70 @@ function routeExpiredStateRecovery_(update,reconciliation) {
     "Предыдущее незавершённое действие истекло и закрыто. Отправьте новые данные полностью — старый контекст не будет использован."});
 }
 
+/*
+ * A single dialogue-state coordinator owns confirmations and short replies.
+ * Domain routes still implement parsing and persistence, but they no longer
+ * compete to decide which active action a generic reply belongs to.
+ */
+function dialogStateOwnerKey_(source) {
+  const owners={
+    NUTRITION_CLARIFICATION:"NUTRITION",C231_DOMAIN_ROUTER:"NUTRITION",
+    C232C2_NUTRITION_TARGETS:"NUTRITION_TARGET",NUTRITION_RECIPE_LIBRARY:"NUTRITION_RECIPE",
+    C232D4_NUTRITION_REPLACE:"NUTRITION_REPLACE",C232D31_NUTRITION_VOID:"NUTRITION_VOID",
+    C20A_WEIGHT_GATE:"WEIGHT",WORKOUT_LOGGING_HISTORY:"WORKOUT",
+    SR2_SUBJECTIVE_RECOVERY:"RECOVERY",AI_COACH_01_PROPOSAL:"AI_COACH",
+    DIALOG_E2E_01_CLARIFICATION:"DIALOG"
+  };
+  return owners[String(source||"")]||"";
+}
+
+function dialogStateOwnerRoutes_(overrides) {
+  const supplied=overrides||{};
+  return {
+    NUTRITION:supplied.NUTRITION||routeDomainFactConfirmation_,
+    NUTRITION_TARGET:supplied.NUTRITION_TARGET||routeNutritionTargetConfirmation_,
+    NUTRITION_RECIPE:supplied.NUTRITION_RECIPE||routeNutritionRecipe_,
+    NUTRITION_REPLACE:supplied.NUTRITION_REPLACE||routeNutritionMealReplace_,
+    NUTRITION_VOID:supplied.NUTRITION_VOID||routeNutritionMealVoid_,
+    WEIGHT:supplied.WEIGHT||routeWeightFactConfirmation_,
+    WORKOUT:supplied.WORKOUT||routeWorkoutLoggingHistory_,
+    RECOVERY:supplied.RECOVERY||routeSubjectiveRecovery_,
+    AI_COACH:supplied.AI_COACH||routeAiCoach01_,
+    DIALOG:supplied.DIALOG||routeNaturalDialogAction_
+  };
+}
+
+function routeDialogStateCoordinator_(update,options) {
+  const runtime=options||{},message=update&&(update.message||update.edited_message);
+  if(!message||typeof message.text!=="string")return naturalDialogRouteResult_(false,true,"NO_DIALOG_TEXT");
+  const userId=String(message.from&&message.from.id||""),chatId=String(message.chat&&message.chat.id||"");
+  if(!userId||!chatId)return naturalDialogRouteResult_(true,false,"INVALID_DIALOG_OWNER",{message:"Не удалось определить пользователя."});
+  const decision=naturalDialogDecision_(message.text);
+  if(decision&&decision.mutation_policy==="GUIDE")return naturalDialogRouteResult_(true,true,"DATA_ENTRY_GUIDE",{
+    message:decision.message,decision:decision,dialog_state:"IDLE",groq_calls:0,production_writes:false
+  });
+  const deps=runtime.dependencies||{},now=runtime.now instanceof Date?runtime.now:new Date();
+  const selected=typeof deps.get_pending==="function"?deps.get_pending(userId,chatId,{now:now}):getPendingCapture_(userId,chatId,{now:now});
+  if(selected&&selected.code==="MULTIPLE_ACTIVE_CAPTURES")return naturalDialogRouteResult_(true,false,"DIALOG_STATE_CONFLICT",{
+    message:"Обнаружено несколько незавершённых действий. Ничего не изменено; повторите запрос позже."
+  });
+  if(!selected||selected.ok!==true)return naturalDialogRouteResult_(false,true,"DIALOG_IDLE",{dialog_state:"IDLE"});
+  const payload=smartConfirmationParseJson_(selected.capture&&selected.capture.payload_json,{}),source=String(payload.source||""),owner=dialogStateOwnerKey_(source);
+  const normalized=dialogNormalize_(message.text),confirmation=detectConfirmationIntent_(message.text),isConfirmation=confirmation&&["CONFIRM","CANCEL"].indexOf(confirmation.intent)>=0;
+  const isShortReply=normalized.length<=40&&(owner==="NUTRITION"&&nutritionClarificationReply_(message.text).recognized===true||owner==="DIALOG");
+  if(!isConfirmation&&!isShortReply)return naturalDialogRouteResult_(false,true,"ACTIVE_DIALOG_PRESERVED",{
+    dialog_state:"AWAITING_USER",active_owner:owner||"UNKNOWN",active_source:source
+  });
+  if(!owner)return naturalDialogRouteResult_(true,false,"UNKNOWN_DIALOG_OWNER",{
+    message:"Не удалось безопасно определить незавершённое действие. Ничего не изменено."
+  });
+  const route=dialogStateOwnerRoutes_(deps.owner_routes)[owner],result=typeof route==="function"?route(update,runtime.route_options||{}):null;
+  if(!result||result.handled!==true)return naturalDialogRouteResult_(true,false,"DIALOG_OWNER_REJECTED",{
+    message:"Не удалось безопасно продолжить незавершённое действие. Ничего не изменено.",active_owner:owner,active_source:source
+  });
+  return Object.assign({},result,{coordinated:true,active_owner:owner,active_source:source});
+}
+
 /* DIALOG-02 — trusted cross-domain context for the existing conversational fallback. */
 function dialog02RequestProfile_(text) {
   const normalized = dialogNormalize_(text);
@@ -563,6 +627,14 @@ function doPost(e) {
       sendTelegramMessage_(chatId, expiredState.message);
       logAiReply_(messageText, expiredState.message, "expired_state_recovery");
       markBotInputProcessed_(inputRow, "Ошибка expired state");
+      return httpOk_("OK");
+    }
+
+    const dialogState = routeDialogStateCoordinator_(update);
+    if (dialogState.handled) {
+      sendTelegramMessage_(chatId, dialogState.message);
+      logAiReply_(messageText, dialogState.message, "dialog_state_coordinator");
+      markBotInputProcessed_(inputRow, dialogState.ok ? "Да" : "Ошибка dialog state");
       return httpOk_("OK");
     }
 

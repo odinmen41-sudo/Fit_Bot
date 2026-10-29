@@ -153,6 +153,27 @@ function routeNaturalDialogAction_(update, options) {
   return Object.assign({}, result, {decision:decision,orchestrated:true,groq_calls:0,production_writes:false});
 }
 
+/*
+ * A recognized confirmation is never free-dialogue input. Domain owners get
+ * the first opportunity to consume it; reaching this fallback means that no
+ * active protected action belongs to the current user/chat.
+ */
+function routeUnownedConfirmationFallback_(update) {
+  const message = update && (update.message || update.edited_message);
+  if (!message || typeof message.text !== "string") {
+    return naturalDialogRouteResult_(false, true, "NOT_CONFIRMATION");
+  }
+  const confirmation = detectConfirmationIntent_(message.text);
+  if (!confirmation || ["CONFIRM", "CANCEL"].indexOf(confirmation.intent) < 0) {
+    return naturalDialogRouteResult_(false, true, "NOT_CONFIRMATION");
+  }
+  return naturalDialogRouteResult_(true, true, "NO_ACTIVE_PROTECTED_ACTION", {
+    message: confirmation.intent === "CONFIRM"
+      ? "Сейчас нет активной записи для подтверждения. Сначала отправьте данные, которые нужно сохранить."
+      : "Сейчас нет активного действия для отмены."
+  });
+}
+
 /* DIALOG-02 — trusted cross-domain context for the existing conversational fallback. */
 function dialog02RequestProfile_(text) {
   const normalized = dialogNormalize_(text);
@@ -636,6 +657,14 @@ function doPost(e) {
       sendTelegramMessage_(chatId, dailyDashboard.message);
       logAiReply_(messageText, dailyDashboard.message, "daily_dashboard");
       markBotInputProcessed_(inputRow, dailyDashboard.ok ? "Да" : "Ошибка daily dashboard");
+      return httpOk_("OK");
+    }
+
+    const unownedConfirmation = routeUnownedConfirmationFallback_(update);
+    if (unownedConfirmation.handled) {
+      sendTelegramMessage_(chatId, unownedConfirmation.message);
+      logAiReply_(messageText, unownedConfirmation.message, "protected_confirmation_fallback");
+      markBotInputProcessed_(inputRow, "Да");
       return httpOk_("OK");
     }
 
@@ -3026,8 +3055,7 @@ function calculatePartialNutritionReferences_(items, references) {
         calculatedItems.push(calculated.item); rawItems.push(calculated.raw); calculable += 1; return;
       }
     }
-    if (String(fields.reference_status && fields.reference_status.value || "") !== "UNKNOWN_REFERENCE" ||
-        String(fields.food_id && fields.food_id.value || "")) {
+    if (String(fields.reference_status && fields.reference_status.value || "") !== "UNKNOWN_REFERENCE") {
       unknown = -1000; calculatedItems.push(item); return;
     }
     const copy = {category:item.category, confidence:item.confidence, fields:{}};

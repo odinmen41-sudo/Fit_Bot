@@ -5157,7 +5157,7 @@ function detectWorkoutLoggingHistoryIntent_(text){
   m=n.match(/^(?:удали|удалить) последн(?:ий|ий подход|юю запись)(?: (.+))?$/);if(m&&(!m[1]||/(?:тяга|жим|присед|станов|подтяг|блок|подход)/.test(m[1])))return {intent:"DELETE",exercise_text:m[1]||""};
   m=n.match(/^исправь последн(?:ий|ий подход)(?: (.+?))? на (\d+(?:[.,]\d+)?)\s*(кг)?\s*(?:на|x|×)\s*(\d+)$/);if(m)return {intent:"CORRECT",exercise_text:m[1]||"",load:m[2],unit:"kg",reps:m[4]};
   m=n.match(/^(?:(.+?)\s+)?(\d+)\s*[x×]\s*(\d+)\s+(\d+(?:[.,]\d+)?)\s*кг$/);if(m)return {intent:"SETS",exercise_text:m[1]||"",count:m[2],reps:m[3],load:m[4],unit:"kg"};
-  m=n.match(/^(.+?),?\s+(\d+(?:[.,]\d+)?)\s*кг,?\s+([а-я0-9]+)\s+подход(?:а|ов)?\s+по\s+([а-я0-9]+)$/);if(m){const count=workoutSpokenInteger_(m[3]),reps=workoutSpokenInteger_(m[4]);return count&&reps?{intent:"SETS",exercise_text:m[1],count:count,reps:reps,load:m[2],unit:"kg"}:{intent:"INVALID_SET"};}
+  m=n.match(/^(.+?),?\s+(\d+(?:[.,]\d+)?)\s*кг,?\s+([а-я0-9]+)\s+подход(?:а|ов)?\s+по\s+([а-я0-9]+)(?:\s+повтор(?:а|ов|ение|ения|ений)?)?$/);if(m){const count=workoutSpokenInteger_(m[3]),reps=workoutSpokenInteger_(m[4]);return count&&reps?{intent:"SETS",exercise_text:m[1],count:count,reps:reps,load:m[2],unit:"kg"}:{intent:"INVALID_SET"};}
   m=n.match(/^3 подхода по (\d+) с (\d+(?:[.,]\d+)?)\s*кг$/);if(m)return {intent:"SETS",exercise_text:"",count:3,reps:m[1],load:m[2],unit:"kg"};
   m=n.match(/^(?:еще\s+)?(?:(.+?)\s+)?(\d+(?:[.,]\d+)?)\s*(кг)?\s*(?:на|x|×)\s*(\d+)$/);if(m)return {intent:"SETS",exercise_text:m[1]||"",count:1,load:m[2],unit:"kg",reps:m[4]};
   if(/(?:подход|\d+\s*[x×]|\d+\s*кг)/.test(n)&&/(?:на|по|x|×)/.test(n))return {intent:"INVALID_SET"};

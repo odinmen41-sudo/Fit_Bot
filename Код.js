@@ -43,6 +43,16 @@ function dialogNormalize_(text) {
 function naturalDialogDecision_(text) {
   const value = dialogNormalize_(text);
   if (!value || /^(?:да|нет|отмена|отменить|воде|на воде|молоке|на молоке|\d+)$/.test(value)) return null;
+  const entryGuides = [
+    {domain:"NUTRITION",pattern:/^(?:записать|добавить|внести)\s+(?:еду|питание|прием пищи|прием еды|в дневник питания)$/,message:"Перечислите продукты и количество одним сообщением — например: «овсяная каша на молоке 300 г и капучино 300 мл»."},
+    {domain:"WEIGHT",pattern:/^(?:записать|добавить|внести)(?:\s+(?:вес|измерение веса))$/,message:"Напишите вес с единицей — например: «Сегодня мой вес 118,2 кг»."},
+    {domain:"WORKOUT",pattern:/^(?:записать|добавить|внести)(?:\s+(?:тренировку|подход|упражнение))$/,message:"Опишите выполненное упражнение, количество подходов, повторов и нагрузку — например: «жим лёжа, 4 подхода по 6, 120 кг»."},
+    {domain:"RECOVERY",pattern:/^(?:записать|добавить|внести)(?:\s+(?:восстановление|самочувствие|сон))$/,message:"Опишите подтверждённые показатели — например: «сон 7 часов, энергия 6 из 10, стресс 4 из 10»."}
+  ];
+  for (let guideIndex = 0; guideIndex < entryGuides.length; guideIndex += 1) {
+    if (entryGuides[guideIndex].pattern.test(value)) return Object.assign({action:"CAPTURE_GUIDE",confidence:1,
+      source:"DETERMINISTIC_DATA_ENTRY_GUIDE",mutation_policy:"GUIDE"},entryGuides[guideIndex]);
+  }
   const rules = [
     {domain:"NUTRITION",action:"HISTORY_TODAY",canonical:"Что я ел сегодня?",pattern:/^(?:покажи что я сегодня ел|что было из еды сегодня|покажи питание за сегодня|напомни что я ел сегодня)$/},
     {domain:"NUTRITION",action:"DAILY_TOTAL",canonical:"Сколько калорий я съел сегодня?",pattern:/^(?:сколько я сегодня съел|сколько калорий уже набрал|какой итог по еде сегодня|подведи итог питания за сегодня)$/},
@@ -127,6 +137,9 @@ function routeNaturalDialogAction_(update, options) {
   }
   const decision = message && typeof message.text === "string" ? naturalDialogDecision_(message.text) : null;
   if (!decision) return naturalDialogRouteResult_(false, true, "NOT_NATURAL_DIALOG_ACTION");
+  if (decision.mutation_policy === "GUIDE") return naturalDialogRouteResult_(true, true, "DATA_ENTRY_GUIDE", {
+    message:decision.message,decision:decision,groq_calls:0,production_writes:false
+  });
   if (decision.mutation_policy === "CLARIFICATION_REQUIRED") {
     if (!userId || !chatId) return naturalDialogRouteResult_(true, false, "INVALID_USER", {message:"Не удалось определить пользователя."});
     const conflict = deps.get_pending(userId, chatId, {now:now});
@@ -172,6 +185,41 @@ function routeUnownedConfirmationFallback_(update) {
       ? "Сейчас нет активной записи для подтверждения. Сначала отправьте данные, которые нужно сохранить."
       : "Сейчас нет активного действия для отмены."
   });
+}
+
+/*
+ * Pending state is reconciled once, before domain routing. Expired captures are
+ * terminal history, not live conversational context. A short answer to a just
+ * expired action gets an explicit recovery message; a new full statement is
+ * allowed to start a fresh action in the same update.
+ */
+function reconcileOwnedPendingState_(userId, chatId, options) {
+  const runtime=options||{},now=runtime.now instanceof Date?runtime.now:new Date(),deps=runtime.dependencies||{};
+  let lock=null,acquired=false;
+  try {
+    const sheet=deps.sheet||(typeof smartConfirmationSheet_==="function"?smartConfirmationSheet_():null);
+    const rows=typeof deps.read_rows==="function"?deps.read_rows(sheet):smartConfirmationReadRows_(sheet);
+    const expired=(rows||[]).filter(function(row){return String(row.user_id)===String(userId)&&String(row.chat_id)===String(chatId)&&
+      row.status===SMART_CONFIRMATION_CONFIG.STATUSES.PENDING&&smartConfirmationDate_(row.expires_at).getTime()<=now.getTime();});
+    if(!expired.length)return {ok:true,code:"STATE_CURRENT",expired_count:0,expired_sources:[]};
+    lock=deps.lock||(typeof LockService!=="undefined"?LockService.getScriptLock():null);
+    if(lock){if(typeof lock.tryLock==="function"){acquired=lock.tryLock(5000)===true;if(!acquired)return {ok:false,code:"STATE_LOCK_TIMEOUT",expired_count:0};}else{lock.waitLock(5000);acquired=true;}}
+    const sources=[];expired.forEach(function(row){const payload=smartConfirmationParseJson_(row.payload_json,{});sources.push(String(payload.source||"UNKNOWN"));
+      if(typeof deps.mark_expired==="function")deps.mark_expired(row,now);else smartConfirmationUpdateState_(sheet,row.row_number,
+        SMART_CONFIRMATION_CONFIG.STATUSES.EXPIRED,"[]","","TTL expired before routing");});
+    if(typeof deps.flush==="function")deps.flush();else if(typeof SpreadsheetApp!=="undefined")SpreadsheetApp.flush();
+    return {ok:true,code:"EXPIRED_STATE_RECONCILED",expired_count:expired.length,expired_sources:sources};
+  }catch(error){return {ok:false,code:"STATE_RECONCILIATION_FAILED",expired_count:0};}
+  finally{if(acquired&&lock)try{lock.releaseLock();}catch(ignored){}}
+}
+
+function routeExpiredStateRecovery_(update,reconciliation) {
+  if(!reconciliation||reconciliation.ok!==true||!reconciliation.expired_count)return naturalDialogRouteResult_(false,true,"NO_EXPIRED_STATE");
+  const message=update&&(update.message||update.edited_message),text=String(message&&message.text||""),normalized=dialogNormalize_(text);
+  const standaloneConfirmation=normalized.length<=40&&detectConfirmationIntent_(text),shortClarification=normalized.length<=40&&nutritionClarificationReply_(text).recognized===true;
+  if(!standaloneConfirmation&&!shortClarification)return naturalDialogRouteResult_(false,true,"FRESH_INPUT_AFTER_EXPIRY");
+  return naturalDialogRouteResult_(true,false,"EXPIRED_STATE_RECOVERY",{message:
+    "Предыдущее незавершённое действие истекло и закрыто. Отправьте новые данные полностью — старый контекст не будет использован."});
 }
 
 /* DIALOG-02 — trusted cross-domain context for the existing conversational fallback. */
@@ -499,6 +547,22 @@ function doPost(e) {
       sendTelegramMessage_(chatId, help);
       logAiReply_(messageText, help, "command");
       markBotInputProcessed_(inputRow, "Да");
+      return httpOk_("OK");
+    }
+
+    const pendingState = reconcileOwnedPendingState_(userId, chatId, {now:new Date()});
+    if (!pendingState.ok) {
+      const stateMessage = "Не удалось безопасно проверить незавершённые действия. Попробуйте ещё раз немного позже.";
+      sendTelegramMessage_(chatId, stateMessage);
+      logAiReply_(messageText, stateMessage, "pending_state_guard");
+      markBotInputProcessed_(inputRow, "Ошибка pending state");
+      return httpOk_("OK");
+    }
+    const expiredState = routeExpiredStateRecovery_(update, pendingState);
+    if (expiredState.handled) {
+      sendTelegramMessage_(chatId, expiredState.message);
+      logAiReply_(messageText, expiredState.message, "expired_state_recovery");
+      markBotInputProcessed_(inputRow, "Ошибка expired state");
       return httpOk_("OK");
     }
 
@@ -7148,7 +7212,7 @@ function sendTelegramMessage_(chatId, text, options) {
 
   if (!token) throw new Error("TELEGRAM_TOKEN is not configured in Script Properties");
 
-  const rendered = renderTelegramMessage_(text);
+  const rendered = renderTelegramMessage_(sanitizeUserFacingInternalMarkers_(text));
   const payload = {chat_id: chatId, text: rendered.text, parse_mode: rendered.parse_mode};
   if (options && options.reply_markup) payload.reply_markup = options.reply_markup;
 
@@ -7171,6 +7235,13 @@ function sendTelegramMessage_(chatId, text, options) {
 
   const result = JSON.parse(body);
   if (!result.ok) throw new Error("Telegram sendMessage failed: " + body);
+}
+
+function sanitizeUserFacingInternalMarkers_(text) {
+  return String(text==null?"":text)
+    .replace(/\bDATA_INTEGRITY_ERROR\b/g,"данные не удалось надёжно прочитать")
+    .replace(/\bUNAVAILABLE\b/g,"данные временно недоступны")
+    .replace(/\bMISSING\b/g,"данные отсутствуют");
 }
 
 /**

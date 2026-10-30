@@ -448,6 +448,8 @@ function auditAdviceEvidence_(text, contract) {
   return {ok:violations.length===0,violations:violations};
 }
 
+function auditUserFacingReply_(text){const source=String(text||""),violations=[];if(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+){2,}\b\s*=/i.test(source))violations.push({reason:"INTERNAL_FIELD_NAME"});if(/\b(?:MISSING|UNAVAILABLE|DATA_INTEGRITY_ERROR|NO_RECORD_TODAY|HAS_COMPLETED_WORKOUTS|RECORDED_TODAY)\b/.test(source))violations.push({reason:"INTERNAL_STATUS"});return {ok:violations.length===0,violations:violations};}
+
 function evidenceBlockValue_(blocks,key) {
   const match=new RegExp("(?:^|\\n)"+String(key).replace(/[.*+?^${}()|[\]\\]/g,"\\$&")+"=([^\\n]+)").exec(String(blocks||""));
   return match?String(match[1]).trim():null;
@@ -456,7 +458,9 @@ function evidenceBlockValue_(blocks,key) {
 function evidenceSafeCoachFallback_(dialogProfile, dialogBlock, nutritionBlock) {
   const domains = dialogProfile && dialogProfile.domains || [];
   const blocks=[dialogBlock||"",nutritionBlock||""].join("\n"), lines=[];
-  if(domains.indexOf("WORKOUT")>=0){const session=evidenceBlockValue_(blocks,"training_plan_session");lines.push("Факт: действующий план"+(session?" — "+session:" прочитан")+". Он содержит силовую основу. Персональный шаг прогрессии стоит обосновыват по фактическому выполнению и восстановлению, а не по универсальному шаблону.");}
+  if(domains.indexOf("WEIGHT")>=0){const weight=evidenceBlockValue_(blocks,"weight_current_kg"),age=evidenceBlockValue_(blocks,"weight_measurement_age_days");lines.push(weight&&weight!=="MISSING"?"Факт: последний подтверждённый вес — "+weight+" кг"+(age==="0"?", измерение сегодня":age&&age!=="MISSING"?", измерение "+age+" дн. назад":"")+".":"Подтверждённого актуального веса для вывода сейчас нет.");}
+  if(domains.indexOf("WORKOUT")>=0){const session=evidenceBlockValue_(blocks,"training_plan_session"),known=session&&session!=="MISSING";lines.push("Факт: действующий план"+(known?" — "+session:" прочитан")+". Персональный шаг прогрессии стоит обосновывать по фактическому выполнению и восстановлению, а не по универсальному шаблону.");}
+  if(domains.indexOf("RECOVERY")>=0){const days=evidenceBlockValue_(blocks,"recovery_last_workout_days_ago"),subjective=evidenceBlockValue_(blocks,"recovery_subjective_status");lines.push((days==="0"?"Факт: последняя завершённая тренировка была сегодня.":days&&days!=="MISSING"?"Факт: последняя завершённая тренировка была "+days+" дн. назад.":"Дата последней завершённой тренировки сейчас не подтверждена.")+(subjective==="NO_RECORD_TODAY"?" Сегодня субъективных отметок о сне, усталости, болезненности и стрессе нет.":"")+" Поэтому надёжно оценить физиологическое восстановление нельзя.");}
   if(domains.indexOf("NUTRITION")>=0){const c=evidenceBlockValue_(blocks,"nutrition_consumed_calories")||evidenceBlockValue_(blocks,"logged_kcal"),t=evidenceBlockValue_(blocks,"nutrition_target_calories")||evidenceBlockValue_(blocks,"target_kcal"),r=evidenceBlockValue_(blocks,"nutrition_remaining_calories")||evidenceBlockValue_(blocks,"remaining_based_on_logged_kcal"),incomplete=(evidenceBlockValue_(blocks,"nutrition_totals_status")||evidenceBlockValue_(blocks,"logged_totals_status"))==="INCOMPLETE";lines.push(incomplete?"Факт: рацион записан не полностью по КБЖУ; "+(c||"0")+" ккал — только известный минимум. Точный итог и остаток по цели сейчас определить нельзя.":"Факт по записям: "+(c||"данные о калориях недоступны")+(t?" ккал из цели "+t:"")+(r?"; по записям остаётся "+r+" ккал":"")+". Это не доказывает, что незаписанной еды не было. Общий принцип: выбор следующей еды можно соотнести с настроенными остатками, но порцию надо уточнить по продукту и аппетиту.");}
   if(!lines.length)lines.push("Подтверждённые данные прочитаны, но для персональной рекомендации пока недостаточно оснований. Уточни желаемое изменение или добавь фактическую динамику.");
   return {text:lines.join("\n\n"),model:"deterministic_evidence_fallback",evidence_fallback:true};
@@ -464,13 +468,13 @@ function evidenceSafeCoachFallback_(dialogProfile, dialogBlock, nutritionBlock) 
 
 function finalizeEvidenceBoundReply_(reply, apiKey, model, messages, evidence, profile, options) {
   if (!reply || !reply.text || !evidence) return reply;
-  const firstAudit = auditAdviceEvidence_(reply.text,evidence);
-  if (firstAudit.ok) return Object.assign({},reply,{evidence_audit:"PASS"});
-  const repairMessages = messages.concat([{role:"system",content:"Предыдущий ответ не прошёл проверку доказательности: "+JSON.stringify(firstAudit.violations)+". Перепиши ответ: сохрани подтверждённые факты, отдели общий принцип от персонального вывода, удали неподтверждённые числовые назначения. Не добавляй новых чисел. Верни только исправленный ответ пользователю."}]);
+  const firstEvidence=auditAdviceEvidence_(reply.text,evidence),firstPresentation=auditUserFacingReply_(reply.text),firstViolations=firstEvidence.violations.concat(firstPresentation.violations);
+  if (firstEvidence.ok&&firstPresentation.ok) return Object.assign({},reply,{evidence_audit:"PASS"});
+  const repairMessages = messages.concat([{role:"system",content:"Предыдущий ответ не прошёл проверку доказательности или пользовательского представления: "+JSON.stringify(firstViolations)+". Перепиши ответ: сохрани подтверждённые факты, отдели общий принцип от персонального вывода, удали неподтверждённые числовые назначения, внутренние имена полей и служебные статусы. Не добавляй новых чисел. Верни только исправленный ответ пользователю."}]);
   try {
     const repaired = callGroq_(apiKey,model,repairMessages,Object.assign({},options||{},{completion_budget:CONFIG.MAX_OUTPUT_TOKENS,attempt_type:"evidence_repair"}));
-    const secondAudit = auditAdviceEvidence_(repaired.text,evidence);
-    if (secondAudit.ok) return Object.assign({},repaired,{evidence_audit:"REPAIRED"});
+    const secondAudit = auditAdviceEvidence_(repaired.text,evidence),secondPresentation=auditUserFacingReply_(repaired.text);
+    if (secondAudit.ok&&secondPresentation.ok) return Object.assign({},repaired,{evidence_audit:"REPAIRED"});
   } catch (ignored) {}
   return evidenceSafeCoachFallback_(profile, messages.map(function(m){return m.content;}).join("\n"), "");
 }

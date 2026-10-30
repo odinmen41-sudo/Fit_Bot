@@ -106,6 +106,8 @@ function runDialog02FreeDialogueTests() {
   rec("D02-EVIDENCE-PLAN-FACTS-ALLOWED",auditAdviceEvidence_("Жим лёжа 3 × 6 × 110 кг — подтверждённый факт.",workoutEvidence).ok,workoutEvidence);
   rec("D02-EVIDENCE-UNSOURCED-PRINCIPLE-NUMBER-REJECTED",!auditAdviceEvidence_("Это 80% от 1RM.",workoutEvidence).ok,{});
   rec("D02-EVIDENCE-UNSOURCED-PERSONAL-PROGRESSION-REJECTED",!auditAdviceEvidence_("Добавляй 2–5 кг каждые 2–3 недели.",workoutEvidence).ok,{});
+  rec("D02-USER-FACING-INTERNAL-FIELD-REJECTED",!auditUserFacingReply_("Факт: recovery_last_workout_days_ago = 0").ok,{});
+  rec("D02-USER-FACING-INTERNAL-STATUS-REJECTED",!auditUserFacingReply_("Статус NO_RECORD_TODAY").ok,{});
   const proposedEvidence=adviceEvidenceContract_("Предложи цель 2200 ккал",workoutContext.block,null);
   rec("D02-EVIDENCE-USER-PROPOSED-NUMBER-ALLOWED",auditAdviceEvidence_("Можно рассмотреть 2200 ккал как предложение.",proposedEvidence).ok,proposedEvidence);
   const nutritionEvidence=adviceEvidenceContract_("Что по питанию?",built.block,null);

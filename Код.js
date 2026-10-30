@@ -3183,6 +3183,16 @@ function resolveNutritionReferences_(items, options) {
     return result;
   }
   const calculated = calculateNutritionReferences_(resolvedItems, source.references || []);
+  if (calculated.status !== "CALCULATED") {
+    const partial = calculatePartialNutritionReferences_(resolvedItems, source.references || []);
+    if (partial) {
+      result.status = "PARTIAL";
+      result.items = partial.items;
+      result.calculation_status = "PARTIAL_CALCULATED";
+      result.nutrition_calculation = partial.nutrition_calculation;
+      return result;
+    }
+  }
   result.items = calculated.items;
   result.calculation_status = calculated.status;
   result.calculation_error = calculated.error || null;
@@ -3202,6 +3212,19 @@ function calculatePartialNutritionReferences_(items, references) {
       if (calculated.ok) {
         calculatedItems.push(calculated.item); rawItems.push(calculated.raw); calculable += 1; return;
       }
+      // Identity can be known while the reference row is not calculable (for
+      // example a staging egg reference with intentionally blank macros).
+      // Treat that item's nutrition as unknown instead of failing the whole
+      // meal or, worse, presenting the missing values as zero.
+      const incomplete = {category:item.category, confidence:item.confidence, fields:{}};
+      Object.keys(fields).forEach(function(key) { incomplete.fields[key] = Object.assign({}, fields[key]); });
+      incomplete.fields.reference_status = {value:"UNKNOWN_REFERENCE", confidence:1, source:"SYSTEM_POLICY"};
+      incomplete.fields.nutrition_reference_id = {value:null, confidence:0, source:"SYSTEM_POLICY"};
+      incomplete.fields.reference_basis_quantity = {value:null, confidence:0, source:"SYSTEM_POLICY"};
+      incomplete.fields.reference_basis_unit = {value:null, confidence:0, source:"SYSTEM_POLICY"};
+      incomplete.fields.nutrition_completeness = {value:"UNKNOWN", confidence:1, source:"SYSTEM_POLICY"};
+      incomplete.fields.calculated_nutrition = {value:null, confidence:1, source:"SYSTEM_POLICY"};
+      calculatedItems.push(incomplete); unknown += 1; return;
     }
     if (String(fields.reference_status && fields.reference_status.value || "") !== "UNKNOWN_REFERENCE") {
       unknown = -1000; calculatedItems.push(item); return;

@@ -38,6 +38,15 @@ function runNutRecipe01Tests() {
   const allUnknown=detectDomainFactCandidate_("Съел домашнее рагу 250 г",options);
   record("NUT-RECIPE-01_14_ALL_UNKNOWN_SAVEABLE_WITHOUT_ZERO_ITEM",allUnknown.calculation_status==="PARTIAL_CALCULATED"&&
     allUnknown.nutrition_calculation.calculable_items_count===0&&allUnknown.items[0].fields.calculated_nutrition.value===null,allUnknown);
+  const incompleteKnown=detectDomainFactCandidate_("Съел 2 куриных яйца",{calculation_enabled:true,aliases:[
+    {ALIAS_NORMALIZED:"куриных яйца",FOOD_ID:"egg",PRIORITY:100,ACTIVE:true}
+  ],references:[{REFERENCE_ID:"egg-incomplete",FOOD_ID:"egg",CANONICAL_NAME:"egg",VARIANT:"",
+    PREPARATION_STATE:"UNKNOWN",BASIS_QUANTITY:1,BASIS_UNIT:"count",CALORIES:"",PROTEIN:"",FAT:"",CARBS:"",
+    AUTHORITY:"STAGING",SOURCE:"incomplete fixture",SOURCE_VERSION:"1",ACTIVE:true}]});
+  record("NUT-RECIPE-01_14B_INCOMPLETE_KNOWN_REFERENCE_DEGRADES_TO_UNKNOWN",incompleteKnown.reference_status==="PARTIAL"&&
+    incompleteKnown.calculation_status==="PARTIAL_CALCULATED"&&incompleteKnown.nutrition_calculation.unknown_items_count===1&&
+    incompleteKnown.items[0].fields.reference_status.value==="UNKNOWN_REFERENCE"&&
+    incompleteKnown.items[0].fields.calculated_nutrition.value===null,incompleteKnown);
   record("NUT-RECIPE-01_15_PERCENT_PRESERVED",detection.items[0].fields.quantity_value.value===200,detection.items[0]);
   const effectiveMeal={meal_at:"2026-10-27T04:53:00.000Z",items:persisted,
     totals:{calories:232,protein:15.1,fat:10.2,carbs:19.8}};

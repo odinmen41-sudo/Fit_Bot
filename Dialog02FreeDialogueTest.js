@@ -64,6 +64,8 @@ function runDialog02FreeDialogueTests() {
   rec("D02-CONTEXT-READY",built.ok&&built.profile.cross_domain&&built.block.indexOf("weight_current_kg=118")>=0&&/nutrition_consumed_calories=390[,.]5/.test(built.block),built);
   rec("D02-CONTEXT-MISSING-EXPLICIT",built.block.indexOf("weight_week_delta_kg=MISSING")>=0,built);
   rec("D02-CONTEXT-PRIVACY",!/(USER_ID|TELEGRAM_ID|CAPTURE_ID|MEAL_ID|SNAPSHOT_HASH|raw_message)/.test(built.block),built);
+  rec("D02-CONTEXT-NO-TECHNICAL-NORMAL",built.block.indexOf("NORMAL")<0,built);
+  const staleSubjective=buildDialog02AuthoritativeContext_("u1","Как я восстановился сегодня?",{build_dashboard:function(){const copy=JSON.parse(JSON.stringify(facts));copy.recovery.subjective_status="NORMAL";return copy;}});rec("D02-STALE-SUBJECTIVE-NOT-HEALTH",staleSubjective.ok&&staleSubjective.block.indexOf("recovery_subjective_status=NO_RECORD_TODAY")>=0&&staleSubjective.block.indexOf("NORMAL")<0,staleSubjective);
   const omitted=buildDialog02AuthoritativeContext_("u1","Что съесть после тренировки?",{omit_nutrition:true,build_dashboard:function(){return facts;}});
   rec("D02-C4-NO-NUTRITION-DUPLICATION",omitted.ok&&omitted.block.indexOf("nutrition_consumed_")<0&&omitted.block.indexOf("training_today=грудь")>=0,omitted);
   const unavailable=buildDialog02AuthoritativeContext_("u1","Почему вес стоит?",{build_dashboard:function(){throw new Error("read");}});

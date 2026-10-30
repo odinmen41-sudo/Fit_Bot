@@ -25,5 +25,11 @@ function runDialogCoordinatorReliabilityTests(){
   rec("DCR-11_IDLE_CONFIRMATION_NOT_CLAIMED",!noPending.handled&&noPending.code==="DIALOG_IDLE",noPending);
   const sanitized=sanitizeUserFacingInternalMarkers_("nutrition=MISSING; weight=UNAVAILABLE; recovery=DATA_INTEGRITY_ERROR");
   rec("DCR-12_INTERNAL_STATE_NEVER_RENDERED",!/MISSING|UNAVAILABLE|DATA_INTEGRITY_ERROR/.test(sanitized),sanitized);
+  const pendingSheet={getRange:function(){return {getValues:function(){return [SMART_CONFIRMATION_CONFIG.HEADERS];}};}};
+  const pendingBook={getSheetByName:function(name){return name===SMART_CONFIRMATION_CONFIG.SHEET_NAME?pendingSheet:null;}};
+  rec("DCR-13_PENDING_USES_ENVIRONMENT_SPREADSHEET",smartConfirmationSheet_({spreadsheet:pendingBook})===pendingSheet,{});
+  const eightProducts="Бутерброд с ветчиной из индейки и сыром 15% — 200 г, 2 куриных яйца, 1 помидор, томатный суп с фасолью и курицей 250 г, отварная свёкла 150 г, цитрусовый компот 150 мл";
+  const parsedEight=extractNutritionFactCandidate_(eightProducts);
+  rec("DCR-14_EIGHT_PRODUCT_REPLAY_IS_FRESH_NUTRITION",parsedEight.detected===true&&parsedEight.requires_clarification===false&&parsedEight.items.length===6&&parsedEight.items[0].fields.quantity_value.value===200,parsedEight);
   const passed=tests.filter(function(t){return t.status==="PASS";}).length;return {suite:"DIALOG_COORDINATOR_RELIABILITY",status:passed===tests.length?"PASS":"FAIL",total:tests.length,passed:passed,failed:tests.length-passed,tests:tests,safety:{sheet_writes:0,telegram_calls:0,groq_calls:0,production_writes:0}};
 }

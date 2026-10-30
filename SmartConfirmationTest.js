@@ -521,8 +521,19 @@ function smartConfirmationTechnicalWritesAllowed_() {
     smartCaptureWritesAllowed_() === false;
 }
 
-function smartConfirmationSheet_() {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SMART_CONFIRMATION_CONFIG.SHEET_NAME);
+function smartConfirmationSheet_(options) {
+  // Pending actions are product state, not a test-only side channel. Resolve
+  // them through the same environment-aware spreadsheet selector as every
+  // authoritative domain reader/writer. In a standalone web app an "active"
+  // spreadsheet is not a stable deployment contract and may be null or point
+  // at a different bound file.
+  const spreadsheet = options && options.spreadsheet
+    ? options.spreadsheet
+    : (typeof getSpreadsheet_ === "function"
+      ? getSpreadsheet_(options)
+      : SpreadsheetApp.getActiveSpreadsheet());
+  if (!spreadsheet) throw new Error("Pending capture spreadsheet is unavailable");
+  const sheet = spreadsheet.getSheetByName(SMART_CONFIRMATION_CONFIG.SHEET_NAME);
   if (!sheet) throw new Error("Missing sheet: " + SMART_CONFIRMATION_CONFIG.SHEET_NAME);
   const actualHeaders = sheet.getRange(1, 1, 1, SMART_CONFIRMATION_CONFIG.HEADERS.length).getValues()[0].map(String);
   SMART_CONFIRMATION_CONFIG.HEADERS.forEach(function(header, index) {

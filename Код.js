@@ -6,8 +6,10 @@ const CONFIG = Object.freeze({
   GROQ_PRIMARY_MODEL_PROPERTY: "GROQ_PRIMARY_MODEL",
   GROQ_FALLBACK_MODEL_PROPERTY: "GROQ_FALLBACK_MODEL",
   PROCESSED_IDS_PROPERTY: "PROCESSED_UPDATE_IDS",
+  WEBHOOK_LIFECYCLE_PROPERTY: "WEBHOOK_LIFECYCLE_DIAGNOSTICS",
   BOT_INPUT_DIAGNOSTICS_PROPERTY: "BOT_INPUT_WRITE_DIAGNOSTICS",
   MAX_PROCESSED_IDS: 200,
+  MAX_WEBHOOK_LIFECYCLE_DIAGNOSTICS: 30,
   MAX_BOT_INPUT_DIAGNOSTICS: 6,
   PRIMARY_MODEL: "llama-3.3-70b-versatile",
   FALLBACK_MODEL: "llama-3.1-8b-instant",
@@ -27,6 +29,8 @@ const CONFIG = Object.freeze({
   MEMORY_RETRY_TTL_MS: 48 * 60 * 60 * 1000,
   MEMORY_RETRY_BASE_DELAY_MS: 5 * 60 * 1000
 });
+
+let ACTIVE_TELEGRAM_UPDATE_ID_ = "";
 
 const CONTEXT_STAGING_USER_ALIASES = Object.freeze({
   "132976932": "staging-user-001"
@@ -475,6 +479,7 @@ function doGet() {
 
 function doPost(e) {
   let updateId = "";
+  ACTIVE_TELEGRAM_UPDATE_ID_ = "";
 
   try {
     const betaWebhook = validateBeta01Webhook_(e);
@@ -497,6 +502,8 @@ function doPost(e) {
       console.log("Duplicate update ignored: " + updateId);
       return httpOk_("DUPLICATE");
     }
+    ACTIVE_TELEGRAM_UPDATE_ID_ = updateId;
+    recordWebhookLifecycle_(updateId, "WEBHOOK_CLAIMED", "");
 
     const betaAccess = routeBeta01Access_(update);
     if (betaAccess.handled && betaAccess.authorized !== true) {
@@ -831,8 +838,13 @@ function doPost(e) {
   } catch (error) {
     const details = "update_id=" + updateId + "; " + errorText_(error);
     console.error(details);
+    recordWebhookLifecycle_(updateId, "EXECUTION_FAILED", error && error.message || String(error));
+    releaseUpdate_(updateId);
     logSystem_("ERROR doPost", details);
-    return httpOk_("ERROR_RECORDED");
+    // An HTTP 200 here permanently acknowledges a Telegram update even though
+    // no user-visible result was delivered. Let Apps Script return a failure so
+    // Telegram can retry the same idempotent update.
+    throw error;
   }
 }
 
@@ -7288,25 +7300,36 @@ function sendTelegramMessage_(chatId, text, options) {
   const payload = {chat_id: chatId, text: rendered.text, parse_mode: rendered.parse_mode};
   if (options && options.reply_markup) payload.reply_markup = options.reply_markup;
 
-  const response = UrlFetchApp.fetch(
-    "https://api.telegram.org/bot" + token + "/sendMessage",
-    {
-      method: "post",
-      contentType: "application/json",
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
-    }
-  );
+  let response;
+  try {
+    response = UrlFetchApp.fetch(
+      "https://api.telegram.org/bot" + token + "/sendMessage",
+      {
+        method: "post",
+        contentType: "application/json",
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      }
+    );
+  } catch (error) {
+    recordWebhookLifecycle_(ACTIVE_TELEGRAM_UPDATE_ID_, "TELEGRAM_SEND_FAILED", error && error.message || String(error));
+    throw error;
+  }
 
   const status = response.getResponseCode();
   const body = response.getContentText();
 
   if (status < 200 || status >= 300) {
+    recordWebhookLifecycle_(ACTIVE_TELEGRAM_UPDATE_ID_, "TELEGRAM_SEND_FAILED", "HTTP " + status);
     throw new Error("Telegram sendMessage HTTP " + status + ": " + body);
   }
 
   const result = JSON.parse(body);
-  if (!result.ok) throw new Error("Telegram sendMessage failed: " + body);
+  if (!result.ok) {
+    recordWebhookLifecycle_(ACTIVE_TELEGRAM_UPDATE_ID_, "TELEGRAM_SEND_FAILED", "API ok=false");
+    throw new Error("Telegram sendMessage failed: " + body);
+  }
+  recordWebhookLifecycle_(ACTIVE_TELEGRAM_UPDATE_ID_, "TELEGRAM_SEND_OK", "");
 }
 
 function sanitizeUserFacingInternalMarkers_(text) {
@@ -7398,6 +7421,43 @@ function claimUpdate_(updateId) {
   } finally {
     lock.releaseLock();
   }
+}
+
+function releaseUpdate_(updateId) {
+  if (!updateId) return false;
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const properties = PropertiesService.getScriptProperties();
+    let ids = [];
+    try { ids = JSON.parse(properties.getProperty(CONFIG.PROCESSED_IDS_PROPERTY) || "[]"); }
+    catch (ignored) { ids = []; }
+    if (!Array.isArray(ids)) ids = [];
+    const remaining = ids.filter(function(id) { return String(id) !== String(updateId); });
+    properties.setProperty(CONFIG.PROCESSED_IDS_PROPERTY, JSON.stringify(remaining));
+    return remaining.length !== ids.length;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function recordWebhookLifecycle_(updateId, stage, detail, options) {
+  if (!updateId || !stage) return false;
+  let lock=null,acquired=false;
+  try {
+    const runtime=options||{},properties=runtime.properties||PropertiesService.getScriptProperties();
+    lock=runtime.lock||(runtime.lock_service||LockService).getScriptLock();
+    lock.waitLock(10000);acquired=true;
+    let rows=[];
+    try { rows=JSON.parse(properties.getProperty(CONFIG.WEBHOOK_LIFECYCLE_PROPERTY)||"[]"); }
+    catch (ignored) { rows=[]; }
+    if(!Array.isArray(rows))rows=[];
+    rows.push({at:new Date().toISOString(),update_id:String(updateId).slice(0,40),stage:String(stage).slice(0,60),detail:limitText_(detail||"",160)});
+    if(rows.length>CONFIG.MAX_WEBHOOK_LIFECYCLE_DIAGNOSTICS)rows=rows.slice(-CONFIG.MAX_WEBHOOK_LIFECYCLE_DIAGNOSTICS);
+    properties.setProperty(CONFIG.WEBHOOK_LIFECYCLE_PROPERTY,JSON.stringify(rows));
+    return true;
+  }catch(ignored){return false;}
+  finally{if(acquired&&lock)try{lock.releaseLock();}catch(ignored){}}
 }
 
 function getSpreadsheet_(options) {
@@ -7582,6 +7642,9 @@ function errorText_(error) {
 }
 
 function httpOk_(text) {
+  if (ACTIVE_TELEGRAM_UPDATE_ID_) {
+    recordWebhookLifecycle_(ACTIVE_TELEGRAM_UPDATE_ID_, "EXECUTION_COMPLETED", String(text || ""));
+  }
   return HtmlService.createHtmlOutput(String(text));
 }
 
